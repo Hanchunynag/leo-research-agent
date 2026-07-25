@@ -1,0 +1,28 @@
+[project]
+name = "leo-research-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "gradio>=6.20.0",
+    "orjson>=3.11.9",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.14.2",
+    "pymupdf>=1.28.0",
+    "rich>=15.0.0",
+    "typer>=0.27.0",
+]
+
+[project.scripts]
+leo-research-agent = "main:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.0",
+    "pytest>=9.1.1",
+    "ruff>=0.15.22",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
