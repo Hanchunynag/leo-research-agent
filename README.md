@@ -25,6 +25,102 @@ PDF 入库
 6. **RAG 必须依靠元数据区分论文**，不能依赖文件名或让 LLM 自己猜来源。
 7. **支持增量维护**，新增一篇论文不应该重新解析和索引全部论文。
 
+## 从零安装
+
+以下步骤用于一台没有现成虚拟环境的新电脑。项目使用 Python 3.11，并通过
+`uv.lock` 固定主环境依赖。`.venv`、`.venv-mineru` 和 `data/` 都是本地目录，
+不会提交到 Git。
+
+### 1. 安装基础工具
+
+需要预先安装：
+
+- Git；
+- [uv](https://docs.astral.sh/uv/)；
+- 足够存放 MinerU 依赖和模型的磁盘空间。
+
+macOS 可以使用 Homebrew 安装 uv：
+
+```bash
+brew install uv
+```
+
+确认安装：
+
+```bash
+git --version
+uv --version
+```
+
+### 2. 克隆项目并创建主环境
+
+```bash
+git clone https://github.com/Hanchunynag/leo-research-agent.git
+cd leo-research-agent
+uv sync --frozen --all-groups
+```
+
+`uv sync` 会读取 `.python-version`、`pyproject.toml` 和 `uv.lock`，自动创建
+`.venv`，并安装运行依赖及 pytest、Ruff、MyPy 等开发工具。
+
+验证主环境：
+
+```bash
+./.venv/bin/python --version
+./.venv/bin/python main.py --help
+```
+
+### 3. 创建 MinerU 专用环境
+
+当前经过验证的组合是 Python 3.11 和 MinerU 3.4.4：
+
+```bash
+uv venv --python 3.11 .venv-mineru
+uv pip install \
+  --python .venv-mineru/bin/python \
+  "mineru[core]==3.4.4"
+```
+
+下载默认 `pipeline` backend 所需模型。国内网络优先使用 ModelScope：
+
+```bash
+./.venv-mineru/bin/mineru-models-download \
+  --source modelscope \
+  --model_type pipeline
+```
+
+模型下载体积较大，只需在首次安装或主动更换模型时执行。验证 MinerU：
+
+```bash
+./.venv-mineru/bin/mineru --version
+```
+
+预期输出：
+
+```text
+mineru, version 3.4.4
+```
+
+Windows 中可执行文件位于 `.venv\Scripts\`，需要把上述 `bin` 路径替换为
+`Scripts`，例如 `.venv-mineru\Scripts\mineru.exe`。
+
+### 4. 运行质量检查
+
+```bash
+./.venv/bin/pytest -q
+./.venv/bin/ruff check app main.py tests
+./.venv/bin/mypy app main.py
+```
+
+三项检查全部通过后，再解析论文：
+
+```bash
+./.venv/bin/python main.py parse "/absolute/path/to/paper.pdf"
+```
+
+首次解析会运行 MinerU，耗时取决于论文页数和本机性能。原始 PDF、MinerU
+产物和 `paper.json` 会写入本地 `data/`，该目录已被 Git 忽略。
+
 ## 当前端到端流程
 
 ### 1. PDF 入库
@@ -447,8 +543,20 @@ PDF。
 
 ## 测试
 
+GitHub Actions 会在每次推送到 `main` 或创建 Pull Request 时，在全新的
+Ubuntu 环境中自动安装主环境并运行以下检查：
+
 ```bash
 ./.venv/bin/pytest -q
 ./.venv/bin/ruff check app main.py tests
 ./.venv/bin/mypy app main.py
 ```
+
+CI 不安装 MinerU，也不下载模型。测试使用小型临时 PDF 和模拟 MinerU 输出，
+用来验证入库、命令构造、失败处理和标准化逻辑。真实论文的 MinerU 解析仍在
+本地专用环境中运行。
+
+## License
+
+项目代码使用 [MIT License](LICENSE)。该许可证不覆盖用户导入的论文、论文
+图片、MinerU 解析出的论文内容、第三方模型或第三方依赖。
