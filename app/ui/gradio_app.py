@@ -266,7 +266,8 @@ def build_demo() -> gr.Blocks:
                     interactive=False,
                 )
 
-        ingest_button.click(
+        # Gradio 在运行时动态注册事件方法；Linux 类型声明未暴露 click。
+        ingest_button.click(  # type: ignore[attr-defined]
             fn=parse_from_ui,
             inputs=[uploaded_pdf],
             outputs=[
@@ -279,7 +280,7 @@ def build_demo() -> gr.Blocks:
             ],
         )
 
-        refresh_button.click(
+        refresh_button.click(  # type: ignore[attr-defined]
             fn=list_local_papers,
             inputs=None,
             outputs=library_table,
