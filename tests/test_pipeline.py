@@ -145,6 +145,42 @@ def test_pipeline_reuses_mineru_and_writes_one_paper_json(
     assert "Algorithm 1" in algorithm["text"]
 
 
+def test_reparse_preserves_verified_external_metadata(tmp_path: Path) -> None:
+    pdf = tmp_path / "test_paper.pdf"
+    create_pdf(pdf)
+    paper_id = f"P_{calculate_sha256(pdf)[:12]}"
+    write_existing_mineru_output(tmp_path, paper_id)
+    first = parse_paper(
+        input_path=pdf,
+        config=PaperParseConfig(project_root=tmp_path),
+    )
+    paper = json.loads(first.paper_json.read_text(encoding="utf-8"))
+    paper["metadata"] = {
+        "parser_title": "Test Paper",
+        "title": "Externally Verified Test Paper",
+        "authors": ["Ada Lovelace"],
+        "abstract": "Verified abstract.",
+        "year": 2025,
+        "doi": "10.1000/test",
+        "verification": {
+            "status": "verified",
+            "method": "academic-discovery-mcp",
+        },
+    }
+    first.paper_json.write_text(json.dumps(paper), encoding="utf-8")
+
+    second = parse_paper(
+        input_path=pdf,
+        config=PaperParseConfig(project_root=tmp_path),
+    )
+    reparsed = json.loads(second.paper_json.read_text(encoding="utf-8"))
+
+    assert reparsed["metadata"]["parser_title"] == "Test Paper"
+    assert reparsed["metadata"]["title"] == "Externally Verified Test Paper"
+    assert reparsed["metadata"]["authors"] == ["Ada Lovelace"]
+    assert reparsed["metadata"]["verification"]["status"] == "verified"
+
+
 def test_mineru_command_uses_dedicated_executable(tmp_path: Path) -> None:
     executable = tmp_path / ".venv-mineru" / "bin" / "mineru"
     config = PaperParseConfig(project_root=tmp_path)

@@ -24,14 +24,15 @@ import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
+
+from filelock import FileLock
 
 from app.ingestion.ingest import IngestResult, ingest_paper
-from app.normalization.mineru_adapter import (
-    build_canonical_document,
-    write_json_atomic,
-)
+from app.knowledge.identity import build_identity
+from app.normalization.mineru_adapter import build_canonical_document
 from app.parsing.precheck import PDFPrecheckResult, precheck_pdf
+from app.storage import write_json_atomic
 
 
 MinerUMethod = Literal["auto", "txt", "ocr"]
@@ -42,6 +43,15 @@ MinerUBackend = Literal[
     "vlm-http-client",
     "hybrid-http-client",
 ]
+PaperParseStage = Literal[
+    "ingesting",
+    "prechecking",
+    "waiting_for_mineru",
+    "running_mineru",
+    "normalizing",
+    "writing",
+]
+PaperProgressCallback = Callable[[PaperParseStage], None]
 
 
 @dataclass(frozen=True)
@@ -200,11 +210,15 @@ def build_mineru_command(
 def find_mineru_artifacts(mineru_root: Path) -> MinerUArtifacts | None:
     """查找同一输出目录内最新且完整的 MinerU 核心产物。"""
 
-    candidates = sorted(
-        mineru_root.rglob("*_content_list_v2.json"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    ) if mineru_root.exists() else []
+    candidates = (
+        sorted(
+            mineru_root.rglob("*_content_list_v2.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if mineru_root.exists()
+        else []
+    )
 
     for content_list in candidates:
         middle_files = sorted(content_list.parent.glob("*_middle.json"))
@@ -240,27 +254,35 @@ def run_mineru(
         config=config,
     )
 
-    completed = subprocess.run(
-        command,
-        cwd=config.project_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
     log_directory = mineru_root / "_pipeline"
     log_directory.mkdir(parents=True, exist_ok=True)
-    (log_directory / "mineru.stdout.log").write_text(
-        completed.stdout,
-        encoding="utf-8",
-    )
-    (log_directory / "mineru.stderr.log").write_text(
-        completed.stderr,
-        encoding="utf-8",
-    )
+    stdout_log = log_directory / "mineru.stdout.log"
+    stderr_log = log_directory / "mineru.stderr.log"
+
+    # 直接流式写日志，避免 MinerU 运行数分钟时页面无反馈、日志也不可见。
+    with (
+        stdout_log.open("w", encoding="utf-8") as stdout_stream,
+        stderr_log.open("w", encoding="utf-8") as stderr_stream,
+    ):
+        completed = subprocess.run(
+            command,
+            cwd=config.project_root,
+            text=True,
+            stdout=stdout_stream,
+            stderr=stderr_stream,
+            check=False,
+        )
 
     if completed.returncode != 0:
-        error_tail = completed.stderr[-4000:] or completed.stdout[-4000:]
+        stderr_text = stderr_log.read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+        stdout_text = stdout_log.read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+        error_tail = stderr_text[-4000:] or stdout_text[-4000:]
         raise MinerUExecutionError(
             f"MinerU 执行失败，退出码 {completed.returncode}。\n"
             f"命令：{' '.join(command)}\n"
@@ -300,10 +322,7 @@ def collect_assets(
                 "text": block.get("text"),
                 "latex": block.get("latex") or block.get("latex_raw"),
                 "caption": block.get("caption"),
-                "table_html": (
-                    block.get("table_html")
-                    or block.get("table_html_raw")
-                ),
+                "table_html": (block.get("table_html") or block.get("table_html_raw")),
                 "image_path": block.get("image_path"),
             }
         )
@@ -345,6 +364,7 @@ def normalize_document_paths(
 def parse_paper(
     input_path: Path,
     config: PaperParseConfig,
+    progress_callback: PaperProgressCallback | None = None,
 ) -> PaperParseResult:
     """通过一个入口完成论文入库、MinerU 解析和统一输出。"""
 
@@ -355,54 +375,89 @@ def parse_paper(
     parsed_root = project_root / "data" / "parsed"
     canonical_root = project_root / "data" / "canonical"
 
+    def notify(stage: PaperParseStage) -> None:
+        if progress_callback is not None:
+            progress_callback(stage)
+
+    notify("ingesting")
     ingest_result: IngestResult = ingest_paper(
         input_path=input_path,
         raw_dir=raw_root,
     )
-    precheck_result: PDFPrecheckResult = precheck_pdf(
-        ingest_result.source_path
-    )
+    notify("prechecking")
+    precheck_result: PDFPrecheckResult = precheck_pdf(ingest_result.source_path)
 
-    mineru_root = (
-        parsed_root
-        / ingest_result.paper_id
-        / "mineru"
-    )
+    mineru_root = parsed_root / ingest_result.paper_id / "mineru"
     paper_directory = canonical_root / ingest_result.paper_id
     paper_json = paper_directory / "paper.json"
 
+    previous_document: dict[str, Any] = {}
     previous_pipeline: dict[str, Any] = {}
     if paper_json.exists():
         try:
-            previous_document = json.loads(
-                paper_json.read_text(encoding="utf-8")
-            )
+            loaded_previous = json.loads(paper_json.read_text(encoding="utf-8"))
+            if isinstance(loaded_previous, dict):
+                previous_document = loaded_previous
             pipeline_value = previous_document.get("pipeline")
             if isinstance(pipeline_value, dict):
                 previous_pipeline = pipeline_value
         except (json.JSONDecodeError, OSError):
             previous_pipeline = {}
 
-    artifacts = (
-        None
-        if config.force_mineru
-        else find_mineru_artifacts(mineru_root)
-    )
-    mineru_reused = artifacts is not None
+    mineru_root.mkdir(parents=True, exist_ok=True)
+    notify("waiting_for_mineru")
+    parse_lock = FileLock(mineru_root / ".parse.lock")
     command: list[str] | None = None
 
-    if artifacts is None:
-        artifacts, command = run_mineru(
-            pdf_path=ingest_result.source_path,
-            mineru_root=mineru_root,
-            config=config,
-        )
+    # 同一篇论文可能从多个浏览器会话或单篇/批量入口同时提交。
+    # 加锁后重新检查产物，让后来的任务复用结果，避免并发写坏目录。
+    with parse_lock:
+        artifacts = None if config.force_mineru else find_mineru_artifacts(mineru_root)
+        mineru_reused = artifacts is not None
 
+        if artifacts is None:
+            notify("running_mineru")
+            artifacts, command = run_mineru(
+                pdf_path=ingest_result.source_path,
+                mineru_root=mineru_root,
+                config=config,
+            )
+
+    notify("normalizing")
     document, adapter_report = build_canonical_document(
         paper_id=ingest_result.paper_id,
         content_list_v2_path=artifacts.content_list_v2,
         middle_path=artifacts.middle_json,
     )
+
+    # 外部元数据核验属于本地 Agent 的后处理结果。相同 SHA 的 PDF 重新标准化时
+    # 保留已经严格核验或显式选择的元数据，同时刷新 MinerU 提取的 parser_title。
+    previous_source = previous_document.get("source")
+    previous_metadata = previous_document.get("metadata")
+    verification = (
+        previous_metadata.get("verification")
+        if isinstance(previous_metadata, dict)
+        else None
+    )
+    previous_sha = (
+        previous_source.get("sha256") if isinstance(previous_source, dict) else None
+    )
+    verification_status = (
+        verification.get("status") if isinstance(verification, dict) else None
+    )
+    if (
+        isinstance(previous_metadata, dict)
+        and previous_sha == ingest_result.sha256
+        and verification_status in {"verified", "selected"}
+    ):
+        fresh_metadata = document.get("metadata")
+        fresh_title = (
+            fresh_metadata.get("title") if isinstance(fresh_metadata, dict) else None
+        )
+        document["metadata"] = {
+            **previous_metadata,
+            "parser_title": fresh_title,
+        }
 
     normalize_document_paths(document, project_root)
 
@@ -432,6 +487,12 @@ def parse_paper(
         "stored_filename": ingest_result.stored_filename,
         "raw_pdf": project_relative(ingest_result.source_path, project_root),
     }
+    metadata_value = document.get("metadata")
+    document["identity"] = build_identity(
+        paper_id=ingest_result.paper_id,
+        sha256=ingest_result.sha256,
+        metadata=metadata_value if isinstance(metadata_value, dict) else {},
+    )
     precheck_payload = asdict(precheck_result)
     precheck_payload["source_path"] = project_relative(
         ingest_result.source_path,
@@ -456,14 +517,10 @@ def parse_paper(
     )
 
     document["parser"]["formula_enabled"] = (
-        applied_options.get("formula_enabled")
-        if applied_options
-        else None
+        applied_options.get("formula_enabled") if applied_options else None
     )
     document["parser"]["table_enabled"] = (
-        applied_options.get("table_enabled")
-        if applied_options
-        else None
+        applied_options.get("table_enabled") if applied_options else None
     )
     document["pipeline"] = {
         "created_at": utc_now_iso(),
@@ -486,6 +543,7 @@ def parse_paper(
     document["tables"] = tables
     document["figures"] = figures
 
+    notify("writing")
     write_json_atomic(paper_json, document)
 
     return PaperParseResult(

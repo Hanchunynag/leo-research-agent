@@ -44,30 +44,6 @@ def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def write_json_atomic(
-    path: Path,
-    payload: Any,
-) -> None:
-    """以临时文件方式安全写入 JSON。"""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    temporary_path = path.with_suffix(
-        path.suffix + ".tmp"
-    )
-
-    temporary_path.write_text(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    temporary_path.replace(path)
-
-
 def render_inline_items(
     items: Any,
 ) -> str:

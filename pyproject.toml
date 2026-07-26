@@ -1,11 +1,14 @@
 [project]
 name = "leo-research-agent"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Local paper parsing and RAG knowledge base for LEO signals-of-opportunity research"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "filelock>=3.20.0",
     "gradio>=6.20.0",
+    "httpx>=0.28.1",
+    "mcp>=1.26,<2",
     "orjson>=3.11.9",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.14.2",

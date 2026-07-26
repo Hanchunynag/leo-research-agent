@@ -2,7 +2,7 @@
 
 面向低轨（LEO）机会信号定位研究的本地论文解析与 RAG 知识库项目。
 
-项目当前已经完成“论文进入知识库之前”的基础链路：
+项目当前已经完成 v0.2 的“单篇解析 + 多论文目录”基础链路：
 
 ```text
 PDF 入库
@@ -10,10 +10,12 @@ PDF 入库
   → MinerU 解析
   → MinerU 数据标准化
   → 每篇论文生成一个 paper.json
+  → 全库生成可重建的 papers.jsonl
 ```
 
-分类、Chunk、索引、检索、重排、LLM 回答和自动评测是下一阶段。本文档同时
-说明已经实现的流程和后续维护几十篇论文时应遵守的数据设计。
+现在支持容错批量入库以及 `library rebuild/list/status`。分类、Chunk、索引、
+检索、重排、LLM 回答和自动评测是下一阶段。本文档同时说明已经实现的流程和
+后续维护几十篇论文时应遵守的数据设计。
 
 ## 核心设计原则
 
@@ -21,7 +23,8 @@ PDF 入库
 2. **只有一个解析入口**，CLI 和 UI 都调用同一个 `parse_paper()`。
 3. **两个虚拟环境严格隔离**，主代码不导入 MinerU 环境中的 Python 包。
 4. **原始数据不丢失**，PDF、MinerU 原始输出和 `raw_block` 都保留。
-5. **每篇论文独立存储**，由 PDF 内容哈希生成稳定 `paper_id`。
+5. **文件身份与论文身份分离**：SHA-256 生成稳定 `document_id`，DOI 等规范
+   标识生成 `work_id`；兼容目录继续保留 `paper_id`。
 6. **RAG 必须依靠元数据区分论文**，不能依赖文件名或让 LLM 自己猜来源。
 7. **支持增量维护**，新增一篇论文不应该重新解析和索引全部论文。
 
@@ -283,6 +286,8 @@ export LEO_MINERU_EXECUTABLE=/absolute/path/to/.venv-mineru/bin/mineru
 ./.venv/bin/python main.py parse /path/to/paper.pdf
 ```
 
+单篇解析成功后会自动重建 `data/knowledge/papers.jsonl`。
+
 强制重新运行 MinerU：
 
 ```bash
@@ -295,18 +300,191 @@ export LEO_MINERU_EXECUTABLE=/absolute/path/to/.venv-mineru/bin/mineru
 ./.venv/bin/python main.py parse --help
 ```
 
+### 批量解析论文
+
+解析目录第一层中的全部 PDF：
+
+```bash
+./.venv/bin/python main.py batch "/path/to/papers"
+```
+
+递归扫描子目录：
+
+```bash
+./.venv/bin/python main.py batch "/path/to/papers" --recursive
+```
+
+批处理逐篇调用同一个 `parse_paper()`。单篇失败会记录在报告中，但不会阻止
+后续论文。完成后自动重建全局目录，并写入：
+
+```text
+data/knowledge/last_batch_report.json
+```
+
+只要存在失败论文或 canonical 目录问题，命令会在打印完整 JSON 报告后返回
+非零退出码，方便脚本和 CI 识别部分失败。
+
+### 管理论文目录
+
+从全部 `data/canonical/*/paper.json` 原子重建目录：
+
+```bash
+./.venv/bin/python main.py library rebuild
+```
+
+列出目录记录：
+
+```bash
+./.venv/bin/python main.py library list
+```
+
+列出按 `work_id` 归并的逻辑论文和 PDF 版本：
+
+```bash
+./.venv/bin/python main.py library works
+```
+
+检查 raw、MinerU、canonical 和 `papers.jsonl` 是否一致：
+
+```bash
+./.venv/bin/python main.py library status
+```
+
+`papers.jsonl` 是可重建的派生目录，不能作为单篇论文事实来源手工维护。损坏的
+`paper.json` 会作为 issue 报告，其余有效论文仍会进入目录。
+
+`papers.jsonl` 一行对应一个具体 PDF 文档；`works.jsonl` 一行对应一篇逻辑
+论文。同一 DOI 的出版社版、预印本或带批注 PDF 拥有不同 `document_id`，但可
+归入相同 `work_id`，后续检索可按 `work_id` 去重、按 `document_id + page`
+引用具体证据。
+
 ### 启动界面
 
 ```bash
 ./.venv/bin/python main.py ui
 ```
 
-UI 的“开始解析”和 CLI 调用的是同一个 `parse_paper()`，不存在两套解析逻辑。
+界面包含：
+
+- “单篇入库”：上传并解析一篇 PDF；
+- “批量入库”：一次选择多篇 PDF，显示总体进度、新解析数、复用数、逐篇结果
+  和失败列表；
+- “本地论文库”：查看本地 raw、MinerU 和 canonical 状态。
+
+UI 和 CLI 最终都调用同一个 `parse_paper()`，不存在两套论文解析逻辑。批量
+页面使用与 CLI `batch` 相同的容错批处理核心，并写入同一个
+`last_batch_report.json`。
+
+## 外部学术发现 MCP
+
+项目提供一个职责独立的 `Academic Discovery MCP`。它只连接外部学术数据源，
+不会包装或替代本地的 MinerU 解析、canonical、Chunk、索引和 RAG 流程。
+
+当前暴露四个工具：
+
+- `search_papers`：聚合搜索 Crossref、OpenAlex 和 arXiv；
+- `resolve_paper`：根据本地提取的标题返回候选元数据和标题匹配分数；
+- `find_fulltext`：根据 DOI、OpenAlex ID 或 arXiv ID 查找开放全文；
+- `download_open_pdf`：凭 `find_fulltext` 返回的临时 token，把用户选定的
+  开放 PDF 下载到 `data/inbox/`。
+
+下载工具只接受由全文发现步骤登记过的 URL，并检查公网 HTTPS、重定向、文件
+体积和 `%PDF-` 文件头。它不会绕过付费墙，也不会自动把下载文件写入 raw、
+canonical 或索引。下载后仍由本地 Agent 显式调用现有 `parse_paper()` 入库。
+
+### 启动 stdio MCP
+
+建议配置一个真实联系邮箱。Crossref 和 OpenAlex 会把它用于 polite 请求，
+Unpaywall 要求提供邮箱才能查询：
+
+```bash
+export LEO_ACADEMIC_CONTACT_EMAIL="researcher@example.com"
+./.venv/bin/python main.py academic-mcp
+```
+
+通用 MCP 客户端配置示例：
+
+```json
+{
+  "mcpServers": {
+    "leo-academic-discovery": {
+      "command": "/absolute/path/to/leo-research-agent/.venv/bin/python",
+      "args": [
+        "/absolute/path/to/leo-research-agent/main.py",
+        "academic-mcp"
+      ],
+      "env": {
+        "LEO_ACADEMIC_CONTACT_EMAIL": "researcher@example.com"
+      }
+    }
+  }
+}
+```
+
+如需本机 Streamable HTTP：
+
+```bash
+./.venv/bin/python -m app.academic_mcp.server \
+  --transport streamable-http \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+默认单个 PDF 最大 100 MiB，可通过正整数环境变量
+`LEO_ACADEMIC_MAX_PDF_BYTES` 调整。MCP 的网络搜索结果是外部候选证据，最终
+是否接受标题、作者、摘要和 DOI，仍由本地 Agent 的元数据合并规则决定。
+
+### 本地 Agent 核验论文元数据
+
+只通过 stdio MCP 查询候选、不修改本地文件：
+
+```bash
+./.venv/bin/python main.py metadata resolve P_2e250a42c5f9
+```
+
+使用严格自动规则核验并合并元数据：
+
+```bash
+./.venv/bin/python main.py metadata enrich P_2e250a42c5f9
+```
+
+自动接受必须同时满足：标题匹配分数至少 `0.98`、至少两个独立数据源、前两名
+分差至少 `0.05`，并且作者、年份和 DOI 都存在。不满足时不会改写
+`paper.json`，但会把候选与原因保存到：
+
+```text
+data/knowledge/metadata_reviews/<paper_id>.json
+```
+
+用户或本地 Agent 审核候选后，可以显式选择从 0 开始的候选序号：
+
+```bash
+./.venv/bin/python main.py metadata enrich \
+  P_2e250a42c5f9 \
+  --candidate-index 0
+```
+
+接受后会保存 `parser_title`、规范标题、作者、摘要、年份、DOI、venue、外部 ID
+和核验来源，并原子重建 `papers.jsonl`。相同 SHA 的 PDF 以后重新运行 MinerU
+时会保留已核验元数据。
+
+已有核验元数据的论文可以不访问网络，直接补齐 `work_id/document_id` 并规范化
+raw PDF 文件名：
+
+```bash
+./.venv/bin/python main.py metadata normalize P_2e250a42c5f9
+```
+
+文件名只采用已核验的真实标题，执行 Unicode NFKC 归一化，移除 Windows、
+macOS 和 Linux 路径中的非法/控制字符，合并连续空白，固定 `.pdf` 后缀，并将
+UTF-8 文件名限制在 220 字节内。原上传名称保留在 `original_filename` 和
+`filename_history` 中。
 
 ## 数据目录
 
 ```text
 data/
+├── inbox/             # 外部 MCP 下载、等待用户确认入库的开放 PDF
 ├── raw/
 │   └── <paper_id>/
 │       └── original.pdf
@@ -316,7 +494,11 @@ data/
 ├── canonical/
 │   └── <paper_id>/
 │       └── paper.json
-├── knowledge/       # 后续全局论文目录与 chunks
+├── knowledge/       # 全局论文目录，后续加入 chunks
+│   ├── papers.jsonl
+│   ├── works.jsonl
+│   ├── metadata_reviews/
+│   └── last_batch_report.json
 ├── index/           # 后续向量、关键词和元数据索引
 └── evaluation/      # 后续自动评测数据
 ```
@@ -361,7 +543,7 @@ block_ids: P_2e250a42c5f9_p003_b005
 [/SOURCE]
 ```
 
-回答时要求模型引用 `paper_id + page`。这样即使一次检索命中十篇论文，LLM
+回答时要求模型引用 `document_id + page`，同时保留兼容 `paper_id`。这样即使一次检索命中十篇论文，LLM
 仍能区分每条证据属于哪篇论文。
 
 ### 是否需要把文件改名为 `<paper_id>.json`？
@@ -383,7 +565,7 @@ P_bbb.paper.json
 
 ## 后续多论文 RAG 流程
 
-### 阶段 1：建立全局论文目录
+### 阶段 1：建立全局论文目录（v0.2 已完成）
 
 从每个 `paper.json` 提取一条论文级记录，写入：
 
@@ -391,18 +573,23 @@ P_bbb.paper.json
 data/knowledge/papers.jsonl
 ```
 
-建议字段：
+当前记录字段：
 
+- `catalog_schema_version`
 - `paper_id`
 - `sha256`
 - `title`
 - `authors`
 - `year`
 - `doi`
+- `page_count`
 - `canonical_path`
-- `parser_version`
 - `schema_version`
-- `indexed_at`
+- `parser_name`
+- `parser_version`
+- `parse_status`
+- `quality_issue_count`
+- `updated_at`
 
 `paper.json` 是单篇论文事实来源，`papers.jsonl` 是全库目录。
 
@@ -431,7 +618,7 @@ Chunk 不应简单按固定字符数切分。建议：
 - 公式与解释段绑定在同一 Chunk 或建立引用关系；
 - 图表与 caption 绑定；
 - 参考文献和 Biography 默认不进入正文索引；
-- 每个 Chunk 始终携带 `paper_id` 和页码。
+- 每个 Chunk 始终携带 `work_id`、`document_id`、兼容 `paper_id` 和页码。
 
 全库 Chunk 可保存为：
 
@@ -450,7 +637,7 @@ data/knowledge/chunks.jsonl
 索引中的每条记录必须保存：
 
 ```text
-chunk_id → paper_id → page/block_ids → canonical_path
+chunk_id → work_id → document_id → page/block_ids → canonical_path
 ```
 
 不要只存 embedding 和正文，否则无法稳定引用或删除单篇论文。
@@ -465,12 +652,12 @@ chunk_id → paper_id → page/block_ids → canonical_path
   → 向量召回 + BM25 召回
   → 合并去重
   → reranker 重排
-  → 按 paper_id 控制证据多样性
+  → 按 work_id 去重并控制证据多样性
   → 组装带 SOURCE 标记的上下文
 ```
 
-“按 paper_id 控制证据多样性”可以防止一个长论文占满全部上下文，也能避免
-LLM 把来自不同论文的结论误认为同一实验结果。
+“按 work_id 去重并控制证据多样性”既能防止同一论文的多个 PDF 版本重复占满
+上下文，也能避免一个长论文挤掉其他论文证据。
 
 ### 阶段 6：生成带引用的回答
 
@@ -507,7 +694,7 @@ LLM 把来自不同论文的结论误认为同一实验结果。
 | Chunk 规则变化 | 重新 Chunk，可复用 MinerU |
 | Embedding 模型变化 | 重新建立向量索引 |
 | taxonomy 变化 | 重新分类，不需要重新 MinerU |
-| 单篇论文删除 | 按 `paper_id` 删除目录、Chunk 和索引记录 |
+| 单个 PDF 删除 | 按 `document_id` 删除文档、Chunk 和索引记录，再更新对应 `work_id` |
 
 未来批量命令应该遍历 `papers.jsonl`，逐篇判断状态，而不是无条件重新处理全部
 PDF。
@@ -521,7 +708,12 @@ PDF。
 | MinerU 双 venv 调用 | 已完成 |
 | Canonical `paper.json` | 已完成 |
 | 公式、图、表资产收集 | 已完成 |
-| 批量论文目录 | 未实现 |
+| 可重建 `papers.jsonl` | 已完成 |
+| 容错批量论文入库 | 已完成 |
+| `library` 管理命令 | 已完成 |
+| 外部学术发现 MCP | 已完成 |
+| `work_id/document_id` 版本归并 | 已完成 |
+| 已核验标题 PDF 规范命名 | 已完成 |
 | 自动分类 | 未实现 |
 | Chunk | 未实现 |
 | 向量/BM25 索引 | 未实现 |
@@ -535,7 +727,10 @@ PDF。
 - `app/parsing/pipeline.py`：唯一论文解析流程；
 - `app/normalization/mineru_adapter.py`：pipeline 内部 MinerU 数据适配器；
 - `app/ingestion/ingest.py`：pipeline 内部 PDF 入库；
+- `app/ingestion/batch.py`：容错批量入库与批处理报告；
+- `app/knowledge/catalog.py`：全局论文目录重建、读取与一致性检查；
 - `app/parsing/precheck.py`：pipeline 内部 PDF 预检查；
+- `app/storage.py`：JSON 和 JSONL 原子写入；
 - `app/ui/gradio_app.py`：调用同一 pipeline 的界面。
 
 这里的“唯一流程”指只有一个对外入口，不是把所有实现堆在一个超大 Python
@@ -555,6 +750,17 @@ Ubuntu 环境中自动安装主环境并运行以下检查：
 CI 不安装 MinerU，也不下载模型。测试使用小型临时 PDF 和模拟 MinerU 输出，
 用来验证入库、命令构造、失败处理和标准化逻辑。真实论文的 MinerU 解析仍在
 本地专用环境中运行。
+
+v0.2 的批量验收会自动生成 5 份独立 PDF 测试夹具和 1 份损坏 PDF，验证：
+
+- 5 篇有效论文全部进入 `papers.jsonl`；
+- 损坏 PDF 不会阻断其他论文；
+- 再次批量导入不会生成重复目录记录；
+- 重建前后的 `papers.jsonl` 内容一致；
+- 中文、空格、子目录和大写 `.PDF` 均可识别。
+- Gradio 批量页面能正确展示进度、成功数、复用数和失败列表。
+
+这些夹具只验证工程流程，不代替真实 LEO 论文语料验收。
 
 ## License
 
