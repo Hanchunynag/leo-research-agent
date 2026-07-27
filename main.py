@@ -323,6 +323,35 @@ def build_parser() -> argparse.ArgumentParser:
     add_embedding_options(rerank_search_command)
     add_reranker_options(rerank_search_command)
 
+    context_command = subparsers.add_parser(
+        "context",
+        help="把检索结果组装为带稳定来源标记的 LLM 证据包。",
+    )
+    context_subparsers = context_command.add_subparsers(
+        dest="context_command",
+        required=True,
+    )
+    context_build_command = context_subparsers.add_parser(
+        "build",
+        help="按 token budget 构建 EvidenceItem/ContextBundle。",
+    )
+    context_build_command.add_argument("query")
+    context_build_command.add_argument(
+        "--mode",
+        choices=["fast", "accurate"],
+        default="fast",
+    )
+    context_build_command.add_argument("--retrieval-limit", type=int, default=10)
+    context_build_command.add_argument("--token-budget", type=int, default=6000)
+    context_build_command.add_argument("--max-evidence", type=int, default=8)
+    context_build_command.add_argument("--max-evidence-per-work", type=int, default=2)
+    context_build_command.add_argument("--work-id")
+    context_build_command.add_argument("--document-id")
+    context_build_command.add_argument("--candidate-limit", type=int, default=20)
+    context_build_command.add_argument("--rrf-k", type=int, default=60)
+    add_embedding_options(context_build_command)
+    add_reranker_options(context_build_command)
+
     evaluate_command = subparsers.add_parser(
         "evaluate",
         help="运行本地检索与后续 RAG 质量评测。",
@@ -431,6 +460,22 @@ def reranker_provider_from_args(args: argparse.Namespace) -> Any:
             local_files_only=args.local_files_only,
             show_progress_bar=not args.no_progress,
         )
+    )
+
+
+def retrieval_runtime_from_args(
+    args: argparse.Namespace,
+    *,
+    include_reranker: bool,
+) -> Any:
+    from app.runtime.retrieval import RetrievalRuntime
+
+    return RetrievalRuntime(
+        project_root=PROJECT_ROOT,
+        embedding_provider=dense_provider_from_args(args),
+        reranker_provider=(
+            reranker_provider_from_args(args) if include_reranker else None
+        ),
     )
 
 
@@ -619,6 +664,26 @@ def main(argv: Sequence[str] | None = None) -> None:
                 rrf_k=args.rrf_k,
             )
         )
+        return
+
+    if args.command == "context":
+        runtime = retrieval_runtime_from_args(
+            args,
+            include_reranker=args.mode == "accurate",
+        )
+        bundle = runtime.build_context(
+            query=args.query,
+            mode=args.mode,
+            retrieval_limit=args.retrieval_limit,
+            token_budget=args.token_budget,
+            max_evidence=args.max_evidence,
+            max_evidence_per_work=args.max_evidence_per_work,
+            work_id=args.work_id,
+            document_id=args.document_id,
+            candidate_limit=args.candidate_limit,
+            rrf_k=args.rrf_k,
+        )
+        print_json(bundle.to_dict())
         return
 
     if args.command == "evaluate":

@@ -15,12 +15,14 @@ PDF 入库
   → 生成确定性结构化 Chunk
   → 建立 BM25 与 BGE-M3/Qdrant local 索引
   → 使用 RRF 融合
-  → 使用 BGE Cross-Encoder 精排并返回页码/block 证据
+  → 使用 BGE Cross-Encoder 精排
+  → 组装带稳定 SOURCE、页码和 block 的上下文证据包
 ```
 
 现在支持容错批量入库、论文身份归并、真实标题规范命名、增量知识层构建、
-BM25、BGE-M3 单向量召回、Qdrant local、RRF、候选池 Oracle 和 Cross-Encoder
-精排。LLM 上下文组装、证据引用、拒答、分类和生成式回答评测仍是下一阶段。
+BM25、BGE-M3 单向量召回、Qdrant local、RRF、候选池 Oracle、Cross-Encoder
+精排和证据上下文组装。LLM 回答、引用校验、拒答、分类和生成式回答评测仍是
+下一阶段。
 
 ## 核心设计原则
 
@@ -427,6 +429,34 @@ Top-20，使用 `k=60` 的 RRF：
 Reranker 只比较 `Query + RRF Candidate` 并输出原始相关性 logits，不与 BM25、
 Dense 或 RRF 分数线性相加。结果保留两路召回排名、RRF 排名和 Reranker 分数。
 
+将检索结果组装成 LLM 可消费的证据包：
+
+```bash
+# 快速模式：BM25 + Dense + RRF
+./.venv/bin/python main.py context build \
+  "Which measurements track LEO ephemerides?" \
+  --mode fast --token-budget 6000 \
+  --revision 5617a9f61b028005a4858fdac845db406aefb181 \
+  --local-files-only
+
+# 精确模式：RRF Top-20 + Cross-Encoder
+./.venv/bin/python main.py context build \
+  "Which measurements track LEO ephemerides?" \
+  --mode accurate --token-budget 6000 \
+  --revision 5617a9f61b028005a4858fdac845db406aefb181 \
+  --reranker-revision 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e \
+  --local-files-only
+```
+
+`ContextBundle` 中每个 `[S1]`、`[S2]` 都绑定唯一 `chunk_id/work_id/document_id`、
+章节、页码和 block IDs。同一逻辑论文只采用一个 PDF 版本；跨 document 的
+parent/overlap 会被拒绝，重复上下文只保留一次，最后一个证据可在自身来源边界内
+按预算截断。
+
+CLI 是一次性进程，仍会在每次执行时加载模型。UI、API 或本地 Agent 应在进程
+启动时创建一个 `RetrievalRuntime` 并复用；调用 `warmup()` 后，后续查询不会重复
+创建 Dense 或 Reranker 模型实例。
+
 ### 运行检索评测基线
 
 人工标注问题集保存在：
@@ -749,7 +779,8 @@ chunk_id → work_id → document_id → page/block_ids
 
 当前已支持关键词检索、语义检索、RRF、BGE Cross-Encoder、候选池 Oracle、
 `work_id/document_id` 过滤、按 `work_id` 控制证据数量和带页码/block 的结果。
-下一步是上下文组装、证据引用和拒答机制，而不是 Agent 或复杂 Query Rewrite。
+证据上下文组装也已完成。下一步是引用校验、AnswerProvider 和拒答机制，而不是
+Agent 或复杂 Query Rewrite。
 
 检索评测器已经独立于具体召回器实现。BM25、Dense、RRF 和 Reranker
 必须使用同一问题集、同一 block qrels 和同一指标函数，才能进行有效比较。
@@ -765,7 +796,7 @@ Dense 业务层只依赖 `EmbeddingProvider` 协议，不直接导入具体模�
   → RRF 合并去重（已完成）
   → BGE Cross-Encoder 重排（已完成）
   → 按 work_id 去重并控制证据多样性
-  → 组装带 SOURCE 标记的上下文
+  → 组装带 SOURCE 标记的 ContextBundle（已完成）
 ```
 
 “按 work_id 去重并控制证据多样性”既能防止同一论文的多个 PDF 版本重复占满
@@ -843,6 +874,8 @@ PDF。
 | BM25 + Dense RRF 混合检索基线 | 已完成 |
 | 联合候选池 Oracle Recall | 已完成 |
 | BGE Cross-Encoder 精排与性能诊断 | 已完成 |
+| fast/accurate 长驻检索运行时 | 已完成 |
+| EvidenceItem/ContextBundle 与 token budget | 已完成 |
 | 自动分类 | 未实现 |
 | LLM 回答和引用 | 未实现 |
 | 生成式回答自动评测 | 未实现 |
@@ -866,6 +899,9 @@ PDF。
 - `app/retrieval/reranked.py`：RRF Top-20 精排、来源保留与延迟记录；
 - `app/reranking/base.py`：与模型 SDK 解耦的 Reranker 协议；
 - `app/reranking/bge.py`：BGE Reranker v2 M3 Cross-Encoder Provider；
+- `app/runtime/retrieval.py`：复用模型实例的 fast/accurate 检索运行时；
+- `app/context/models.py`：EvidenceItem 与 ContextBundle 稳定契约；
+- `app/context/assembly.py`：来源去重、边界校验和 token budget 组装；
 - `app/evaluation/retrieval.py`：检索问题校验、qrels 映射和排名指标；
 - `app/embeddings/base.py`：与本地模型/API 解耦的 Embedding 协议；
 - `app/parsing/precheck.py`：pipeline 内部 PDF 预检查；
@@ -888,8 +924,8 @@ Ubuntu 环境中自动安装主环境并运行以下检查：
 
 CI 不安装 MinerU，也不下载模型。测试使用小型临时 PDF 和模拟 MinerU 输出，
 用来验证入库、命令构造、失败处理、标准化、结构恢复、Chunk、BM25、Dense
-Manifest、Qdrant 过滤、RRF、Cross-Encoder 适配和评测逻辑。CI 不下载真实
-BGE-M3 或 Reranker 权重。
+Manifest、Qdrant 过滤、RRF、Cross-Encoder 适配、上下文来源边界和评测逻辑。
+CI 不下载真实 BGE-M3 或 Reranker 权重。
 
 v0.2 的批量验收会自动生成 5 份独立 PDF 测试夹具和 1 份损坏 PDF，验证：
 
