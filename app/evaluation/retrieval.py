@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from app.embeddings.base import EmbeddingProvider
 from app.retrieval.search import load_chunks, search_evidence
 from app.storage import write_json_atomic
 
@@ -280,6 +281,102 @@ def evaluate_bm25(
         retriever_name="bm25",
         k_values=k_values,
     )
+    report["questions_path"] = str(questions_path.expanduser().resolve())
+    if output_path is not None:
+        resolved_output = output_path.expanduser().resolve()
+        report["output_path"] = str(resolved_output)
+        write_json_atomic(resolved_output, report)
+    return report
+
+
+def evaluate_dense(
+    project_root: Path,
+    questions_path: Path,
+    provider: EmbeddingProvider,
+    output_path: Path | None = None,
+    k_values: Sequence[int] = (1, 5, 10),
+) -> dict[str, Any]:
+    from app.retrieval.dense import search_dense_evidence
+
+    root = project_root.expanduser().resolve()
+    questions = load_retrieval_questions(questions_path)
+    chunks = load_chunks(root)
+
+    def retrieve(question: str, limit: int) -> list[dict[str, Any]]:
+        result = search_dense_evidence(
+            project_root=root,
+            provider=provider,
+            query=question,
+            limit=limit,
+            max_chunks_per_work=20,
+        )
+        raw_results = result.get("results")
+        return (
+            [value for value in raw_results if isinstance(value, dict)]
+            if isinstance(raw_results, list)
+            else []
+        )
+
+    report = evaluate_ranked_retriever(
+        questions=questions,
+        chunks=chunks,
+        retrieve=retrieve,
+        retriever_name="dense",
+        k_values=k_values,
+    )
+    report["model_name"] = getattr(provider, "model_name", None)
+    report["model_revision"] = getattr(provider, "revision", None)
+    report["questions_path"] = str(questions_path.expanduser().resolve())
+    if output_path is not None:
+        resolved_output = output_path.expanduser().resolve()
+        report["output_path"] = str(resolved_output)
+        write_json_atomic(resolved_output, report)
+    return report
+
+
+def evaluate_hybrid_rrf(
+    project_root: Path,
+    questions_path: Path,
+    provider: EmbeddingProvider,
+    output_path: Path | None = None,
+    k_values: Sequence[int] = (1, 5, 10),
+    candidate_limit: int = 20,
+    rrf_k: int = 60,
+) -> dict[str, Any]:
+    from app.retrieval.hybrid import search_hybrid_evidence
+
+    root = project_root.expanduser().resolve()
+    questions = load_retrieval_questions(questions_path)
+    chunks = load_chunks(root)
+
+    def retrieve(question: str, limit: int) -> list[dict[str, Any]]:
+        result = search_hybrid_evidence(
+            project_root=root,
+            provider=provider,
+            query=question,
+            limit=limit,
+            max_chunks_per_work=20,
+            candidate_limit=candidate_limit,
+            rrf_k=rrf_k,
+        )
+        raw_results = result.get("results")
+        return (
+            [value for value in raw_results if isinstance(value, dict)]
+            if isinstance(raw_results, list)
+            else []
+        )
+
+    report = evaluate_ranked_retriever(
+        questions=questions,
+        chunks=chunks,
+        retrieve=retrieve,
+        retriever_name="hybrid_rrf",
+        k_values=k_values,
+    )
+    report["model_name"] = getattr(provider, "model_name", None)
+    report["model_revision"] = getattr(provider, "revision", None)
+    report["candidate_limit_per_source"] = candidate_limit
+    report["rrf_k"] = rrf_k
     report["questions_path"] = str(questions_path.expanduser().resolve())
     if output_path is not None:
         resolved_output = output_path.expanduser().resolve()

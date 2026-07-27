@@ -2,7 +2,7 @@
 
 面向低轨（LEO）机会信号定位研究的本地论文解析与 RAG 知识库项目。
 
-项目当前已经完成从 PDF 到本地关键词证据检索的第一条 RAG 基线链路：
+项目当前已经完成从 PDF 到本地混合证据检索的可评测 RAG 基线链路：
 
 ```text
 PDF 入库
@@ -13,11 +13,13 @@ PDF 入库
   → 全库生成可重建的 papers.jsonl
   → 恢复内容区域和章节层级
   → 生成确定性结构化 Chunk
-  → 建立本地 BM25 索引并返回页码/block 证据
+  → 建立 BM25 与 BGE-M3/Qdrant local 索引
+  → 使用 RRF 融合并返回页码/block 证据
 ```
 
-现在支持容错批量入库、论文身份归并、真实标题规范命名、增量知识层构建和
-BM25 证据检索。向量召回、重排、LLM 回答、分类和自动评测仍是下一阶段。
+现在支持容错批量入库、论文身份归并、真实标题规范命名、增量知识层构建、
+BM25、BGE-M3 单向量召回、Qdrant local 和 RRF。Cross-Encoder 重排、LLM 回答、
+分类和生成式回答评测仍是下一阶段。
 
 ## 核心设计原则
 
@@ -387,6 +389,30 @@ Chunk，结果包含标题、章节路径、页码、`block_ids`、父章节上�
 和具体内容。若索引和 `chunks.jsonl` 指纹不一致，检索会拒绝使用旧索引并提示
 重新构建。
 
+固定 BGE-M3 revision 并构建可复用的 Qdrant local 索引：
+
+```bash
+./.venv/bin/python main.py dense build \
+  --revision 5617a9f61b028005a4858fdac845db406aefb181
+
+./.venv/bin/python main.py dense search \
+  "Which measurements track LEO ephemerides?" \
+  --revision 5617a9f61b028005a4858fdac845db406aefb181 \
+  --local-files-only
+```
+
+Dense 只使用归一化的 1024 维单向量，不启用 BGE-M3 sparse 或 multi-vector。
+Manifest 记录 Chunk 指纹、文本策略、模型 revision、维度、距离和 collection；
+任一项不一致时检索会拒绝旧索引。混合检索默认融合 BM25 Top-20 与 Dense
+Top-20，使用 `k=60` 的 RRF：
+
+```bash
+./.venv/bin/python main.py hybrid search \
+  "Which measurements track LEO ephemerides?" \
+  --revision 5617a9f61b028005a4858fdac845db406aefb181 \
+  --local-files-only
+```
+
 ### 运行检索评测基线
 
 人工标注问题集保存在：
@@ -399,25 +425,29 @@ data/evaluation/retrieval_questions.jsonl
 依次退回 `relevant_document_ids` 和 `relevant_work_ids`。父章节与重叠上下文中的
 block 也保留独立来源，因此可以参与严格 block 级评测。
 
-运行 BM25 基线：
+运行三条可比基线：
 
 ```bash
 ./.venv/bin/python main.py evaluate retrieval
+./.venv/bin/python main.py evaluate retrieval --retriever dense \
+  --revision 5617a9f61b028005a4858fdac845db406aefb181 --local-files-only
+./.venv/bin/python main.py evaluate retrieval --retriever rrf \
+  --revision 5617a9f61b028005a4858fdac845db406aefb181 --local-files-only
 ```
 
-报告写入 `data/evaluation/bm25_baseline.json`，包含 Recall@1/5/10、MRR、
+报告按检索器写入 `data/evaluation/*_baseline.json`，包含 Recall@1/5/10、MRR、
 nDCG@10、按问题类型聚合的指标以及每道题的排名。当前 21 道题的首版基线为：
 
-| 指标 | BM25 |
-|---|---:|
-| Recall@1 | 0.3571 |
-| Recall@5 | 0.5714 |
-| Recall@10 | 0.7857 |
-| MRR | 0.5137 |
-| nDCG@10 | 0.5685 |
+| 指标 | BM25 | Dense | RRF |
+|---|---:|---:|---:|
+| Recall@1 | 0.3571 | 0.2381 | 0.3810 |
+| Recall@5 | 0.5714 | 0.7381 | 0.8095 |
+| Recall@10 | 0.7857 | 0.8333 | 0.8810 |
+| MRR | 0.5137 | 0.4480 | 0.5409 |
+| nDCG@10 | 0.5685 | 0.5441 | 0.6232 |
 
-这组结果是 Dense、RRF 和 Reranker 后续必须对比的固定基线，不能只凭示例查询
-判断新检索器是否更好。
+这三组结果是 Reranker 后续必须对比的固定基线，不能只凭示例查询判断新检索器
+是否更好。
 
 ### 启动界面
 
@@ -685,34 +715,34 @@ data/knowledge/papers.jsonl
 data/knowledge/chunks.jsonl
 ```
 
-### 阶段 4：建立索引（BM25 已完成）
+### 阶段 4：建立索引（BM25 与 Dense 已完成）
 
-当前 BM25 无需外部服务，标题和章节字段有适度权重，并校验 Chunk 集合指纹。
-后续再补向量索引，用于语义问题；两类索引都必须保存：
+BM25 无需外部服务，标题和章节字段有适度权重。Dense 使用 BGE-M3 单向量和
+Qdrant local。两类索引都校验 Chunk 集合指纹，并保存：
 
 ```text
 chunk_id → work_id → document_id → page/block_ids
 ```
 
-### 阶段 5：检索（BM25 基线已完成）
+### 阶段 5：检索（BM25、Dense 与 RRF 基线已完成）
 
-当前已支持关键词检索、`work_id/document_id` 过滤、按 `work_id` 控制证据数量和
-带页码/block 的结果。下一步是在此基线上增加向量召回、合并去重和 reranker，
-而不是改变 PDF 入库或把本地项目包装成 MCP。
+当前已支持关键词检索、语义检索、RRF、`work_id/document_id` 过滤、按 `work_id`
+控制证据数量和带页码/block 的结果。下一步是在冻结基线上增加 reranker，而不是
+改变 PDF 入库或把本地项目包装成 MCP。
 
-检索评测器已经独立于具体召回器实现。BM25、后续 Dense、RRF 和 Reranker
+检索评测器已经独立于具体召回器实现。BM25、Dense、RRF 和后续 Reranker
 必须使用同一问题集、同一 block qrels 和同一指标函数，才能进行有效比较。
 Dense 业务层只依赖 `EmbeddingProvider` 协议，不直接导入具体模型 SDK 或 API
 客户端；本地 BGE 模型和远程 Embedding API 都必须通过这一接口接入。
 
-后续混合检索流程：
+当前及后续精排流程：
 
 ```text
 用户问题
   → 可选元数据过滤
-  → 向量召回 + BM25 召回
-  → 合并去重
-  → reranker 重排
+  → BGE-M3 Dense Top-20 + BM25 Top-20
+  → RRF 合并去重（已完成）
+  → reranker 重排（下一步）
   → 按 work_id 去重并控制证据多样性
   → 组装带 SOURCE 标记的上下文
 ```
@@ -787,9 +817,11 @@ PDF。
 | 本地 BM25 索引 | 已完成 |
 | 带页码/block 的关键词证据检索 | 已完成 |
 | block 级检索评测集与 BM25 基线 | 已完成 |
+| BGE-M3 单向量与 Qdrant local Manifest 索引 | 已完成 |
+| Dense 基线与逐题退化分析 | 已完成 |
+| BM25 + Dense RRF 混合检索基线 | 已完成 |
 | 自动分类 | 未实现 |
-| 向量索引 | 未实现 |
-| 混合检索与重排 | 未实现 |
+| Cross-Encoder 重排 | 未实现 |
 | LLM 回答和引用 | 未实现 |
 | 生成式回答自动评测 | 未实现 |
 
@@ -805,7 +837,10 @@ PDF。
 - `app/chunking/chunker.py`：确定性结构化 Chunk；
 - `app/chunking/builder.py`：全库增量知识层构建；
 - `app/indexing/bm25.py`：本地 BM25 倒排索引；
+- `app/indexing/dense.py`：带 Manifest 的 Qdrant local 单向量索引；
 - `app/retrieval/search.py`：带过滤、去重和引用的证据检索；
+- `app/retrieval/dense.py`：BGE-M3 Dense 证据检索；
+- `app/retrieval/hybrid.py`：BM25 与 Dense 的 RRF 融合；
 - `app/evaluation/retrieval.py`：检索问题校验、qrels 映射和排名指标；
 - `app/embeddings/base.py`：与本地模型/API 解耦的 Embedding 协议；
 - `app/parsing/precheck.py`：pipeline 内部 PDF 预检查；
@@ -827,8 +862,8 @@ Ubuntu 环境中自动安装主环境并运行以下检查：
 ```
 
 CI 不安装 MinerU，也不下载模型。测试使用小型临时 PDF 和模拟 MinerU 输出，
-用来验证入库、命令构造、失败处理、标准化、结构恢复、Chunk、BM25 和检索
-逻辑。真实论文的 MinerU 解析仍在本地专用环境中运行。
+用来验证入库、命令构造、失败处理、标准化、结构恢复、Chunk、BM25、Dense
+Manifest、Qdrant 过滤、RRF 和评测逻辑。CI 不下载真实 BGE-M3 权重。
 
 v0.2 的批量验收会自动生成 5 份独立 PDF 测试夹具和 1 份损坏 PDF，验证：
 

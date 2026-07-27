@@ -1,0 +1,38 @@
+{
+  "baseline_schema_version": "1.0",
+  "retriever": "hybrid_rrf",
+  "evaluation_schema_version": "1.0",
+  "questions_path": "data/evaluation/retrieval_questions.jsonl",
+  "questions_sha256": "f59c0bbfc50ab4d6a096c4c260563a186b6271b60164a0c477f158f1b81467c0",
+  "question_count": 21,
+  "chunk_policy_version": "2.1",
+  "chunk_count": 135,
+  "chunks_digest": "26974e78733162a98405271f13fc146a6b842736f570418490e9c59c937fb7fa",
+  "bm25_schema_version": "2.0",
+  "dense_index_schema_version": "1.0",
+  "dense_text_policy_version": "1.0",
+  "model_name": "BAAI/bge-m3",
+  "model_revision": "5617a9f61b028005a4858fdac845db406aefb181",
+  "normalized": true,
+  "candidate_limit_per_source": 20,
+  "rrf_k": 60,
+  "k_values": [1, 5, 10],
+  "metrics": {
+    "recall@1": 0.380952,
+    "recall@5": 0.809524,
+    "recall@10": 0.880952,
+    "mrr": 0.540873,
+    "ndcg@10": 0.623224
+  },
+  "missed_at_10": ["Q004", "Q011"],
+  "partially_recalled_at_10": {
+    "Q013": 0.5
+  },
+  "notable_rank_changes": {
+    "Q006": {"bm25_rank": null, "dense_rank": 2, "rrf_rank": 4},
+    "Q008": {"bm25_rank": 6, "dense_rank": null, "rrf_rank": 4},
+    "Q016": {"bm25_rank": null, "dense_rank": null, "rrf_rank": 8},
+    "Q017": {"bm25_rank": 1, "dense_rank": 8, "rrf_rank": 3},
+    "Q004": {"bm25_rank": null, "dense_rank": 3, "rrf_rank": null}
+  }
+}
