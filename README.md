@@ -2,7 +2,7 @@
 
 面向低轨（LEO）机会信号定位研究的本地论文解析与 RAG 知识库项目。
 
-项目当前已经完成 v0.2 的“单篇解析 + 多论文目录”基础链路：
+项目当前已经完成从 PDF 到本地关键词证据检索的第一条 RAG 基线链路：
 
 ```text
 PDF 入库
@@ -11,11 +11,13 @@ PDF 入库
   → MinerU 数据标准化
   → 每篇论文生成一个 paper.json
   → 全库生成可重建的 papers.jsonl
+  → 恢复内容区域和章节层级
+  → 生成确定性结构化 Chunk
+  → 建立本地 BM25 索引并返回页码/block 证据
 ```
 
-现在支持容错批量入库以及 `library rebuild/list/status`。分类、Chunk、索引、
-检索、重排、LLM 回答和自动评测是下一阶段。本文档同时说明已经实现的流程和
-后续维护几十篇论文时应遵守的数据设计。
+现在支持容错批量入库、论文身份归并、真实标题规范命名、增量知识层构建和
+BM25 证据检索。向量召回、重排、LLM 回答、分类和自动评测仍是下一阶段。
 
 ## 核心设计原则
 
@@ -358,6 +360,33 @@ data/knowledge/last_batch_report.json
 归入相同 `work_id`，后续检索可按 `work_id` 去重、按 `document_id + page`
 引用具体证据。
 
+### 构建结构化知识层并检索
+
+从全部已核验、具备 `work_id/document_id` 的 canonical 论文增量构建：
+
+```bash
+./.venv/bin/python main.py knowledge build
+```
+
+默认正文上限为 700 个近似词元。小于 80 词元的父章节引导段会作为独立
+`parent_context` 附着到直属子章节；同一章节的连续 Chunk 最多附带 80 词元的
+`overlap_context`。三个阈值可分别通过 `--max-tokens`、
+`--min-chunk-tokens` 和 `--overlap-tokens` 调整。上下文保留自己的章节、页码和
+block ID，不会跨论文、跨内容区域或跨兄弟章节。输入未变化时会根据指纹复用。
+
+本地关键词证据检索：
+
+```bash
+./.venv/bin/python main.py search \
+  "ephemeris and timing error disambiguation" \
+  --limit 5
+```
+
+可以使用 `--work-id` 或 `--document-id` 过滤。默认每个 `work_id` 最多返回两个
+Chunk，结果包含标题、章节路径、页码、`block_ids`、父章节上下文、重叠上下文
+和具体内容。若索引和 `chunks.jsonl` 指纹不一致，检索会拒绝使用旧索引并提示
+重新构建。
+
 ### 启动界面
 
 ```bash
@@ -487,19 +516,26 @@ data/
 ├── inbox/             # 外部 MCP 下载、等待用户确认入库的开放 PDF
 ├── raw/
 │   └── <paper_id>/
-│       └── original.pdf
+│       └── <verified-title>.pdf
 ├── parsed/
 │   └── <paper_id>/
 │       └── mineru/
 ├── canonical/
 │   └── <paper_id>/
 │       └── paper.json
-├── knowledge/       # 全局论文目录，后续加入 chunks
+├── knowledge/
 │   ├── papers.jsonl
 │   ├── works.jsonl
+│   ├── chunks.jsonl
+│   ├── structures/
+│   │   └── <document_id>.structure.json
+│   ├── chunks/
+│   │   └── <document_id>.chunks.json
 │   ├── metadata_reviews/
+│   ├── last_knowledge_build.json
 │   └── last_batch_report.json
-├── index/           # 后续向量、关键词和元数据索引
+├── index/
+│   └── bm25.json
 └── evaluation/      # 后续自动评测数据
 ```
 
@@ -514,11 +550,13 @@ LLM 通常不会直接浏览 `data/canonical` 目录。它只会看到检索器�
 文本。如果只把正文文本交给 LLM，不附带来源，那么无论文件叫什么，LLM 都
 可能把不同论文的内容混在一起。
 
-因此后续每个 Chunk 必须包含：
+因此当前每个 Chunk 都包含：
 
 ```json
 {
-  "chunk_id": "P_xxx_c000123",
+  "chunk_id": "D_xxx_cp02_c000123",
+  "work_id": "W_xxx",
+  "document_id": "D_xxx",
   "paper_id": "P_xxx",
   "title": "论文标题",
   "page_start": 3,
@@ -563,7 +601,7 @@ P_aaa.paper.json
 P_bbb.paper.json
 ```
 
-## 后续多论文 RAG 流程
+## 多论文 RAG 流程
 
 ### 阶段 1：建立全局论文目录（v0.2 已完成）
 
@@ -593,58 +631,44 @@ data/knowledge/papers.jsonl
 
 `paper.json` 是单篇论文事实来源，`papers.jsonl` 是全库目录。
 
-### 阶段 2：自动分类和知识抽取
+### 阶段 2：恢复内容区域和章节结构（已完成）
 
-根据项目 taxonomy 自动提取：
+结构恢复在 Chunk 之前执行，负责：
 
-- research task；
-- method family；
-- algorithm；
-- observation type；
-- 卫星星座；
-- 信号和观测量；
-- 数据集、仿真和实验设置；
-- 主要结论。
+- 识别 abstract、main body、appendix、references、biography 等内容区域；
+- 恢复罗马数字、数字编号、字母子标题和无编号标题的章节路径；
+- 排除页眉页脚、目录、参考文献、致谢和作者简介；
+- 纠正被 MinerU 标为标题的 Figure、Table、Algorithm 和 Equation；
+- 为公式、图、表记录同章节内最近的上下文 block；
+- 使用已核验摘要只辅助识别 PDF 中的摘要 block，不把外部摘要伪装成本地证据。
 
-分类结果必须带 `paper_id`，不能生成脱离来源的全局标签文本。
+### 阶段 3：结构化 Chunk（已完成）
 
-### 阶段 3：结构化 Chunk
-
-Chunk 不应简单按固定字符数切分。建议：
-
-- 优先按标题和段落边界；
-- 保留 section path；
-- 连续短段可以合并；
-- 公式与解释段绑定在同一 Chunk 或建立引用关系；
-- 图表与 caption 绑定；
-- 参考文献和 Biography 默认不进入正文索引；
-- 每个 Chunk 始终携带 `work_id`、`document_id`、兼容 `paper_id` 和页码。
-
-全库 Chunk 可保存为：
+当前规则优先保持章节和 block 边界，必要时才按句子拆分超长内容。每个 Chunk
+携带 `work_id`、`document_id`、兼容 `paper_id`、章节路径、页码和 block ID；
+小父章节和章节内重叠分别存入 `parent_contexts` 与 `overlap_context`，不混入
+主证据字段。Chunk ID、顺序和输入指纹都是确定性的。全库产物位于：
 
 ```text
 data/knowledge/chunks.jsonl
 ```
 
-### 阶段 4：建立多种索引
+### 阶段 4：建立索引（BM25 已完成）
 
-建议至少保留三种能力：
-
-1. 向量索引：语义问题；
-2. BM25/全文索引：术语、公式变量、卫星名称和精确关键词；
-3. 元数据过滤：`paper_id`、年份、任务类别、算法和星座。
-
-索引中的每条记录必须保存：
+当前 BM25 无需外部服务，标题和章节字段有适度权重，并校验 Chunk 集合指纹。
+后续再补向量索引，用于语义问题；两类索引都必须保存：
 
 ```text
-chunk_id → work_id → document_id → page/block_ids → canonical_path
+chunk_id → work_id → document_id → page/block_ids
 ```
 
-不要只存 embedding 和正文，否则无法稳定引用或删除单篇论文。
+### 阶段 5：检索（BM25 基线已完成）
 
-### 阶段 5：检索与重排
+当前已支持关键词检索、`work_id/document_id` 过滤、按 `work_id` 控制证据数量和
+带页码/block 的结果。下一步是在此基线上增加向量召回、合并去重和 reranker，
+而不是改变 PDF 入库或把本地项目包装成 MCP。
 
-推荐流程：
+后续混合检索流程：
 
 ```text
 用户问题
@@ -658,6 +682,12 @@ chunk_id → work_id → document_id → page/block_ids → canonical_path
 
 “按 work_id 去重并控制证据多样性”既能防止同一论文的多个 PDF 版本重复占满
 上下文，也能避免一个长论文挤掉其他论文证据。
+
+### 后续：自动分类和知识抽取
+
+根据项目 taxonomy 自动提取 research task、method family、algorithm、观测量、
+卫星星座、实验设置和主要结论。分类结果必须带来源身份，不能生成脱离论文的
+全局标签文本。
 
 ### 阶段 6：生成带引用的回答
 
@@ -714,10 +744,14 @@ PDF。
 | 外部学术发现 MCP | 已完成 |
 | `work_id/document_id` 版本归并 | 已完成 |
 | 已核验标题 PDF 规范命名 | 已完成 |
+| 内容区域与章节结构恢复 | 已完成 |
+| 确定性结构化 Chunk | 已完成 |
+| 小父章节吸收与章节内重叠 | 已完成 |
+| 本地 BM25 索引 | 已完成 |
+| 带页码/block 的关键词证据检索 | 已完成 |
 | 自动分类 | 未实现 |
-| Chunk | 未实现 |
-| 向量/BM25 索引 | 未实现 |
-| 检索与重排 | 未实现 |
+| 向量索引 | 未实现 |
+| 混合检索与重排 | 未实现 |
 | LLM 回答和引用 | 未实现 |
 | 自动评测 | 未实现 |
 
@@ -729,6 +763,11 @@ PDF。
 - `app/ingestion/ingest.py`：pipeline 内部 PDF 入库；
 - `app/ingestion/batch.py`：容错批量入库与批处理报告；
 - `app/knowledge/catalog.py`：全局论文目录重建、读取与一致性检查；
+- `app/chunking/structure.py`：内容区域、章节路径和资产关系恢复；
+- `app/chunking/chunker.py`：确定性结构化 Chunk；
+- `app/chunking/builder.py`：全库增量知识层构建；
+- `app/indexing/bm25.py`：本地 BM25 倒排索引；
+- `app/retrieval/search.py`：带过滤、去重和引用的证据检索；
 - `app/parsing/precheck.py`：pipeline 内部 PDF 预检查；
 - `app/storage.py`：JSON 和 JSONL 原子写入；
 - `app/ui/gradio_app.py`：调用同一 pipeline 的界面。
@@ -748,8 +787,8 @@ Ubuntu 环境中自动安装主环境并运行以下检查：
 ```
 
 CI 不安装 MinerU，也不下载模型。测试使用小型临时 PDF 和模拟 MinerU 输出，
-用来验证入库、命令构造、失败处理和标准化逻辑。真实论文的 MinerU 解析仍在
-本地专用环境中运行。
+用来验证入库、命令构造、失败处理、标准化、结构恢复、Chunk、BM25 和检索
+逻辑。真实论文的 MinerU 解析仍在本地专用环境中运行。
 
 v0.2 的批量验收会自动生成 5 份独立 PDF 测试夹具和 1 份损坏 PDF，验证：
 

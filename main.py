@@ -153,6 +153,57 @@ def build_parser() -> argparse.ArgumentParser:
                 help="显式选择从 0 开始的候选序号；省略时使用严格自动规则。",
             )
 
+    knowledge_command = subparsers.add_parser(
+        "knowledge",
+        help="从 canonical paper.json 构建论文结构、Chunk 和本地索引。",
+    )
+    knowledge_subparsers = knowledge_command.add_subparsers(
+        dest="knowledge_command",
+        required=True,
+    )
+    knowledge_build_command = knowledge_subparsers.add_parser(
+        "build",
+        help="增量构建结构化知识层和 BM25 索引。",
+    )
+    knowledge_build_command.add_argument(
+        "--force",
+        action="store_true",
+        help="忽略输入指纹，重新生成每篇论文的结构和 Chunk。",
+    )
+    knowledge_build_command.add_argument(
+        "--max-tokens",
+        type=int,
+        default=700,
+        help="单个 Chunk 的最大近似词元数，默认 700。",
+    )
+    knowledge_build_command.add_argument(
+        "--min-chunk-tokens",
+        type=int,
+        default=80,
+        help="可吸收到直属子章节上下文的小 Chunk 阈值，默认 80。",
+    )
+    knowledge_build_command.add_argument(
+        "--overlap-tokens",
+        type=int,
+        default=80,
+        help="同一章节连续 Chunk 的最大重叠上下文词元数，默认 80。",
+    )
+
+    search_command = subparsers.add_parser(
+        "search",
+        help="从本地 BM25 索引检索带页码和 block 来源的论文证据。",
+    )
+    search_command.add_argument("query")
+    search_command.add_argument("--limit", type=int, default=10)
+    search_command.add_argument("--work-id")
+    search_command.add_argument("--document-id")
+    search_command.add_argument(
+        "--max-chunks-per-work",
+        type=int,
+        default=2,
+        help="每个逻辑论文最多返回的 Chunk 数，默认 2。",
+    )
+
     return parser
 
 
@@ -271,16 +322,46 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit(2)
         return
 
+    if args.command == "knowledge":
+        from app.chunking.builder import build_knowledge_base
+
+        knowledge_report = build_knowledge_base(
+            project_root=PROJECT_ROOT,
+            force=args.force,
+            maximum_tokens=args.max_tokens,
+            minimum_chunk_tokens=args.min_chunk_tokens,
+            overlap_tokens=args.overlap_tokens,
+        )
+        print_json(knowledge_report.to_dict())
+        if knowledge_report.issues:
+            raise SystemExit(1)
+        return
+
+    if args.command == "search":
+        from app.retrieval.search import search_evidence
+
+        print_json(
+            search_evidence(
+                project_root=PROJECT_ROOT,
+                query=args.query,
+                limit=args.limit,
+                work_id=args.work_id,
+                document_id=args.document_id,
+                max_chunks_per_work=args.max_chunks_per_work,
+            )
+        )
+        return
+
     config = config_from_args(args)
 
     if args.command == "batch":
-        report = batch_parse_directory(
+        batch_report = batch_parse_directory(
             input_directory=args.directory,
             config=config,
             recursive=args.recursive,
         )
-        print_json(report.to_dict())
-        if report.failed_count or report.catalog_issues:
+        print_json(batch_report.to_dict())
+        if batch_report.failed_count or batch_report.catalog_issues:
             raise SystemExit(1)
         return
 
