@@ -15,5 +15,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 tmp/
-data/
+# Keep local paper data private, but version the human retrieval qrels.
+data/*
+!data/evaluation/
+data/evaluation/*
+!data/evaluation/retrieval_questions.jsonl
 mineru_structure.txt

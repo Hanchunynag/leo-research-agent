@@ -387,6 +387,38 @@ Chunk，结果包含标题、章节路径、页码、`block_ids`、父章节上�
 和具体内容。若索引和 `chunks.jsonl` 指纹不一致，检索会拒绝使用旧索引并提示
 重新构建。
 
+### 运行检索评测基线
+
+人工标注问题集保存在：
+
+```text
+data/evaluation/retrieval_questions.jsonl
+```
+
+每道题按最细粒度可用标注判断相关性：优先使用 `relevant_block_ids`，缺失时才
+依次退回 `relevant_document_ids` 和 `relevant_work_ids`。父章节与重叠上下文中的
+block 也保留独立来源，因此可以参与严格 block 级评测。
+
+运行 BM25 基线：
+
+```bash
+./.venv/bin/python main.py evaluate retrieval
+```
+
+报告写入 `data/evaluation/bm25_baseline.json`，包含 Recall@1/5/10、MRR、
+nDCG@10、按问题类型聚合的指标以及每道题的排名。当前 21 道题的首版基线为：
+
+| 指标 | BM25 |
+|---|---:|
+| Recall@1 | 0.3571 |
+| Recall@5 | 0.5714 |
+| Recall@10 | 0.7857 |
+| MRR | 0.5137 |
+| nDCG@10 | 0.5685 |
+
+这组结果是 Dense、RRF 和 Reranker 后续必须对比的固定基线，不能只凭示例查询
+判断新检索器是否更好。
+
 ### 启动界面
 
 ```bash
@@ -668,6 +700,11 @@ chunk_id → work_id → document_id → page/block_ids
 带页码/block 的结果。下一步是在此基线上增加向量召回、合并去重和 reranker，
 而不是改变 PDF 入库或把本地项目包装成 MCP。
 
+检索评测器已经独立于具体召回器实现。BM25、后续 Dense、RRF 和 Reranker
+必须使用同一问题集、同一 block qrels 和同一指标函数，才能进行有效比较。
+Dense 业务层只依赖 `EmbeddingProvider` 协议，不直接导入具体模型 SDK 或 API
+客户端；本地 BGE 模型和远程 Embedding API 都必须通过这一接口接入。
+
 后续混合检索流程：
 
 ```text
@@ -749,11 +786,12 @@ PDF。
 | 小父章节吸收与章节内重叠 | 已完成 |
 | 本地 BM25 索引 | 已完成 |
 | 带页码/block 的关键词证据检索 | 已完成 |
+| block 级检索评测集与 BM25 基线 | 已完成 |
 | 自动分类 | 未实现 |
 | 向量索引 | 未实现 |
 | 混合检索与重排 | 未实现 |
 | LLM 回答和引用 | 未实现 |
-| 自动评测 | 未实现 |
+| 生成式回答自动评测 | 未实现 |
 
 ## 代码入口
 
@@ -768,6 +806,8 @@ PDF。
 - `app/chunking/builder.py`：全库增量知识层构建；
 - `app/indexing/bm25.py`：本地 BM25 倒排索引；
 - `app/retrieval/search.py`：带过滤、去重和引用的证据检索；
+- `app/evaluation/retrieval.py`：检索问题校验、qrels 映射和排名指标；
+- `app/embeddings/base.py`：与本地模型/API 解耦的 Embedding 协议；
 - `app/parsing/precheck.py`：pipeline 内部 PDF 预检查；
 - `app/storage.py`：JSON 和 JSONL 原子写入；
 - `app/ui/gradio_app.py`：调用同一 pipeline 的界面。

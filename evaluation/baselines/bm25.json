@@ -1,0 +1,27 @@
+{
+  "baseline_schema_version": "1.0",
+  "retriever": "bm25",
+  "evaluation_schema_version": "1.0",
+  "questions_path": "data/evaluation/retrieval_questions.jsonl",
+  "questions_sha256": "f59c0bbfc50ab4d6a096c4c260563a186b6271b60164a0c477f158f1b81467c0",
+  "question_count": 21,
+  "chunk_policy_version": "2.1",
+  "chunk_count": 135,
+  "chunks_digest": "26974e78733162a98405271f13fc146a6b842736f570418490e9c59c937fb7fa",
+  "bm25_schema_version": "2.0",
+  "k_values": [1, 5, 10],
+  "metrics": {
+    "recall@1": 0.357143,
+    "recall@5": 0.571429,
+    "recall@10": 0.785714,
+    "mrr": 0.513681,
+    "ndcg@10": 0.568536
+  },
+  "missed_at_10": ["Q004", "Q006", "Q011", "Q016"],
+  "ranked_6_to_10": {
+    "Q002": 6,
+    "Q007": 7,
+    "Q008": 6,
+    "Q019": 9
+  }
+}

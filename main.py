@@ -204,6 +204,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="每个逻辑论文最多返回的 Chunk 数，默认 2。",
     )
 
+    evaluate_command = subparsers.add_parser(
+        "evaluate",
+        help="运行本地检索与后续 RAG 质量评测。",
+    )
+    evaluate_subparsers = evaluate_command.add_subparsers(
+        dest="evaluate_command",
+        required=True,
+    )
+    retrieval_evaluate_command = evaluate_subparsers.add_parser(
+        "retrieval",
+        help="在人工标注问题集上评测 BM25 检索基线。",
+    )
+    retrieval_evaluate_command.add_argument(
+        "--questions",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "evaluation" / "retrieval_questions.jsonl",
+    )
+    retrieval_evaluate_command.add_argument(
+        "--output",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "evaluation" / "bm25_baseline.json",
+    )
+    retrieval_evaluate_command.add_argument(
+        "--k-values",
+        default="1,5,10",
+        help="逗号分隔的 Recall@K 列表，最大值同时用于 nDCG，默认 1,5,10。",
+    )
+
     return parser
 
 
@@ -229,6 +257,16 @@ def config_from_args(args: argparse.Namespace) -> PaperParseConfig:
         table_enabled=not args.no_table,
         force_mineru=args.force_mineru,
     )
+
+
+def parse_k_values(value: str) -> list[int]:
+    try:
+        values = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as error:
+        raise ValueError("--k-values 必须是逗号分隔的整数。") from error
+    if not values or any(item < 1 or item > 100 for item in values):
+        raise ValueError("--k-values 必须在 1 到 100 之间。")
+    return sorted(set(values))
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -348,6 +386,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                 work_id=args.work_id,
                 document_id=args.document_id,
                 max_chunks_per_work=args.max_chunks_per_work,
+            )
+        )
+        return
+
+    if args.command == "evaluate":
+        from app.evaluation.retrieval import evaluate_bm25
+
+        print_json(
+            evaluate_bm25(
+                project_root=PROJECT_ROOT,
+                questions_path=args.questions,
+                output_path=args.output,
+                k_values=parse_k_values(args.k_values),
             )
         )
         return
