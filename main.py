@@ -53,6 +53,25 @@ def add_embedding_options(command: argparse.ArgumentParser) -> None:
     )
 
 
+def add_reranker_options(command: argparse.ArgumentParser) -> None:
+    """为 RRF 精排与评测提供同一组 Cross-Encoder 参数。"""
+
+    command.add_argument(
+        "--reranker-model",
+        default="BAAI/bge-reranker-v2-m3",
+    )
+    command.add_argument(
+        "--reranker-revision",
+        help="Reranker 的精确 revision/commit SHA。",
+    )
+    command.add_argument(
+        "--reranker-device",
+        help="默认沿用 --device。",
+    )
+    command.add_argument("--reranker-batch-size", type=int, default=4)
+    command.add_argument("--reranker-max-length", type=int, default=1024)
+
+
 def add_mineru_options(command: argparse.ArgumentParser) -> None:
     """为单篇和批量入口添加同一组 MinerU 参数。"""
 
@@ -282,6 +301,28 @@ def build_parser() -> argparse.ArgumentParser:
     hybrid_search_command.add_argument("--rrf-k", type=int, default=60)
     add_embedding_options(hybrid_search_command)
 
+    rerank_command = subparsers.add_parser(
+        "rerank",
+        help="使用 BGE Cross-Encoder 精排 RRF Top-20。",
+    )
+    rerank_subparsers = rerank_command.add_subparsers(
+        dest="rerank_command",
+        required=True,
+    )
+    rerank_search_command = rerank_subparsers.add_parser(
+        "search",
+        help="召回 RRF 候选并执行 Cross-Encoder 精排。",
+    )
+    rerank_search_command.add_argument("query")
+    rerank_search_command.add_argument("--limit", type=int, default=10)
+    rerank_search_command.add_argument("--work-id")
+    rerank_search_command.add_argument("--document-id")
+    rerank_search_command.add_argument("--max-chunks-per-work", type=int, default=2)
+    rerank_search_command.add_argument("--candidate-limit", type=int, default=20)
+    rerank_search_command.add_argument("--rrf-k", type=int, default=60)
+    add_embedding_options(rerank_search_command)
+    add_reranker_options(rerank_search_command)
+
     evaluate_command = subparsers.add_parser(
         "evaluate",
         help="运行本地检索与后续 RAG 质量评测。",
@@ -292,11 +333,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retrieval_evaluate_command = evaluate_subparsers.add_parser(
         "retrieval",
-        help="在同一人工标注问题集上评测 BM25 或 Dense。",
+        help="在同一人工标注问题集上评测召回、候选池或精排。",
     )
     retrieval_evaluate_command.add_argument(
         "--retriever",
-        choices=["bm25", "dense", "rrf"],
+        choices=["bm25", "dense", "rrf", "oracle", "reranker"],
         default="bm25",
     )
     retrieval_evaluate_command.add_argument(
@@ -317,6 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
     retrieval_evaluate_command.add_argument("--candidate-limit", type=int, default=20)
     retrieval_evaluate_command.add_argument("--rrf-k", type=int, default=60)
     add_embedding_options(retrieval_evaluate_command)
+    add_reranker_options(retrieval_evaluate_command)
 
     return parser
 
@@ -367,6 +409,25 @@ def dense_provider_from_args(args: argparse.Namespace) -> Any:
             device=args.device,
             cache_folder=args.model_cache,
             batch_size=args.embedding_batch_size,
+            local_files_only=args.local_files_only,
+            show_progress_bar=not args.no_progress,
+        )
+    )
+
+
+def reranker_provider_from_args(args: argparse.Namespace) -> Any:
+    """延迟创建 Cross-Encoder，普通召回命令不加载 Reranker。"""
+
+    from app.reranking.bge import BGERerankerConfig, BGERerankerProvider
+
+    return BGERerankerProvider(
+        BGERerankerConfig(
+            model_name=args.reranker_model,
+            revision=args.reranker_revision,
+            device=args.reranker_device or args.device,
+            cache_folder=args.model_cache,
+            batch_size=args.reranker_batch_size,
+            max_length=args.reranker_max_length,
             local_files_only=args.local_files_only,
             show_progress_bar=not args.no_progress,
         )
@@ -541,11 +602,32 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         return
 
+    if args.command == "rerank":
+        from app.retrieval.reranked import search_reranked_evidence
+
+        print_json(
+            search_reranked_evidence(
+                project_root=PROJECT_ROOT,
+                embedding_provider=dense_provider_from_args(args),
+                reranker_provider=reranker_provider_from_args(args),
+                query=args.query,
+                limit=args.limit,
+                work_id=args.work_id,
+                document_id=args.document_id,
+                max_chunks_per_work=args.max_chunks_per_work,
+                candidate_limit=args.candidate_limit,
+                rrf_k=args.rrf_k,
+            )
+        )
+        return
+
     if args.command == "evaluate":
         from app.evaluation.retrieval import (
             evaluate_bm25,
+            evaluate_candidate_pool_oracle,
             evaluate_dense,
             evaluate_hybrid_rrf,
+            evaluate_reranked,
         )
 
         output = args.output or (
@@ -567,6 +649,26 @@ def main(argv: Sequence[str] | None = None) -> None:
                 project_root=PROJECT_ROOT,
                 questions_path=args.questions,
                 provider=dense_provider_from_args(args),
+                output_path=output,
+                k_values=parse_k_values(args.k_values),
+                candidate_limit=args.candidate_limit,
+                rrf_k=args.rrf_k,
+            )
+        elif args.retriever == "oracle":
+            report = evaluate_candidate_pool_oracle(
+                project_root=PROJECT_ROOT,
+                questions_path=args.questions,
+                provider=dense_provider_from_args(args),
+                output_path=output,
+                candidate_limit=args.candidate_limit,
+                rrf_k=args.rrf_k,
+            )
+        elif args.retriever == "reranker":
+            report = evaluate_reranked(
+                project_root=PROJECT_ROOT,
+                questions_path=args.questions,
+                embedding_provider=dense_provider_from_args(args),
+                reranker_provider=reranker_provider_from_args(args),
                 output_path=output,
                 k_values=parse_k_values(args.k_values),
                 candidate_limit=args.candidate_limit,

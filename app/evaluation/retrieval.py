@@ -8,9 +8,11 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Sequence
 
 from app.embeddings.base import EmbeddingProvider
+from app.reranking.base import RerankerProvider
 from app.retrieval.search import load_chunks, search_evidence
 from app.storage import write_json_atomic
 
@@ -378,6 +380,296 @@ def evaluate_hybrid_rrf(
     report["candidate_limit_per_source"] = candidate_limit
     report["rrf_k"] = rrf_k
     report["questions_path"] = str(questions_path.expanduser().resolve())
+    if output_path is not None:
+        resolved_output = output_path.expanduser().resolve()
+        report["output_path"] = str(resolved_output)
+        write_json_atomic(resolved_output, report)
+    return report
+
+
+def evaluate_candidate_pool_oracle(
+    project_root: Path,
+    questions_path: Path,
+    provider: EmbeddingProvider,
+    output_path: Path | None = None,
+    candidate_limit: int = 20,
+    rrf_k: int = 60,
+) -> dict[str, Any]:
+    """测量 BM25∪Dense 候选池及其 RRF Top-N 的理论召回上限。"""
+
+    from app.retrieval.dense import search_dense_evidence
+    from app.retrieval.hybrid import reciprocal_rank_fusion
+
+    root = project_root.expanduser().resolve()
+    questions = load_retrieval_questions(questions_path)
+    chunks = load_chunks(root)
+    per_question: list[dict[str, Any]] = []
+    union_recalls: list[float] = []
+    rrf_recalls: list[float] = []
+    union_sizes: list[int] = []
+    for question in questions:
+        qrels = relevant_chunk_ids(question, chunks)
+        if not qrels:
+            raise ValueError(
+                f"{question.question_id} 的标注在当前 chunks 中没有对应证据。"
+            )
+        bm25 = search_evidence(
+            project_root=root,
+            query=question.question,
+            limit=candidate_limit,
+            max_chunks_per_work=20,
+        )
+        dense = search_dense_evidence(
+            project_root=root,
+            provider=provider,
+            query=question.question,
+            limit=candidate_limit,
+            max_chunks_per_work=20,
+        )
+        bm25_results = [
+            value for value in bm25.get("results", []) if isinstance(value, dict)
+        ]
+        dense_results = [
+            value for value in dense.get("results", []) if isinstance(value, dict)
+        ]
+        union_ids = {
+            chunk_id
+            for result in [*bm25_results, *dense_results]
+            if isinstance((chunk_id := result.get("chunk_id")), str)
+        }
+        fused = reciprocal_rank_fusion(
+            {"bm25": bm25_results, "dense": dense_results},
+            rrf_k=rrf_k,
+            limit=candidate_limit,
+        )
+        rrf_ids = {
+            chunk_id
+            for result in fused
+            if isinstance((chunk_id := result.get("chunk_id")), str)
+        }
+        union_hits = qrels & union_ids
+        rrf_hits = qrels & rrf_ids
+        union_recall = len(union_hits) / len(qrels)
+        rrf_recall = len(rrf_hits) / len(qrels)
+        union_recalls.append(union_recall)
+        rrf_recalls.append(rrf_recall)
+        union_sizes.append(len(union_ids))
+        per_question.append(
+            {
+                **asdict(question),
+                "target_level": question.target_level,
+                "relevant_chunk_ids": sorted(qrels),
+                "bm25_candidate_ids": [
+                    result.get("chunk_id") for result in bm25_results
+                ],
+                "dense_candidate_ids": [
+                    result.get("chunk_id") for result in dense_results
+                ],
+                "union_candidate_count": len(union_ids),
+                "union_relevant_ids": sorted(union_hits),
+                "union_oracle_recall": union_recall,
+                "rrf_candidate_ids": [result.get("chunk_id") for result in fused],
+                "rrf_relevant_ids": sorted(rrf_hits),
+                "rrf_pool_oracle_recall": rrf_recall,
+            }
+        )
+
+    def pool_summary(values: list[float]) -> dict[str, float]:
+        count = len(values)
+        return {
+            "mean_recall": round(sum(values) / count, 6),
+            "any_hit_rate": round(sum(value > 0 for value in values) / count, 6),
+            "full_recall_rate": round(sum(value == 1 for value in values) / count, 6),
+        }
+
+    report: dict[str, Any] = {
+        "evaluation_schema_version": EVALUATION_SCHEMA_VERSION,
+        "retriever": "candidate_pool_oracle",
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "question_count": len(questions),
+        "candidate_limit_per_source": candidate_limit,
+        "rrf_k": rrf_k,
+        "model_name": getattr(provider, "model_name", None),
+        "model_revision": getattr(provider, "revision", None),
+        "union_top_n_each": {
+            **pool_summary(union_recalls),
+            "mean_candidate_count": round(sum(union_sizes) / len(union_sizes), 3),
+        },
+        "rrf_top_n": pool_summary(rrf_recalls),
+        "questions_path": str(questions_path.expanduser().resolve()),
+        "per_question": per_question,
+    }
+    if output_path is not None:
+        resolved_output = output_path.expanduser().resolve()
+        report["output_path"] = str(resolved_output)
+        write_json_atomic(resolved_output, report)
+    return report
+
+
+def _latency_summary(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {"mean": 0.0, "p50": 0.0, "p95": 0.0}
+    ordered = sorted(values)
+    p95_index = max(0, math.ceil(len(ordered) * 0.95) - 1)
+    middle = len(ordered) // 2
+    median = (
+        ordered[middle]
+        if len(ordered) % 2
+        else (ordered[middle - 1] + ordered[middle]) / 2
+    )
+    return {
+        "mean": round(sum(ordered) / len(ordered), 3),
+        "p50": round(median, 3),
+        "p95": round(ordered[p95_index], 3),
+    }
+
+
+def evaluate_reranked(
+    project_root: Path,
+    questions_path: Path,
+    embedding_provider: EmbeddingProvider,
+    reranker_provider: RerankerProvider,
+    output_path: Path | None = None,
+    k_values: Sequence[int] = (1, 5, 10),
+    candidate_limit: int = 20,
+    rrf_k: int = 60,
+) -> dict[str, Any]:
+    """在同一 qrels 上评测 RRF Top-N 的 Cross-Encoder 精排。"""
+
+    from app.retrieval.reranked import search_reranked_evidence
+
+    root = project_root.expanduser().resolve()
+    questions = load_retrieval_questions(questions_path)
+    chunks = load_chunks(root)
+    embedding_warmup_started = perf_counter()
+    embedding_warmup_vector = embedding_provider.embed_query(
+        "warmup retrieval query"
+    )
+    embedding_warmup_ms = (perf_counter() - embedding_warmup_started) * 1000
+    if not embedding_warmup_vector:
+        raise RuntimeError("Embedding warmup 返回了空向量。")
+    reranker_warmup_started = perf_counter()
+    warmup_scores = reranker_provider.score(
+        "warmup relevance query",
+        ["warmup candidate document"],
+    )
+    reranker_warmup_ms = (perf_counter() - reranker_warmup_started) * 1000
+    if len(warmup_scores) != 1:
+        raise RuntimeError("Reranker warmup 返回的分数数量不正确。")
+
+    diagnostics: dict[str, dict[str, Any]] = {}
+
+    def retrieve(question: str, limit: int) -> list[dict[str, Any]]:
+        result = search_reranked_evidence(
+            project_root=root,
+            embedding_provider=embedding_provider,
+            reranker_provider=reranker_provider,
+            query=question,
+            limit=candidate_limit,
+            max_chunks_per_work=20,
+            candidate_limit=candidate_limit,
+            rrf_k=rrf_k,
+        )
+        raw_results = result.get("results")
+        values = (
+            [value for value in raw_results if isinstance(value, dict)]
+            if isinstance(raw_results, list)
+            else []
+        )
+        diagnostics[question] = {
+            "candidate_count": result.get("candidate_count"),
+            "timing": result.get("timing"),
+            "results": values,
+        }
+        return values[:limit]
+
+    report = evaluate_ranked_retriever(
+        questions=questions,
+        chunks=chunks,
+        retrieve=retrieve,
+        retriever_name="hybrid_rrf_reranked",
+        k_values=k_values,
+    )
+    candidate_ms: list[float] = []
+    reranking_ms: list[float] = []
+    total_ms: list[float] = []
+    total_pairs = 0
+    for question_report in report["per_question"]:
+        question_text = str(question_report["question"])
+        diagnostic = diagnostics[question_text]
+        results = diagnostic["results"]
+        qrels = set(question_report["relevant_chunk_ids"])
+        rrf_rank = min(
+            (
+                int(result["rrf_rank"])
+                for result in results
+                if result.get("chunk_id") in qrels
+                and isinstance(result.get("rrf_rank"), int)
+            ),
+            default=None,
+        )
+        reranked_rank = next(
+            (
+                rank
+                for rank, result in enumerate(results, 1)
+                if result.get("chunk_id") in qrels
+            ),
+            None,
+        )
+        rank_delta = (
+            reranked_rank - rrf_rank
+            if reranked_rank is not None and rrf_rank is not None
+            else None
+        )
+        timing = diagnostic.get("timing")
+        if not isinstance(timing, dict):
+            timing = {}
+        question_report["reranking_diagnostics"] = {
+            "rrf_candidate_first_relevant_rank": rrf_rank,
+            "reranked_candidate_first_relevant_rank": reranked_rank,
+            "rank_delta": rank_delta,
+            "candidate_count": diagnostic["candidate_count"],
+            "timing": timing,
+        }
+        candidate_ms.append(float(timing.get("candidate_retrieval_ms", 0.0)))
+        reranking_ms.append(float(timing.get("reranking_ms", 0.0)))
+        total_ms.append(float(timing.get("total_ms", 0.0)))
+        total_pairs += int(diagnostic["candidate_count"] or 0)
+
+    reranking_seconds = sum(reranking_ms) / 1000
+    total_seconds = sum(total_ms) / 1000
+    report.update(
+        {
+            "embedding_model_name": getattr(embedding_provider, "model_name", None),
+            "embedding_model_revision": getattr(
+                embedding_provider, "revision", None
+            ),
+            "reranker_model_name": getattr(reranker_provider, "model_name", None),
+            "reranker_model_revision": getattr(
+                reranker_provider, "revision", None
+            ),
+            "reranker_max_length": getattr(reranker_provider, "max_length", None),
+            "candidate_limit": candidate_limit,
+            "rrf_k": rrf_k,
+            "performance": {
+                "embedding_warmup_ms": round(embedding_warmup_ms, 3),
+                "reranker_warmup_ms": round(reranker_warmup_ms, 3),
+                "candidate_retrieval_ms": _latency_summary(candidate_ms),
+                "reranking_ms": _latency_summary(reranking_ms),
+                "total_ms": _latency_summary(total_ms),
+                "total_pairs": total_pairs,
+                "pairs_per_second": round(
+                    total_pairs / reranking_seconds if reranking_seconds else 0.0,
+                    3,
+                ),
+                "queries_per_second": round(
+                    len(questions) / total_seconds if total_seconds else 0.0,
+                    3,
+                ),
+            },
+            "questions_path": str(questions_path.expanduser().resolve()),
+        }
+    )
     if output_path is not None:
         resolved_output = output_path.expanduser().resolve()
         report["output_path"] = str(resolved_output)

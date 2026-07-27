@@ -1,0 +1,85 @@
+{
+  "baseline_schema_version": "1.0",
+  "retriever": "hybrid_rrf_reranked",
+  "evaluation_schema_version": "1.0",
+  "questions_path": "data/evaluation/retrieval_questions.jsonl",
+  "questions_sha256": "f59c0bbfc50ab4d6a096c4c260563a186b6271b60164a0c477f158f1b81467c0",
+  "question_count": 21,
+  "chunk_policy_version": "2.1",
+  "chunk_count": 135,
+  "chunks_digest": "26974e78733162a98405271f13fc146a6b842736f570418490e9c59c937fb7fa",
+  "candidate_retriever": "hybrid_rrf",
+  "candidate_limit": 20,
+  "rrf_k": 60,
+  "embedding_model_name": "BAAI/bge-m3",
+  "embedding_model_revision": "5617a9f61b028005a4858fdac845db406aefb181",
+  "reranker_model_name": "BAAI/bge-reranker-v2-m3",
+  "reranker_model_revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
+  "reranker_score_transform": "identity_logits",
+  "reranker_max_length": 1024,
+  "reranker_batch_size": 4,
+  "device": "cpu",
+  "k_values": [1, 5, 10],
+  "metrics": {
+    "recall@1": 0.571429,
+    "recall@5": 0.785714,
+    "recall@10": 0.928571,
+    "mrr": 0.710979,
+    "ndcg@10": 0.741598
+  },
+  "delta_vs_rrf": {
+    "recall@1": 0.190477,
+    "recall@5": -0.02381,
+    "recall@10": 0.047619,
+    "mrr": 0.170106,
+    "ndcg@10": 0.118374
+  },
+  "candidate_pool_oracle": {
+    "mean_recall": 0.928571,
+    "any_hit_rate": 0.952381,
+    "full_recall_rate": 0.904762
+  },
+  "performance": {
+    "embedding_warmup_ms": 3778.52,
+    "reranker_warmup_ms": 885.324,
+    "candidate_retrieval_ms": {
+      "mean": 136.741,
+      "p50": 121.886,
+      "p95": 239.461
+    },
+    "reranking_ms": {
+      "mean": 14010.145,
+      "p50": 14225.825,
+      "p95": 17181.199
+    },
+    "total_ms": {
+      "mean": 14146.983,
+      "p50": 14346.666,
+      "p95": 17299.847
+    },
+    "total_pairs": 420,
+    "pairs_per_second": 1.428,
+    "queries_per_second": 0.071
+  },
+  "rank_changes": {
+    "improved": {
+      "Q004": {"rrf_rank": 12, "reranked_rank": 3},
+      "Q007": {"rrf_rank": 2, "reranked_rank": 1},
+      "Q008": {"rrf_rank": 4, "reranked_rank": 1},
+      "Q010": {"rrf_rank": 3, "reranked_rank": 2},
+      "Q013": {"rrf_rank": 3, "reranked_rank": 1},
+      "Q019": {"rrf_rank": 5, "reranked_rank": 1},
+      "Q020": {"rrf_rank": 5, "reranked_rank": 1}
+    },
+    "degraded": {
+      "Q006": {"rrf_rank": 4, "reranked_rank": 9},
+      "Q012": {"rrf_rank": 3, "reranked_rank": 8},
+      "Q016": {"rrf_rank": 8, "reranked_rank": 9},
+      "Q017": {"rrf_rank": 3, "reranked_rank": 4}
+    },
+    "stable_question_ids": [
+      "Q001", "Q002", "Q003", "Q005", "Q009", "Q014", "Q015", "Q018", "Q021"
+    ],
+    "candidate_pool_miss_question_ids": ["Q011"]
+  }
+}
