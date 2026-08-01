@@ -13,6 +13,12 @@ from app.agentic.coverage import (
     deterministic_repair,
     deterministic_semantic_validation,
 )
+from app.agentic.harness import (
+    AgenticRunHarness,
+    AgenticRunPolicy,
+    AgenticStage,
+    TerminationReason,
+)
 from app.agentic.models import (
     AgenticAnswerDraft,
     AgenticMetricsRecord,
@@ -43,8 +49,7 @@ from app.generation.models import (
     GroundedAnswer,
 )
 from app.generation.validation import validate_answer_draft
-from app.indexing.tokenization import token_count
-from app.indexing.tokenization import normalize_search_text
+from app.indexing.tokenization import normalize_search_text, token_count
 from app.runtime.retrieval import RetrievalRuntime
 
 
@@ -116,6 +121,14 @@ class AgenticRAGService:
         self.store = session_store
         self.reranker = reranker
         self.config = config
+        self.policy = AgenticRunPolicy(
+            max_retrieval_rounds=config.max_retrieval_rounds,
+            max_structure_repairs=config.max_structure_repairs,
+            max_answer_repairs=config.max_answer_repairs,
+            max_total_latency_ms=config.max_total_latency_ms,
+            fail_closed=config.fail_closed,
+            allow_model_downloads=config.allow_model_downloads,
+        )
         self.planner = QueryPlanner()
         self._stage_fallbacks: list[str] = []
         self.router = TopicRouter(
@@ -515,6 +528,7 @@ class AgenticRAGService:
         """执行最多 N 轮检索和一次 Repair，并追加全部状态事件。"""
 
         started = perf_counter()
+        harness = AgenticRunHarness(self.policy)
         compaction_count = 0
         self._stage_fallbacks = []
         configuration_fingerprint = _configuration_fingerprint(self.config)
@@ -541,23 +555,31 @@ class AgenticRAGService:
             if current_topic is not None
             else []
         )
-        preliminary_query = (
-            rewrite_standalone_query(query, str(current_topic["topic_summary"]))
-            if current_topic is not None
-            else query
-        )
-        preliminary = (
-            self._retrieve_queries([preliminary_query])
-            if current_topic is not None and not force_new_topic
-            else []
-        )
-        route = self.router.route(
-            query,
-            current_topic,
-            preliminary,
-            registry,
-            force_new_topic=force_new_topic,
-        )
+        with harness.stage(AgenticStage.ROUTING) as routing_trace:
+            preliminary_query = (
+                rewrite_standalone_query(query, str(current_topic["topic_summary"]))
+                if current_topic is not None
+                else query
+            )
+            preliminary = (
+                self._retrieve_queries([preliminary_query])
+                if current_topic is not None and not force_new_topic
+                else []
+            )
+            route = self.router.route(
+                query,
+                current_topic,
+                preliminary,
+                registry,
+                force_new_topic=force_new_topic,
+            )
+            routing_trace.update(
+                {
+                    "relation": route.relation,
+                    "context_dependent": route.context_dependent,
+                    "preliminary_candidate_count": len(preliminary),
+                }
+            )
         if route.relation != "same_topic" or current_topic is None:
             parent = (
                 str(current_topic["topic_id"])
@@ -580,7 +602,16 @@ class AgenticRAGService:
             topic = current_topic
             self.store.set_active_topic(sid, str(topic["topic_id"]))
         topic_id = str(topic["topic_id"])
-        plan = self.planner.plan(route.standalone_query)
+        with harness.stage(AgenticStage.PLANNING) as planning_trace:
+            plan = self.planner.plan(route.standalone_query)
+            planning_trace.update(
+                {
+                    "intent": plan.intent,
+                    "target_category": plan.target_category,
+                    "subquestion_count": len(plan.subquestions),
+                    "retrieval_query_count": len(plan.retrieval_queries),
+                }
+            )
         user_event = self.store.append_event(
             sid,
             topic_id,
@@ -609,23 +640,48 @@ class AgenticRAGService:
             followup_queries=queries,
         )
         last_reranked: list[dict[str, Any]] = []
-        for round_number in range(1, self.config.max_retrieval_rounds + 1):
-            fresh = [
-                *(preliminary if round_number == 1 else []),
-                *self._retrieve_queries(queries),
-            ]
-            reused = (
-                self._relevant_registry(route.standalone_query, registry)
-                if route.reuse_previous_evidence
-                else []
-            )
-            retrieved = self._merge_fresh_and_reused(fresh, reused)
-            reranked = self.reranker.rerank(
-                route.standalone_query,
-                retrieved,
-                self.config.rerank_top_k,
-                plan,
-            )
+        while harness.can_retrieve():
+            round_number = harness.begin_retrieval_round()
+            with harness.stage(
+                AgenticStage.RETRIEVING,
+                attempt=round_number,
+                details={"query_count": len(queries)},
+            ) as retrieval_trace:
+                fresh = [
+                    *(preliminary if round_number == 1 else []),
+                    *self._retrieve_queries(queries),
+                ]
+                reused = (
+                    self._relevant_registry(route.standalone_query, registry)
+                    if route.reuse_previous_evidence
+                    else []
+                )
+                retrieved = self._merge_fresh_and_reused(fresh, reused)
+                retrieval_trace.update(
+                    {
+                        "candidate_count": len(retrieved),
+                        "reused_candidate_count": len(reused),
+                    }
+                )
+            with harness.stage(
+                AgenticStage.RERANKING,
+                attempt=round_number,
+                details={"candidate_count": len(retrieved)},
+            ) as rerank_trace:
+                reranked = self.reranker.rerank(
+                    route.standalone_query,
+                    retrieved,
+                    self.config.rerank_top_k,
+                    plan,
+                )
+                rerank_trace.update(
+                    {
+                        "output_count": len(reranked),
+                        "fallback_used": bool(
+                            self.reranker.last_diagnostics.get("fallback_used")
+                        ),
+                    }
+                )
             reranker_diagnostics.append(dict(self.reranker.last_diagnostics))
             registered, new_count, reused_count = self._register_round_evidence(
                 sid,
@@ -638,7 +694,18 @@ class AgenticRAGService:
             total_new += new_count
             total_reused += reused_count
             last_reranked = registered
-            coverage = self._coverage(plan, list(evidence_by_id.values()))
+            with harness.stage(
+                AgenticStage.COVERAGE_CHECKING,
+                attempt=round_number,
+                details={"evidence_count": len(evidence_by_id)},
+            ) as coverage_trace:
+                coverage = self._coverage(plan, list(evidence_by_id.values()))
+                coverage_trace.update(
+                    {
+                        "overall_sufficient": coverage.overall_sufficient,
+                        "followup_query_count": len(coverage.followup_queries),
+                    }
+                )
             status: EvidenceStatus = (
                 "sufficient"
                 if coverage.overall_sufficient
@@ -664,22 +731,37 @@ class AgenticRAGService:
             if not queries:
                 break
 
-        final_evidence = self._final_evidence(
-            coverage,
-            evidence_by_id,
-            last_reranked,
-        )
-        context = self._build_context(
-            route.standalone_query,
-            final_evidence,
-            len(round_reports),
-        )
-        if not coverage.overall_sufficient:
-            reason = "; ".join(
-                item.missing_information
-                for item in coverage.coverage
-                if item.status != "sufficient"
-            ) or "达到最大检索轮数后证据覆盖仍不足。"
+        with harness.stage(AgenticStage.CONTEXT_BUILDING) as context_trace:
+            final_evidence = self._final_evidence(
+                coverage,
+                evidence_by_id,
+                last_reranked,
+            )
+            context = self._build_context(
+                route.standalone_query,
+                final_evidence,
+                len(round_reports),
+            )
+            context_trace.update(
+                {
+                    "evidence_count": len(final_evidence),
+                    "token_count": context.token_count,
+                }
+            )
+        budget_exhausted = harness.deadline_exceeded()
+        if budget_exhausted or not coverage.overall_sufficient:
+            reason = (
+                "Harness 总运行时限已耗尽。"
+                if budget_exhausted
+                else (
+                    "; ".join(
+                        item.missing_information
+                        for item in coverage.coverage
+                        if item.status != "sufficient"
+                    )
+                    or "达到最大检索轮数后证据覆盖仍不足。"
+                )
+            )
             answer = self._refusal_result(query, context, reason)
             semantic = SemanticValidationReport(
                 valid=False,
@@ -709,62 +791,138 @@ class AgenticRAGService:
                 * self.config.context_compaction_threshold
             )
             if token_count(stable_json(messages)) >= threshold:
-                compact_topic(
-                    self.store,
-                    sid,
-                    topic_id,
-                    recent_event_count=self.config.recent_events_after_compaction,
-                )
-                compaction_count += 1
-                events = self.store.list_events(sid, topic_id)
-                messages = build_topic_messages(events)
-                previous_event_count = 0
+                with harness.stage(AgenticStage.COMPACTING) as compaction_trace:
+                    report = compact_topic(
+                        self.store,
+                        sid,
+                        topic_id,
+                        recent_event_count=self.config.recent_events_after_compaction,
+                    )
+                    compaction_count += 1
+                    events = self.store.list_events(sid, topic_id)
+                    messages = build_topic_messages(events)
+                    previous_event_count = 0
+                    compaction_trace.update(
+                        {
+                            "before_tokens": report.before_tokens,
+                            "after_tokens": report.after_tokens,
+                            "retained_evidence_count": len(
+                                report.retained_evidence_ids
+                            ),
+                        }
+                    )
             new_message_count = max(0, len(events) - previous_event_count)
-            try:
-                draft, generation_metadata = self.reasoning_provider.generate_answer(
-                    messages
+            with harness.stage(AgenticStage.GENERATING) as generation_trace:
+                try:
+                    draft, generation_metadata = (
+                        self.reasoning_provider.generate_answer(messages)
+                    )
+                except Exception as error:
+                    self._stage_fallbacks.append("answer_generation")
+                    generation_trace["fallback_used"] = True
+                    generation_trace["error_type"] = type(error).__name__
+                    draft = AgenticAnswerDraft(
+                        answerable=False,
+                        claims=[],
+                        refusal_reason=(
+                            "回答模型未返回合法结构："
+                            f"{type(error).__name__}"
+                        ),
+                    )
+                    generation_metadata = {}
+                structure_repairs = generation_metadata.get(
+                    "structure_repair_attempts",
+                    0,
                 )
-            except Exception as error:
-                self._stage_fallbacks.append("answer_generation")
-                draft = AgenticAnswerDraft(
-                    answerable=False,
-                    claims=[],
-                    refusal_reason=f"回答模型未返回合法结构：{type(error).__name__}",
+                if isinstance(structure_repairs, int):
+                    harness.record_structure_repairs(structure_repairs)
+                generation_trace.update(
+                    {
+                        "answerable": draft.answerable,
+                        "claim_count": len(draft.claims),
+                        "structure_repair_attempts": (
+                            structure_repairs
+                            if isinstance(structure_repairs, int)
+                            else 0
+                        ),
+                    }
                 )
-                generation_metadata = {}
-            structural = validate_answer_draft(
-                _agentic_to_answer_draft(draft),
-                context,
-            )
-            structural = self._validate_evidence_mapping(draft, context, structural)
-            semantic = self._semantic_validate(
-                route.standalone_query,
-                plan,
-                draft,
-                final_evidence,
-                structural.valid,
-            )
+            with harness.stage(
+                AgenticStage.STRUCTURAL_VALIDATING
+            ) as structural_trace:
+                structural = validate_answer_draft(
+                    _agentic_to_answer_draft(draft),
+                    context,
+                )
+                structural = self._validate_evidence_mapping(
+                    draft,
+                    context,
+                    structural,
+                )
+                structural_trace.update(
+                    {
+                        "valid": structural.valid,
+                        "issue_count": len(structural.issues),
+                    }
+                )
+            with harness.stage(
+                AgenticStage.SEMANTIC_VALIDATING
+            ) as semantic_trace:
+                semantic = self._semantic_validate(
+                    route.standalone_query,
+                    plan,
+                    draft,
+                    final_evidence,
+                    structural.valid,
+                )
+                semantic_trace.update(
+                    {
+                        "valid": semantic.valid,
+                        "requires_retrieval": semantic.requires_retrieval,
+                        "claim_count": len(semantic.claim_results),
+                    }
+                )
             if (
                 draft.answerable
                 and semantic.requires_retrieval
-                and len(round_reports) < self.config.max_retrieval_rounds
+                and harness.can_retrieve()
             ):
+                round_number = harness.begin_retrieval_round()
                 followup_queries = semantic.followup_queries or [
                     route.standalone_query
                 ]
-                retrieved = self._merge_fresh_and_reused(
-                    self._retrieve_queries(followup_queries),
-                    self._relevant_registry(
+                with harness.stage(
+                    AgenticStage.RETRIEVING,
+                    attempt=round_number,
+                    details={"query_count": len(followup_queries), "semantic": True},
+                ) as retrieval_trace:
+                    retrieved = self._merge_fresh_and_reused(
+                        self._retrieve_queries(followup_queries),
+                        self._relevant_registry(
+                            route.standalone_query,
+                            list(evidence_by_id.values()),
+                        ),
+                    )
+                    retrieval_trace["candidate_count"] = len(retrieved)
+                with harness.stage(
+                    AgenticStage.RERANKING,
+                    attempt=round_number,
+                    details={"candidate_count": len(retrieved), "semantic": True},
+                ) as rerank_trace:
+                    reranked = self.reranker.rerank(
                         route.standalone_query,
-                        list(evidence_by_id.values()),
-                    ),
-                )
-                reranked = self.reranker.rerank(
-                    route.standalone_query,
-                    retrieved,
-                    self.config.rerank_top_k,
-                    plan,
-                )
+                        retrieved,
+                        self.config.rerank_top_k,
+                        plan,
+                    )
+                    rerank_trace.update(
+                        {
+                            "output_count": len(reranked),
+                            "fallback_used": bool(
+                                self.reranker.last_diagnostics.get("fallback_used")
+                            ),
+                        }
+                    )
                 reranker_diagnostics.append(dict(self.reranker.last_diagnostics))
                 registered, new_count, reused_count = self._register_round_evidence(
                     sid,
@@ -777,7 +935,18 @@ class AgenticRAGService:
                 total_new += new_count
                 total_reused += reused_count
                 last_reranked = registered
-                coverage = self._coverage(plan, list(evidence_by_id.values()))
+                with harness.stage(
+                    AgenticStage.COVERAGE_CHECKING,
+                    attempt=round_number,
+                    details={"evidence_count": len(evidence_by_id), "semantic": True},
+                ) as coverage_trace:
+                    coverage = self._coverage(plan, list(evidence_by_id.values()))
+                    coverage_trace.update(
+                        {
+                            "overall_sufficient": coverage.overall_sufficient,
+                            "followup_query_count": len(coverage.followup_queries),
+                        }
+                    )
                 semantic_round_status: EvidenceStatus = (
                     "sufficient"
                     if coverage.overall_sufficient
@@ -785,7 +954,7 @@ class AgenticRAGService:
                 )
                 round_reports.append(
                     RetrievalRound(
-                        round=len(round_reports) + 1,
+                        round=round_number,
                         queries=list(followup_queries),
                         candidate_count=len(retrieved),
                         reranked_count=len(registered),
@@ -793,16 +962,26 @@ class AgenticRAGService:
                         coverage_status=semantic_round_status,
                     )
                 )
-                final_evidence = self._final_evidence(
-                    coverage,
-                    evidence_by_id,
-                    last_reranked,
-                )
-                context = self._build_context(
-                    route.standalone_query,
-                    final_evidence,
-                    len(round_reports),
-                )
+                with harness.stage(
+                    AgenticStage.CONTEXT_BUILDING,
+                    attempt=round_number,
+                ) as context_trace:
+                    final_evidence = self._final_evidence(
+                        coverage,
+                        evidence_by_id,
+                        last_reranked,
+                    )
+                    context = self._build_context(
+                        route.standalone_query,
+                        final_evidence,
+                        len(round_reports),
+                    )
+                    context_trace.update(
+                        {
+                            "evidence_count": len(final_evidence),
+                            "token_count": context.token_count,
+                        }
+                    )
                 self._append_source_mapping(
                     sid,
                     topic_id,
@@ -813,63 +992,157 @@ class AgenticRAGService:
                 events = self.store.list_events(sid, topic_id)
                 messages = build_topic_messages(events)
                 new_message_count = max(0, len(events) - previous_event_count)
-                try:
-                    draft, generation_metadata = (
-                        self.reasoning_provider.generate_answer(messages)
+                with harness.stage(
+                    AgenticStage.GENERATING,
+                    attempt=2,
+                    details={"after_semantic_retrieval": True},
+                ) as generation_trace:
+                    try:
+                        draft, generation_metadata = (
+                            self.reasoning_provider.generate_answer(messages)
+                        )
+                    except Exception as error:
+                        self._stage_fallbacks.append(
+                            "answer_generation_after_retrieval"
+                        )
+                        generation_trace["fallback_used"] = True
+                        generation_trace["error_type"] = type(error).__name__
+                        draft = AgenticAnswerDraft(
+                            answerable=False,
+                            claims=[],
+                            refusal_reason=(
+                                "补充检索后的回答模型未返回合法结构："
+                                f"{type(error).__name__}"
+                            ),
+                        )
+                        generation_metadata = {}
+                    structure_repairs = generation_metadata.get(
+                        "structure_repair_attempts",
+                        0,
                     )
-                except Exception as error:
-                    self._stage_fallbacks.append("answer_generation_after_retrieval")
-                    draft = AgenticAnswerDraft(
-                        answerable=False,
-                        claims=[],
-                        refusal_reason=(
-                            "补充检索后的回答模型未返回合法结构："
-                            f"{type(error).__name__}"
-                        ),
+                    if isinstance(structure_repairs, int):
+                        harness.record_structure_repairs(structure_repairs)
+                    generation_trace.update(
+                        {
+                            "answerable": draft.answerable,
+                            "claim_count": len(draft.claims),
+                            "structure_repair_attempts": (
+                                structure_repairs
+                                if isinstance(structure_repairs, int)
+                                else 0
+                            ),
+                        }
                     )
-                    generation_metadata = {}
-                structural = validate_answer_draft(
-                    _agentic_to_answer_draft(draft),
-                    context,
-                )
-                structural = self._validate_evidence_mapping(
-                    draft,
-                    context,
-                    structural,
-                )
-                semantic = self._semantic_validate(
-                    route.standalone_query,
-                    plan,
-                    draft,
-                    final_evidence,
-                    structural.valid,
-                )
-            repair_used = False
-            if draft.answerable and not semantic.valid:
-                repair_used = True
-                try:
-                    draft = self.reasoning_provider.repair_answer(
+                with harness.stage(
+                    AgenticStage.STRUCTURAL_VALIDATING,
+                    attempt=2,
+                ) as structural_trace:
+                    structural = validate_answer_draft(
+                        _agentic_to_answer_draft(draft),
+                        context,
+                    )
+                    structural = self._validate_evidence_mapping(
+                        draft,
+                        context,
+                        structural,
+                    )
+                    structural_trace.update(
+                        {
+                            "valid": structural.valid,
+                            "issue_count": len(structural.issues),
+                        }
+                    )
+                with harness.stage(
+                    AgenticStage.SEMANTIC_VALIDATING,
+                    attempt=2,
+                ) as semantic_trace:
+                    semantic = self._semantic_validate(
+                        route.standalone_query,
                         plan,
                         draft,
-                        semantic,
                         final_evidence,
+                        structural.valid,
                     )
-                except Exception:
-                    self._stage_fallbacks.append("answer_repair")
-                    draft = deterministic_repair(draft, semantic)
-                structural = validate_answer_draft(
-                    _agentic_to_answer_draft(draft),
-                    context,
-                )
-                structural = self._validate_evidence_mapping(draft, context, structural)
-                semantic = self._semantic_validate(
-                    route.standalone_query,
-                    plan,
-                    draft,
-                    final_evidence,
-                    structural.valid,
-                )
-            final_valid = structural.valid and semantic.valid
+                    semantic_trace.update(
+                        {
+                            "valid": semantic.valid,
+                            "requires_retrieval": semantic.requires_retrieval,
+                            "claim_count": len(semantic.claim_results),
+                        }
+                    )
+            repair_used = False
+            if (
+                draft.answerable
+                and not semantic.valid
+                and harness.can_repair_answer()
+            ):
+                repair_used = True
+                repair_attempt = harness.begin_answer_repair()
+                with harness.stage(
+                    AgenticStage.REPAIRING,
+                    attempt=repair_attempt,
+                ) as repair_trace:
+                    try:
+                        draft = self.reasoning_provider.repair_answer(
+                            plan,
+                            draft,
+                            semantic,
+                            final_evidence,
+                        )
+                    except Exception as error:
+                        self._stage_fallbacks.append("answer_repair")
+                        repair_trace["fallback_used"] = True
+                        repair_trace["error_type"] = type(error).__name__
+                        draft = deterministic_repair(draft, semantic)
+                    repair_trace.update(
+                        {
+                            "answerable": draft.answerable,
+                            "claim_count": len(draft.claims),
+                        }
+                    )
+                with harness.stage(
+                    AgenticStage.STRUCTURAL_VALIDATING,
+                    attempt=2,
+                ) as structural_trace:
+                    structural = validate_answer_draft(
+                        _agentic_to_answer_draft(draft),
+                        context,
+                    )
+                    structural = self._validate_evidence_mapping(
+                        draft,
+                        context,
+                        structural,
+                    )
+                    structural_trace.update(
+                        {
+                            "valid": structural.valid,
+                            "issue_count": len(structural.issues),
+                        }
+                    )
+                with harness.stage(
+                    AgenticStage.SEMANTIC_VALIDATING,
+                    attempt=2,
+                ) as semantic_trace:
+                    semantic = self._semantic_validate(
+                        route.standalone_query,
+                        plan,
+                        draft,
+                        final_evidence,
+                        structural.valid,
+                    )
+                    semantic_trace.update(
+                        {
+                            "valid": semantic.valid,
+                            "requires_retrieval": semantic.requires_retrieval,
+                            "claim_count": len(semantic.claim_results),
+                        }
+                    )
+            deadline_after_validation = harness.deadline_exceeded()
+            final_valid = (
+                structural.valid
+                and semantic.valid
+                and not deadline_after_validation
+            )
             if draft.answerable and final_valid:
                 answer = GroundedAnswer(
                     query=query,
@@ -883,8 +1156,13 @@ class AgenticRAGService:
                     diagnostics={},
                 )
             else:
-                reason = draft.refusal_reason or (
-                    "回答在一次修复后仍未通过 Claim-Citation 语义验证。"
+                reason = (
+                    "Harness 总运行时限已耗尽。"
+                    if deadline_after_validation
+                    else (
+                        draft.refusal_reason
+                        or "回答在一次修复后仍未通过 Claim-Citation 语义验证。"
+                    )
                 )
                 answer = GroundedAnswer(
                     query=query,
@@ -907,59 +1185,85 @@ class AgenticRAGService:
                 ),
             )
 
-        validation_payload = semantic.model_dump(mode="json")
-        validation_payload["structural"] = answer.validation.to_dict()
-        validation_payload["valid"] = bool(
-            answer.validation.valid and semantic.valid and answer.answerable
-        )
-        self.store.append_event(
-            sid,
-            topic_id,
-            "answer",
-            {
-                "answerable": answer.answerable,
-                "answer": answer.answer,
-                "claims": [claim.to_dict() for claim in answer.claims],
-                "refusal_reason": answer.refusal_reason,
-            },
-        )
-        self.store.append_event(sid, topic_id, "validation", validation_payload)
-        confirmed = [
-            *topic.get("confirmed_facts", []),
-            *(claim.text for claim in answer.claims if answer.answerable),
-        ]
-        open_questions = (
-            []
-            if coverage.overall_sufficient and answer.answerable
-            else [
-                item.missing_information
-                for item in coverage.coverage
-                if item.status != "sufficient"
-            ]
-        )
-        state_delta = {
-            "confirmed_facts_added": [
-                claim.text for claim in answer.claims if answer.answerable
-            ],
-            "open_questions": open_questions,
-            "evidence_reused": total_reused,
-            "evidence_added": total_new,
-        }
-        self.store.append_event(sid, topic_id, "state_delta", state_delta)
-        updated_summary = str(topic["topic_summary"])
-        entities = list(
-            dict.fromkeys(
-                [*topic.get("entities", []), *extract_entities(route.standalone_query)]
+        with harness.stage(AgenticStage.PERSISTING) as persistence_trace:
+            validation_payload = semantic.model_dump(mode="json")
+            validation_payload["structural"] = answer.validation.to_dict()
+            validation_payload["valid"] = bool(
+                answer.validation.valid and semantic.valid and answer.answerable
             )
-        )
-        self.store.update_topic_state(
-            sid,
-            topic_id,
-            topic_summary=updated_summary,
-            user_goal=str(topic["user_goal"]),
-            entities=entities,
-            confirmed_facts=confirmed,
-            open_questions=open_questions,
+            self.store.append_event(
+                sid,
+                topic_id,
+                "answer",
+                {
+                    "answerable": answer.answerable,
+                    "answer": answer.answer,
+                    "claims": [claim.to_dict() for claim in answer.claims],
+                    "refusal_reason": answer.refusal_reason,
+                },
+            )
+            self.store.append_event(sid, topic_id, "validation", validation_payload)
+            confirmed = [
+                *topic.get("confirmed_facts", []),
+                *(claim.text for claim in answer.claims if answer.answerable),
+            ]
+            open_questions = (
+                []
+                if coverage.overall_sufficient and answer.answerable
+                else [
+                    item.missing_information
+                    for item in coverage.coverage
+                    if item.status != "sufficient"
+                ]
+            )
+            state_delta = {
+                "confirmed_facts_added": [
+                    claim.text for claim in answer.claims if answer.answerable
+                ],
+                "open_questions": open_questions,
+                "evidence_reused": total_reused,
+                "evidence_added": total_new,
+            }
+            self.store.append_event(sid, topic_id, "state_delta", state_delta)
+            updated_summary = str(topic["topic_summary"])
+            entities = list(
+                dict.fromkeys(
+                    [
+                        *topic.get("entities", []),
+                        *extract_entities(route.standalone_query),
+                    ]
+                )
+            )
+            self.store.update_topic_state(
+                sid,
+                topic_id,
+                topic_summary=updated_summary,
+                user_goal=str(topic["user_goal"]),
+                entities=entities,
+                confirmed_facts=confirmed,
+                open_questions=open_questions,
+            )
+            persistence_trace.update(
+                {
+                    "answerable": answer.answerable,
+                    "claim_count": len(answer.claims),
+                    "event_count_added": 3,
+                }
+            )
+        if answer.answerable:
+            termination_reason = TerminationReason.COMPLETED
+        elif not coverage.overall_sufficient:
+            termination_reason = TerminationReason.INSUFFICIENT_COVERAGE
+        elif any(
+            value.startswith("answer_generation")
+            for value in self._stage_fallbacks
+        ):
+            termination_reason = TerminationReason.GENERATION_FAILED
+        else:
+            termination_reason = TerminationReason.SEMANTIC_VALIDATION_FAILED
+        harness.finish(
+            answerable=answer.answerable,
+            reason=termination_reason,
         )
         elapsed_ms = round((perf_counter() - started) * 1000, 3)
         metrics = AgenticMetricsRecord(
@@ -1047,5 +1351,6 @@ class AgenticRAGService:
             "stage_fallbacks": list(dict.fromkeys(self._stage_fallbacks)),
             "metrics": metrics.model_dump(mode="json"),
             "elapsed_ms": elapsed_ms,
+            "harness": harness.diagnostics(),
         }
         return result

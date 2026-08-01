@@ -13,6 +13,11 @@ class AgenticRAGConfig:
     rerank_top_k: int = 8
     final_top_k: int = 5
     max_retrieval_rounds: int = 2
+    max_structure_repairs: int = 1
+    max_answer_repairs: int = 1
+    max_total_latency_ms: int | None = None
+    fail_closed: bool = True
+    allow_model_downloads: bool = True
     rrf_k: int = 60
     reranker_enabled: bool = True
     semantic_validation_enabled: bool = True
@@ -55,6 +60,10 @@ class AgenticRAGConfig:
             value = raw(name)
             return int(value) if value is not None else default
 
+        def optional_integer(name: str, default: int | None) -> int | None:
+            value = raw(name)
+            return int(value) if value not in {None, ""} else default
+
         def number(name: str, default: float) -> float:
             value = raw(name)
             return float(value) if value is not None else default
@@ -77,6 +86,19 @@ class AgenticRAGConfig:
             final_top_k=integer("FINAL_TOP_K", defaults.final_top_k),
             max_retrieval_rounds=integer(
                 "MAX_RETRIEVAL_ROUNDS", defaults.max_retrieval_rounds
+            ),
+            max_structure_repairs=integer(
+                "MAX_STRUCTURE_REPAIRS", defaults.max_structure_repairs
+            ),
+            max_answer_repairs=integer(
+                "MAX_ANSWER_REPAIRS", defaults.max_answer_repairs
+            ),
+            max_total_latency_ms=optional_integer(
+                "MAX_TOTAL_LATENCY_MS", defaults.max_total_latency_ms
+            ),
+            fail_closed=boolean("FAIL_CLOSED", defaults.fail_closed),
+            allow_model_downloads=boolean(
+                "ALLOW_MODEL_DOWNLOADS", defaults.allow_model_downloads
             ),
             rrf_k=integer("RRF_K", defaults.rrf_k),
             reranker_enabled=boolean(
@@ -130,6 +152,14 @@ class AgenticRAGConfig:
             raise ValueError("final_top_k 不能大于 rerank_top_k。")
         if self.rrf_k < 1 or self.rrf_k > 10_000:
             raise ValueError("rrf_k 必须在 1 到 10000 之间。")
+        if self.max_structure_repairs not in {0, 1}:
+            raise ValueError("max_structure_repairs 只能是 0 或 1。")
+        if self.max_answer_repairs not in {0, 1}:
+            raise ValueError("max_answer_repairs 只能是 0 或 1。")
+        if self.max_total_latency_ms is not None and self.max_total_latency_ms < 1:
+            raise ValueError("max_total_latency_ms 必须为空或大于 0。")
+        if not self.fail_closed:
+            raise ValueError("Scientific RAG 必须保持 fail_closed=true。")
         if not 0 < self.new_topic_threshold < self.same_topic_threshold < 1:
             raise ValueError("Topic 阈值必须满足 0 < new < same < 1。")
         weight_sum = sum(

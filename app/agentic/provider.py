@@ -120,9 +120,17 @@ def _safe_evidence(evidence: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 class OpenAIAgenticReasoningProvider:
     """使用现有 OpenAI-compatible 客户端执行全部受限结构化阶段。"""
 
-    def __init__(self, provider: OpenAICompatibleAnswerProvider) -> None:
+    def __init__(
+        self,
+        provider: OpenAICompatibleAnswerProvider,
+        *,
+        max_structure_repairs: int = 1,
+    ) -> None:
+        if max_structure_repairs not in {0, 1}:
+            raise ValueError("max_structure_repairs 只能是 0 或 1。")
         self.provider = provider
         self.model_name = provider.model_name
+        self.max_structure_repairs = max_structure_repairs
         self.last_stage_diagnostics: dict[str, dict[str, Any]] = {}
 
     def _complete(
@@ -133,7 +141,7 @@ class OpenAIAgenticReasoningProvider:
     ) -> tuple[ModelT, dict[str, Any]]:
         working = [dict(message) for message in messages]
         last_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(self.max_structure_repairs + 1):
             payload = self.provider.chat_completion(working)
             try:
                 content = payload["choices"][0]["message"]["content"]
@@ -149,7 +157,7 @@ class OpenAIAgenticReasoningProvider:
                 return result, diagnostics
             except (KeyError, IndexError, TypeError, ValueError, ValidationError) as error:
                 last_error = error
-                if attempt == 0:
+                if attempt < self.max_structure_repairs:
                     choices = payload.get("choices")
                     first_choice = (
                         choices[0]
@@ -182,9 +190,7 @@ class OpenAIAgenticReasoningProvider:
                             },
                         ]
                     )
-        raise ValueError(
-            f"{stage} 在一次结构修复后仍未返回合法 JSON。"
-        ) from last_error
+        raise ValueError(f"{stage} 未在结构修复预算内返回合法 JSON。") from last_error
 
     @staticmethod
     def _metadata(

@@ -322,6 +322,32 @@ def test_coverage_triggers_bounded_second_retrieval_round(tmp_path: Path) -> Non
     assert result["retrieval_rounds"][1]["coverage_status"] == "sufficient"
     assert result["coverage"]["overall_sufficient"] is True
     assert runtime.calls == 4
+    harness = result["diagnostics"]["harness"]
+    assert harness["state"] == "completed"
+    assert harness["termination_reason"] == "completed"
+    assert harness["budget"]["retrieval_rounds_used"] == 2
+    assert [item["stage"] for item in harness["trace"]][:3] == [
+        "routing",
+        "planning",
+        "retrieving",
+    ]
+
+
+def test_harness_refuses_when_retrieval_budget_ends_without_coverage(
+    tmp_path: Path,
+) -> None:
+    service, _, _ = make_service(tmp_path, staged=True, rounds=1)
+
+    result = service.answer(
+        "哪些观测量用于估计星历和时钟误差？",
+        session_id="bounded_refusal",
+    )
+
+    harness = result["diagnostics"]["harness"]
+    assert result["answerable"] is False
+    assert harness["state"] == "refused"
+    assert harness["termination_reason"] == "insufficient_coverage"
+    assert harness["budget"]["retrieval_rounds_used"] == 1
 
 
 def test_session_persists_events_and_reuses_stable_evidence(tmp_path: Path) -> None:
@@ -633,6 +659,36 @@ def test_agentic_provider_repairs_empty_choices_once() -> None:
     assert inner.calls == 2
 
 
+def test_agentic_provider_can_disable_structure_repair() -> None:
+    class InvalidProvider:
+        model_name = "fixture/model"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat_completion(
+            self,
+            messages: list[dict[str, str]],
+        ) -> dict[str, Any]:
+            self.calls += 1
+            return {"choices": []}
+
+    inner = InvalidProvider()
+    provider = OpenAIAgenticReasoningProvider(  # type: ignore[arg-type]
+        inner,
+        max_structure_repairs=0,
+    )
+
+    with pytest.raises(ValueError, match="结构修复预算"):
+        provider._complete(  # noqa: SLF001
+            "router_test",
+            [{"role": "user", "content": "route"}],
+            RoutingLLMDecision,
+        )
+
+    assert inner.calls == 1
+
+
 def test_deepseek_api_key_alias_and_redaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -721,7 +777,12 @@ def test_agentic_config_loads_dotenv_with_environment_precedence(
 ) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "LEO_AGENTIC_CANDIDATE_LIMIT=30\nLEO_AGENTIC_RRF_K=55\n",
+        (
+            "LEO_AGENTIC_CANDIDATE_LIMIT=30\n"
+            "LEO_AGENTIC_RRF_K=55\n"
+            "LEO_AGENTIC_MAX_ANSWER_REPAIRS=0\n"
+            "LEO_AGENTIC_MAX_TOTAL_LATENCY_MS=5000\n"
+        ),
         encoding="utf-8",
     )
     monkeypatch.setenv("LEO_AGENTIC_RRF_K", "61")
@@ -730,6 +791,8 @@ def test_agentic_config_loads_dotenv_with_environment_precedence(
 
     assert loaded.candidate_limit == 30
     assert loaded.rrf_k == 61
+    assert loaded.max_answer_repairs == 0
+    assert loaded.max_total_latency_ms == 5000
 
 
 def test_relative_session_database_is_resolved_from_project_root(

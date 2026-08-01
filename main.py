@@ -392,6 +392,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=agentic_defaults.max_retrieval_rounds,
     )
     answer_command.add_argument(
+        "--max-structure-repairs",
+        type=int,
+        choices=[0, 1],
+        default=agentic_defaults.max_structure_repairs,
+        help="每个结构化 LLM 阶段允许的 JSON 修复次数，默认 1。",
+    )
+    answer_command.add_argument(
+        "--max-answer-repairs",
+        type=int,
+        choices=[0, 1],
+        default=agentic_defaults.max_answer_repairs,
+        help="整次运行允许的 Answer Repair 次数，默认 1。",
+    )
+    answer_command.add_argument(
+        "--max-total-latency-ms",
+        type=int,
+        default=agentic_defaults.max_total_latency_ms,
+        help="可选 Harness 总时限；默认不设置硬时限。",
+    )
+    answer_command.add_argument(
         "--rrf-k", type=int, default=agentic_defaults.rrf_k
     )
     answer_command.add_argument(
@@ -529,6 +549,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_embedding_options(answer_command)
     add_reranker_options(answer_command)
+    answer_command.set_defaults(
+        agentic_allow_model_downloads=agentic_defaults.allow_model_downloads,
+    )
 
     session_command = subparsers.add_parser(
         "session",
@@ -759,6 +782,13 @@ def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) ->
         rerank_top_k=args.rerank_top_k,
         final_top_k=args.final_top_k,
         max_retrieval_rounds=args.max_retrieval_rounds,
+        max_structure_repairs=args.max_structure_repairs,
+        max_answer_repairs=args.max_answer_repairs,
+        max_total_latency_ms=args.max_total_latency_ms,
+        fail_closed=True,
+        allow_model_downloads=(
+            args.agentic_allow_model_downloads and not args.local_files_only
+        ),
         rrf_k=args.rrf_k,
         reranker_enabled=not args.disable_reranker,
         semantic_validation_enabled=not args.disable_semantic_validation,
@@ -779,7 +809,10 @@ def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) ->
     )
     return AgenticRAGService(
         runtime,
-        OpenAIAgenticReasoningProvider(answer_provider),
+        OpenAIAgenticReasoningProvider(
+            answer_provider,
+            max_structure_repairs=config.max_structure_repairs,
+        ),
         store,
         DirectAnswerReranker(
             runtime.reranker_provider,

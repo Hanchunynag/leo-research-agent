@@ -629,6 +629,76 @@ User Query
 `--local-files-only` 时，Reranker 会记录 `fallback_used=true` 并保持 RRF 顺序，
 不会联网下载或令整个回答崩溃；也可用 `--disable-reranker` 做消融。
 
+#### Agent Harness：状态机、预算和运行轨迹
+
+Agentic 业务流程运行在独立的轻量 Harness 中，而不是让 LLM 自由决定循环和终止。
+Harness 与 Router、Retriever、Generator 解耦，只负责五类系统约束：
+
+```text
+AgenticRunPolicy
+  ├─ max_retrieval_rounds
+  ├─ max_structure_repairs
+  ├─ max_answer_repairs
+  ├─ max_total_latency_ms
+  ├─ fail_closed
+  └─ allow_model_downloads
+
+AgenticRunHarness
+  ├─ finite-state transitions
+  ├─ retrieval/repair budget
+  ├─ deadline
+  ├─ termination reason
+  └─ ordered stage trace
+```
+
+有限状态机只允许以下主路径和显式回环：
+
+```text
+initialized
+→ routing → planning
+→ retrieving → reranking → coverage_checking
+   └──────────────────────────────→ retrieving（证据不足且仍有预算）
+→ context_building → compacting? → generating
+→ structural_validating → semantic_validating
+   ├──────────────────────────────→ retrieving（retrieve_more）
+   └→ repairing → structural_validating（最多一次）
+→ persisting → completed | refused
+```
+
+非法跳转会抛出 `HarnessConstraintError`；检索最多 1–5 轮，结构修复和答案修复
+只能配置为 0 或 1。`fail_closed=false` 会在配置阶段直接被拒绝。可选总时限在新
+检索、Repair 和生成前作为硬门禁；`--local-files-only` 同时令 Harness Policy 的
+`allow_model_downloads=false`。
+
+Agentic 输出的 `diagnostics.harness` 提供可复现实验和面试讲解所需的统一轨迹：
+
+```json
+{
+  "policy": {
+    "max_retrieval_rounds": 2,
+    "max_structure_repairs": 1,
+    "max_answer_repairs": 1,
+    "fail_closed": true
+  },
+  "state": "completed",
+  "termination_reason": "completed",
+  "budget": {
+    "retrieval_rounds_used": 2,
+    "structure_repairs_used": 0,
+    "answer_repairs_used": 0
+  },
+  "trace": [
+    {"ordinal": 1, "stage": "routing", "status": "succeeded"},
+    {"ordinal": 2, "stage": "planning", "status": "succeeded"},
+    {"ordinal": 3, "stage": "retrieving", "attempt": 1, "status": "succeeded"}
+  ]
+}
+```
+
+Trace 只保存阶段、次数、耗时、数量和错误类型，不保存异常正文、API Key 或完整
+Prompt。业务级 retrieval diagnostics 和 Harness 控制轨迹分别保留，避免把质量
+评测与执行控制混为一层。
+
 #### Topic、Session 与 Evidence Registry
 
 一个 Session 可以包含多个 Topic。Router 同时使用上下文依赖、BGE-M3 语义
@@ -711,7 +781,9 @@ Recall、Evidence Coverage、Citation Precision/Recall、Claim Entailment Accura
 #### Agentic 配置
 
 主要 CLI 参数为 `--candidate-limit 20`、`--rerank-top-k 8`、
-`--final-top-k 5`、`--max-retrieval-rounds 2`、`--rrf-k 60`、
+`--final-top-k 5`、`--max-retrieval-rounds 2`、
+`--max-structure-repairs 1`、`--max-answer-repairs 1`、
+`--max-total-latency-ms`、`--rrf-k 60`、
 `--disable-reranker`、
 `--disable-semantic-validation`、`--same-topic-threshold`、
 `--new-topic-threshold`、四个 Router 权重、`--model-context-window` 和
@@ -1156,6 +1228,7 @@ PDF。
 | 增量 Evidence Registry、Coverage 与有界补充检索 | 已完成 |
 | 类别感知 Planner、语义引用验证与 Repair | 已完成 |
 | Cache Prefix 诊断与非破坏性 Compaction | 已完成 |
+| Agent Harness Policy、状态机、预算与 Stage Trace | 已完成 |
 | 自动分类 | 未实现 |
 | 大型多轮生成式人工评测集 | 未实现 |
 
@@ -1189,6 +1262,7 @@ PDF。
 - `app/generation/service.py`：检索、生成、确定性引用渲染和失败关闭；
 - `app/agentic/`：Session Store、Topic Router、Planner、Reranker、Coverage、
   结构化 Provider、Prompt/Compaction、语义验证、Repair 和端到端编排；
+- `app/agentic/harness.py`：RunPolicy、有限状态机、预算、终止原因与安全 Trace；
 - `app/evaluation/retrieval.py`：检索问题校验、qrels 映射和排名指标；
 - `app/embeddings/base.py`：与本地模型/API 解耦的 Embedding 协议；
 - `app/parsing/precheck.py`：pipeline 内部 PDF 预检查；
