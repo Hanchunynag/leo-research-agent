@@ -17,12 +17,14 @@ PDF 入库
   → 使用 RRF 融合
   → 使用 BGE Cross-Encoder 精排
   → 组装带稳定 SOURCE、页码和 block 的上下文证据包
+  → 本地模型生成结构化 claims
+  → 逐条校验引用并失败关闭
 ```
 
 现在支持容错批量入库、论文身份归并、真实标题规范命名、增量知识层构建、
 BM25、BGE-M3 单向量召回、Qdrant local、RRF、候选池 Oracle、Cross-Encoder
-精排和证据上下文组装。LLM 回答、引用校验、拒答、分类和生成式回答评测仍是
-下一阶段。
+精排、证据上下文组装、OpenAI-compatible 本地回答模型、claim 级引用校验和
+fail-closed 拒答。自动分类和生成式回答评测仍是下一阶段。
 
 ## 核心设计原则
 
@@ -457,6 +459,51 @@ CLI 是一次性进程，仍会在每次执行时加载模型。UI、API 或本�
 启动时创建一个 `RetrievalRuntime` 并复用；调用 `warmup()` 后，后续查询不会重复
 创建 Dense 或 Reranker 模型实例。
 
+### 生成带逐条引用的回答
+
+先启动支持 OpenAI Chat Completions 接口的本地模型服务，例如 Ollama、LM Studio
+或 vLLM。调用时必须显式给出服务地址和模型名：
+
+```bash
+./.venv/bin/python main.py answer \
+  "Which measurements track LEO ephemerides?" \
+  --mode fast \
+  --llm-base-url http://127.0.0.1:11434 \
+  --llm-model qwen3:8b \
+  --revision 5617a9f61b028005a4858fdac845db406aefb181 \
+  --local-files-only
+```
+
+`--llm-base-url` 可以是服务根地址、`/v1` 地址或完整的
+`/v1/chat/completions` 地址。`accurate` 模式还需固定 Reranker revision，参数与
+`context build` 相同。
+
+回答模型不能直接输出自由文本引用。它必须返回结构化 claims：
+
+```json
+{
+  "answerable": true,
+  "claims": [
+    {
+      "claim_id": "C1",
+      "text": "The observations jointly estimate both errors.",
+      "source_ids": ["S1"]
+    }
+  ],
+  "refusal_reason": null
+}
+```
+
+应用只接受当前 `ContextBundle` 中存在的来源，并确定性渲染为
+`claim text [S1]`。每条 citation 同时展开为 title、`work_id`、`document_id`、
+章节、页码和 block IDs。空证据、上下文预算或来源完整性异常、无引用 claim、
+重复或未知来源、非法模型 JSON 都不会输出部分回答，而是返回
+`answerable=false`；CLI 对拒答使用退出码 2。
+
+这里的校验保证“引用存在且身份可追溯”，不等于已经自动证明 claim 被引用文本
+语义蕴含。语义正确率、引用精确率和拒答质量需要在下一阶段的生成式评测集中
+单独测量。
+
 ### 运行检索评测基线
 
 人工标注问题集保存在：
@@ -876,8 +923,9 @@ PDF。
 | BGE Cross-Encoder 精排与性能诊断 | 已完成 |
 | fast/accurate 长驻检索运行时 | 已完成 |
 | EvidenceItem/ContextBundle 与 token budget | 已完成 |
+| AnswerProvider 与 OpenAI-compatible 本地模型 | 已完成 |
+| claim 级引用校验与 fail-closed 拒答 | 已完成 |
 | 自动分类 | 未实现 |
-| LLM 回答和引用 | 未实现 |
 | 生成式回答自动评测 | 未实现 |
 
 ## 代码入口
@@ -902,6 +950,10 @@ PDF。
 - `app/runtime/retrieval.py`：复用模型实例的 fast/accurate 检索运行时；
 - `app/context/models.py`：EvidenceItem 与 ContextBundle 稳定契约；
 - `app/context/assembly.py`：来源去重、边界校验和 token budget 组装；
+- `app/generation/base.py`：与具体 LLM 服务解耦的 AnswerProvider 协议；
+- `app/generation/openai_compatible.py`：本地 Chat Completions 适配器；
+- `app/generation/validation.py`：上下文完整性与 claim 级引用校验；
+- `app/generation/service.py`：检索、生成、确定性引用渲染和失败关闭；
 - `app/evaluation/retrieval.py`：检索问题校验、qrels 映射和排名指标；
 - `app/embeddings/base.py`：与本地模型/API 解耦的 Embedding 协议；
 - `app/parsing/precheck.py`：pipeline 内部 PDF 预检查；

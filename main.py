@@ -352,6 +352,36 @@ def build_parser() -> argparse.ArgumentParser:
     add_embedding_options(context_build_command)
     add_reranker_options(context_build_command)
 
+    answer_command = subparsers.add_parser(
+        "answer",
+        help="使用本地 OpenAI-compatible 模型生成逐条引用并可失败关闭的回答。",
+    )
+    answer_command.add_argument("query")
+    answer_command.add_argument(
+        "--mode",
+        choices=["fast", "accurate"],
+        default="fast",
+    )
+    answer_command.add_argument("--retrieval-limit", type=int, default=10)
+    answer_command.add_argument("--token-budget", type=int, default=6000)
+    answer_command.add_argument("--max-evidence", type=int, default=8)
+    answer_command.add_argument("--max-evidence-per-work", type=int, default=2)
+    answer_command.add_argument("--work-id")
+    answer_command.add_argument("--document-id")
+    answer_command.add_argument("--candidate-limit", type=int, default=20)
+    answer_command.add_argument("--rrf-k", type=int, default=60)
+    answer_command.add_argument(
+        "--llm-base-url",
+        required=True,
+        help="例如 http://127.0.0.1:11434 或 http://127.0.0.1:1234/v1。",
+    )
+    answer_command.add_argument("--llm-model", required=True)
+    answer_command.add_argument("--llm-api-key")
+    answer_command.add_argument("--llm-timeout", type=float, default=120.0)
+    answer_command.add_argument("--llm-max-tokens", type=int, default=1200)
+    add_embedding_options(answer_command)
+    add_reranker_options(answer_command)
+
     evaluate_command = subparsers.add_parser(
         "evaluate",
         help="运行本地检索与后续 RAG 质量评测。",
@@ -459,6 +489,25 @@ def reranker_provider_from_args(args: argparse.Namespace) -> Any:
             max_length=args.reranker_max_length,
             local_files_only=args.local_files_only,
             show_progress_bar=not args.no_progress,
+        )
+    )
+
+
+def answer_provider_from_args(args: argparse.Namespace) -> Any:
+    """创建显式配置的 OpenAI-compatible 本地回答模型。"""
+
+    from app.generation.openai_compatible import (
+        OpenAICompatibleAnswerProvider,
+        OpenAICompatibleConfig,
+    )
+
+    return OpenAICompatibleAnswerProvider(
+        OpenAICompatibleConfig(
+            base_url=args.llm_base_url,
+            model=args.llm_model,
+            api_key=args.llm_api_key,
+            timeout_seconds=args.llm_timeout,
+            max_tokens=args.llm_max_tokens,
         )
     )
 
@@ -684,6 +733,31 @@ def main(argv: Sequence[str] | None = None) -> None:
             rrf_k=args.rrf_k,
         )
         print_json(bundle.to_dict())
+        return
+
+    if args.command == "answer":
+        from app.generation.service import GroundedAnswerService
+
+        runtime = retrieval_runtime_from_args(
+            args,
+            include_reranker=args.mode == "accurate",
+        )
+        service = GroundedAnswerService(runtime, answer_provider_from_args(args))
+        answer = service.answer(
+            query=args.query,
+            mode=args.mode,
+            retrieval_limit=args.retrieval_limit,
+            token_budget=args.token_budget,
+            max_evidence=args.max_evidence,
+            max_evidence_per_work=args.max_evidence_per_work,
+            work_id=args.work_id,
+            document_id=args.document_id,
+            candidate_limit=args.candidate_limit,
+            rrf_k=args.rrf_k,
+        )
+        print_json(answer.to_dict())
+        if not answer.answerable:
+            raise SystemExit(2)
         return
 
     if args.command == "evaluate":
