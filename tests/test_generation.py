@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ import pytest
 import main as cli
 from app.context.assembly import assemble_context_bundle
 from app.context.models import ContextBundle
+from app.context.session import ContextSessionStore
 from app.generation.models import AnswerClaim, AnswerDraft
 from app.generation.openai_compatible import (
     OpenAICompatibleAnswerProvider,
@@ -57,9 +59,11 @@ class FakeAnswerProvider:
     def __init__(self, draft: AnswerDraft) -> None:
         self.draft = draft
         self.calls = 0
+        self.queries: list[str] = []
 
     def generate(self, query: str, context: ContextBundle) -> AnswerDraft:
         self.calls += 1
+        self.queries.append(query)
         return self.draft
 
 
@@ -177,6 +181,8 @@ def test_openai_compatible_provider_parses_structured_json_without_network() -> 
             "model": "served-local-model",
             "usage": {
                 "prompt_tokens": 321,
+                "prompt_cache_hit_tokens": 256,
+                "prompt_cache_miss_tokens": 64,
                 "completion_tokens": 42,
                 "total_tokens": 363,
                 "ignored_nested_detail": {"cached_tokens": 10},
@@ -197,26 +203,48 @@ def test_openai_compatible_provider_parses_structured_json_without_network() -> 
     )
     client = FakeHTTPClient(response)
     provider = OpenAICompatibleAnswerProvider(
-        OpenAICompatibleConfig("http://127.0.0.1:11434", "local-model"),
+        OpenAICompatibleConfig(
+            "http://127.0.0.1:11434",
+            "local-model",
+            prompt_layout="context_first",
+        ),
         client=client,
     )
 
     draft = provider.generate("question", context_bundle())
 
     assert draft.claims[0].source_ids == ["S1"]
-    assert draft.provider_metadata == {
-        "response_model": "served-local-model",
-        "usage": {
-            "prompt_tokens": 321,
-            "completion_tokens": 42,
-            "total_tokens": 363,
-        },
+    assert draft.provider_metadata["response_model"] == "served-local-model"
+    assert draft.provider_metadata["usage"] == {
+        "prompt_tokens": 321,
+        "prompt_cache_hit_tokens": 256,
+        "prompt_cache_miss_tokens": 64,
+        "completion_tokens": 42,
+        "total_tokens": 363,
     }
+    assert draft.provider_metadata["cache_diagnostics"] == {
+        "hit_tokens": 256,
+        "miss_tokens": 64,
+        "eligible_prompt_tokens": 320,
+        "hit_rate": 0.8,
+    }
+    prompt_diagnostics = draft.provider_metadata["prompt_diagnostics"]
+    assert prompt_diagnostics["layout"] == "context_first"
+    assert len(prompt_diagnostics["fingerprint"]) == 64
+    second_draft = provider.generate("different question", context_bundle())
+    second_prompt = second_draft.provider_metadata["prompt_diagnostics"]
+    assert (
+        second_prompt["stable_prefix_fingerprint"]
+        == prompt_diagnostics["stable_prefix_fingerprint"]
+    )
+    assert second_prompt["fingerprint"] != prompt_diagnostics["fingerprint"]
     assert response.status_checked is True
     assert client.calls[0][0] == "http://127.0.0.1:11434/v1/chat/completions"
     request = client.calls[0][1]
     assert request["model"] == "local-model"
     assert "[S1]" in request["messages"][1]["content"]
+    user_content = request["messages"][1]["content"]
+    assert user_content.index("Evidence bundle:") < user_content.index("Question:")
 
 
 def test_answer_cli_outputs_grounded_result(
@@ -308,6 +336,8 @@ def test_answer_provider_reads_local_dotenv_with_safe_precedence(
             "question",
             "--llm-model",
             "cli-model",
+            "--context-session",
+            "cache_experiment",
         ]
     )
 
@@ -318,6 +348,7 @@ def test_answer_provider_reads_local_dotenv_with_safe_precedence(
     assert provider.config.api_key == "file-test-key"
     assert provider.config.timeout_seconds == 45
     assert provider.config.max_tokens == 700
+    assert provider.config.prompt_layout == "context_first"
 
 
 def test_answer_provider_reports_missing_local_configuration(
@@ -331,3 +362,76 @@ def test_answer_provider_reports_missing_local_configuration(
 
     with pytest.raises(ValueError, match="复制 .env.example 为 .env"):
         cli.answer_provider_from_args(args)
+
+
+def test_context_session_round_trip_and_integrity_check(tmp_path: Path) -> None:
+    store = ContextSessionStore(tmp_path)
+    original = context_bundle()
+
+    saved = store.save("leo_timing", original)
+    loaded = store.load("leo_timing")
+
+    assert loaded.context_hash == saved.context_hash
+    assert loaded.context.context_text == original.context_text
+    assert loaded.context.evidence[0].chunk_id == "C_alpha"
+
+    path = store.path_for("leo_timing")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["context"]["context_text"] += " tampered"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="完整性指纹不匹配"):
+        store.load("leo_timing")
+
+
+def test_context_session_rejects_unsafe_identifier(tmp_path: Path) -> None:
+    store = ContextSessionStore(tmp_path)
+
+    with pytest.raises(ValueError, match="session ID"):
+        store.path_for("../outside")
+
+
+class CountingRuntime:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def build_context(self, query: str, **kwargs: Any) -> ContextBundle:
+        self.calls += 1
+        return replace(context_bundle(), query=query)
+
+
+def test_answer_cli_reuses_context_session_without_retrieval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = CountingRuntime()
+    provider = FakeAnswerProvider(
+        AnswerDraft(True, [AnswerClaim("C1", "Session fact.", ["S1"])])
+    )
+    monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "retrieval_runtime_from_args",
+        lambda args, include_reranker: runtime,
+    )
+    monkeypatch.setattr(cli, "answer_provider_from_args", lambda args: provider)
+
+    cli.main(["answer", "initial question", "--context-session", "leo_session"])
+    created = json.loads(capsys.readouterr().out)
+    assert created["diagnostics"]["context_session"]["state"] == "created"
+    assert runtime.calls == 1
+
+    monkeypatch.setattr(
+        cli,
+        "retrieval_runtime_from_args",
+        lambda args, include_reranker: pytest.fail("session reuse must skip retrieval"),
+    )
+    cli.main(["answer", "follow-up question", "--context-session", "leo_session"])
+    reused = json.loads(capsys.readouterr().out)
+
+    session_diagnostics = reused["diagnostics"]["context_session"]
+    assert reused["query"] == "follow-up question"
+    assert session_diagnostics["state"] == "reused"
+    assert session_diagnostics["retrieval_skipped"] is True
+    assert session_diagnostics["source_query"] == "initial question"
+    assert provider.queries == ["initial question", "follow-up question"]

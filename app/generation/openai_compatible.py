@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
 
 from app.context.models import ContextBundle
 from app.generation.models import AnswerClaim, AnswerDraft
+from app.indexing.tokenization import token_count
 
 
 SYSTEM_PROMPT = """You are a research-paper question answering component.
@@ -24,6 +26,8 @@ Every claim must be atomic and supported by every listed source ID. Use only sou
 present in the evidence. Never put citation markers in claim text; the application renders them.
 """
 
+PromptLayout = Literal["query_first", "context_first"]
+
 
 @dataclass(frozen=True)
 class OpenAICompatibleConfig:
@@ -33,6 +37,7 @@ class OpenAICompatibleConfig:
     timeout_seconds: float = 120.0
     max_tokens: int = 1200
     temperature: float = 0.0
+    prompt_layout: PromptLayout = "query_first"
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.base_url)
@@ -46,6 +51,8 @@ class OpenAICompatibleConfig:
             raise ValueError("max_tokens 必须大于 0。")
         if self.temperature < 0:
             raise ValueError("temperature 不能小于 0。")
+        if self.prompt_layout not in {"query_first", "context_first"}:
+            raise ValueError("prompt_layout 必须是 query_first 或 context_first。")
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -122,19 +129,28 @@ class OpenAICompatibleAnswerProvider:
         )
 
     def generate(self, query: str, context: ContextBundle) -> AnswerDraft:
-        user_prompt = (
-            f"Question:\n{query.strip()}\n\n"
-            f"Evidence bundle:\n{context.context_text}\n\n"
-            "Return the required JSON object."
-        )
+        cleaned_query = query.strip()
+        if self.config.prompt_layout == "context_first":
+            user_prompt = (
+                f"Evidence bundle:\n{context.context_text}\n\n"
+                f"Question:\n{cleaned_query}\n\n"
+                "Return the required JSON object."
+            )
+        else:
+            user_prompt = (
+                f"Question:\n{cleaned_query}\n\n"
+                f"Evidence bundle:\n{context.context_text}\n\n"
+                "Return the required JSON object."
+            )
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
         response = self._client.post(
             self.endpoint,
             json={
                 "model": self.config.model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
+                "messages": messages,
                 "temperature": self.config.temperature,
                 "max_tokens": self.config.max_tokens,
             },
@@ -162,6 +178,49 @@ class OpenAICompatibleAnswerProvider:
             }
             if safe_usage:
                 metadata["usage"] = safe_usage
+                hit_tokens = safe_usage.get("prompt_cache_hit_tokens")
+                miss_tokens = safe_usage.get("prompt_cache_miss_tokens")
+                if isinstance(hit_tokens, (int, float)) and isinstance(
+                    miss_tokens,
+                    (int, float),
+                ):
+                    eligible_tokens = hit_tokens + miss_tokens
+                    if eligible_tokens > 0:
+                        metadata["cache_diagnostics"] = {
+                            "hit_tokens": hit_tokens,
+                            "miss_tokens": miss_tokens,
+                            "eligible_prompt_tokens": eligible_tokens,
+                            "hit_rate": round(hit_tokens / eligible_tokens, 6),
+                        }
+        prompt_serialized = json.dumps(
+            messages,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        stable_prefix = (
+            SYSTEM_PROMPT
+            + (
+                f"Evidence bundle:\n{context.context_text}\n\nQuestion:\n"
+                if self.config.prompt_layout == "context_first"
+                else "Question:\n"
+            )
+        )
+        metadata["prompt_diagnostics"] = {
+            "layout": self.config.prompt_layout,
+            "fingerprint": hashlib.sha256(
+                prompt_serialized.encode("utf-8")
+            ).hexdigest(),
+            "stable_prefix_fingerprint": hashlib.sha256(
+                stable_prefix.encode("utf-8")
+            ).hexdigest(),
+            "stable_prefix_approx_tokens": token_count(stable_prefix),
+            "system_approx_tokens": token_count(SYSTEM_PROMPT),
+            "query_approx_tokens": token_count(cleaned_query),
+            "context_approx_tokens": token_count(context.context_text),
+            "total_approx_tokens": token_count(SYSTEM_PROMPT + user_prompt),
+            "token_counter": "deterministic_approximation_v1",
+        }
         return replace(
             _parse_answer_draft(content),
             provider_metadata=metadata,

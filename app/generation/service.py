@@ -36,7 +36,7 @@ class GroundedAnswerService:
 
     def __init__(
         self,
-        retrieval_runtime: RetrievalRuntime,
+        retrieval_runtime: RetrievalRuntime | None,
         answer_provider: AnswerProvider,
     ) -> None:
         self.retrieval_runtime = retrieval_runtime
@@ -44,13 +44,14 @@ class GroundedAnswerService:
 
     def _refusal(
         self,
+        query: str,
         context: ContextBundle,
         reason: str,
         validation: CitationValidationReport,
         diagnostics: dict[str, Any],
     ) -> GroundedAnswer:
         return GroundedAnswer(
-            query=context.query,
+            query=query,
             answerable=False,
             answer="",
             claims=[],
@@ -61,9 +62,17 @@ class GroundedAnswerService:
             diagnostics=diagnostics,
         )
 
-    def answer_from_context(self, context: ContextBundle) -> GroundedAnswer:
+    def answer_from_context(
+        self,
+        context: ContextBundle,
+        *,
+        query: str | None = None,
+    ) -> GroundedAnswer:
         """对已组装证据包生成回答，便于 API 复用和独立测试。"""
 
+        effective_query = (query if query is not None else context.query).strip()
+        if not effective_query:
+            raise ValueError("query 不能为空。")
         diagnostics: dict[str, Any] = {
             "provider": type(self.answer_provider).__name__,
             "model": getattr(self.answer_provider, "model_name", None),
@@ -77,11 +86,17 @@ class GroundedAnswerService:
                 else INVALID_CONTEXT_REFUSAL
             )
             diagnostics["generation_skipped"] = True
-            return self._refusal(context, reason, validation, diagnostics)
+            return self._refusal(
+                effective_query,
+                context,
+                reason,
+                validation,
+                diagnostics,
+            )
 
         started = perf_counter()
         try:
-            draft = self.answer_provider.generate(context.query, context)
+            draft = self.answer_provider.generate(effective_query, context)
         except Exception as error:
             diagnostics.update(
                 {
@@ -103,6 +118,7 @@ class GroundedAnswerService:
                 [],
             )
             return self._refusal(
+                effective_query,
                 context,
                 PROVIDER_ERROR_REFUSAL,
                 validation,
@@ -117,6 +133,7 @@ class GroundedAnswerService:
         validation = validate_answer_draft(draft, context)
         if not validation.valid:
             return self._refusal(
+                effective_query,
                 context,
                 INVALID_DRAFT_REFUSAL,
                 validation,
@@ -125,13 +142,14 @@ class GroundedAnswerService:
         if not draft.answerable:
             assert draft.refusal_reason is not None
             return self._refusal(
+                effective_query,
                 context,
                 draft.refusal_reason.strip(),
                 validation,
                 diagnostics,
             )
         return GroundedAnswer(
-            query=context.query,
+            query=effective_query,
             answerable=True,
             answer=_render_claims(draft.claims),
             claims=draft.claims,
@@ -158,6 +176,8 @@ class GroundedAnswerService:
     ) -> GroundedAnswer:
         """检索、组装并生成一个带可追溯引用的回答。"""
 
+        if self.retrieval_runtime is None:
+            raise RuntimeError("answer() 需要 RetrievalRuntime。")
         started = perf_counter()
         context = self.retrieval_runtime.build_context(
             query=query,
@@ -171,7 +191,7 @@ class GroundedAnswerService:
             candidate_limit=candidate_limit,
             rrf_k=rrf_k,
         )
-        result = self.answer_from_context(context)
+        result = self.answer_from_context(context, query=query)
         diagnostics = dict(result.diagnostics)
         diagnostics["retrieval_and_context_elapsed_ms"] = round(
             (perf_counter() - started) * 1000

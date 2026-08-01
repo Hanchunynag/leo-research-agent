@@ -523,6 +523,59 @@ Reranker revision，参数与 `context build` 相同。
 的模型标识和 token usage，不再重复打印完整论文上下文。只有排查检索证据时才
 使用 `--include-context` 输出完整 `ContextBundle`。
 
+#### Context Session 与缓存命中实验
+
+普通动态问答保持 `S + Q + C`，每个问题重新检索。需要围绕同一批证据连续提问
+时，指定一个安全的 session ID：
+
+```bash
+# 首次调用：检索、保存固定 ContextBundle，并使用 S + C + Q
+./.venv/bin/python main.py answer \
+  "哪些观测量用于估计星历和时钟误差？" \
+  --context-session leo_timing \
+  --revision 5617a9f61b028005a4858fdac845db406aefb181 \
+  --local-files-only
+
+# 后续调用：复用相同证据，不再加载 BGE-M3 或执行检索
+./.venv/bin/python main.py answer \
+  "其中多普勒观测对应哪些状态量？" \
+  --context-session leo_timing
+```
+
+快照保存在本地私有目录 `data/runtime/context_sessions/`，包含稳定
+`context_hash` 和完整性校验；不会提交 Git。只有研究主题或证据需求发生变化时
+才显式刷新：
+
+```bash
+./.venv/bin/python main.py answer \
+  "为当前问题重新选择证据" \
+  --context-session leo_timing \
+  --refresh-context-session \
+  --revision 5617a9f61b028005a4858fdac845db406aefb181 \
+  --local-files-only
+```
+
+动态问答默认 `--prompt-layout query_first`，Context Session 默认
+`context_first`；两种模式都可以显式覆盖。session 复用状态、原始检索问题、
+`context_hash`、完整 Prompt 指纹、稳定前缀指纹和近似 token 数记录在
+`diagnostics`。若服务商返回 `prompt_cache_hit_tokens` 与
+`prompt_cache_miss_tokens`，还会自动生成：
+
+```json
+{
+  "cache_diagnostics": {
+    "hit_tokens": 2560,
+    "miss_tokens": 128,
+    "eligible_prompt_tokens": 2688,
+    "hit_rate": 0.952381
+  }
+}
+```
+
+命中率是服务端 token 级结果；`prompt_diagnostics` 中的 token 数只是项目统一的
+近似计数，用于本地对照。固定 session 能提高缓存复用，但不会自动判断新问题是否
+仍与旧证据相关；证据不再适用时必须刷新，不能用命中率替代回答质量评测。
+
 这里的校验保证“引用存在且身份可追溯”，不等于已经自动证明 claim 被引用文本
 语义蕴含。语义正确率、引用精确率和拒答质量需要在下一阶段的生成式评测集中
 单独测量。
@@ -948,6 +1001,7 @@ PDF。
 | EvidenceItem/ContextBundle 与 token budget | 已完成 |
 | AnswerProvider 与 OpenAI-compatible 本地模型 | 已完成 |
 | claim 级引用校验与 fail-closed 拒答 | 已完成 |
+| Context Session、Prompt 布局与缓存诊断 | 已完成 |
 | 自动分类 | 未实现 |
 | 生成式回答自动评测 | 未实现 |
 
@@ -973,6 +1027,7 @@ PDF。
 - `app/runtime/retrieval.py`：复用模型实例的 fast/accurate 检索运行时；
 - `app/context/models.py`：EvidenceItem 与 ContextBundle 稳定契约；
 - `app/context/assembly.py`：来源去重、边界校验和 token budget 组装；
+- `app/context/session.py`：固定证据快照、完整性指纹与本地 session 存储；
 - `app/generation/base.py`：与具体 LLM 服务解耦的 AnswerProvider 协议；
 - `app/generation/openai_compatible.py`：本地 Chat Completions 适配器；
 - `app/generation/settings.py`：环境变量与本地 `.env` 的安全配置入口；

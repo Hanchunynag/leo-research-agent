@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -387,6 +387,23 @@ def build_parser() -> argparse.ArgumentParser:
     answer_command.add_argument("--llm-timeout", type=float)
     answer_command.add_argument("--llm-max-tokens", type=int)
     answer_command.add_argument(
+        "--prompt-layout",
+        choices=["query_first", "context_first"],
+        help=(
+            "Prompt 顺序；动态问答默认 query_first，Context Session 默认 "
+            "context_first。"
+        ),
+    )
+    answer_command.add_argument(
+        "--context-session",
+        help="创建或复用一个固定 ContextBundle 快照，例如 leo_timing。",
+    )
+    answer_command.add_argument(
+        "--refresh-context-session",
+        action="store_true",
+        help="用当前问题重新检索并显式覆盖指定 Context Session。",
+    )
+    answer_command.add_argument(
         "--include-context",
         action="store_true",
         help="调试时在 JSON 中包含完整 ContextBundle；默认省略。",
@@ -541,6 +558,11 @@ def answer_provider_from_args(args: argparse.Namespace) -> Any:
         else settings_api_key
     )
     normalized_api_key = api_key.strip() if api_key is not None else None
+    prompt_layout = (
+        args.prompt_layout
+        or settings.prompt_layout
+        or ("context_first" if args.context_session else "query_first")
+    )
 
     return OpenAICompatibleAnswerProvider(
         OpenAICompatibleConfig(
@@ -557,6 +579,7 @@ def answer_provider_from_args(args: argparse.Namespace) -> Any:
                 if args.llm_max_tokens is not None
                 else settings.max_tokens
             ),
+            prompt_layout=prompt_layout,
         )
     )
 
@@ -791,23 +814,71 @@ def main(argv: Sequence[str] | None = None) -> None:
             answer_provider = answer_provider_from_args(args)
         except ValueError as error:
             raise SystemExit(f"LLM 配置错误：{error}") from error
-        runtime = retrieval_runtime_from_args(
-            args,
-            include_reranker=args.mode == "accurate",
-        )
-        service = GroundedAnswerService(runtime, answer_provider)
-        answer = service.answer(
-            query=args.query,
-            mode=args.mode,
-            retrieval_limit=args.retrieval_limit,
-            token_budget=args.token_budget,
-            max_evidence=args.max_evidence,
-            max_evidence_per_work=args.max_evidence_per_work,
-            work_id=args.work_id,
-            document_id=args.document_id,
-            candidate_limit=args.candidate_limit,
-            rrf_k=args.rrf_k,
-        )
+        if args.refresh_context_session and not args.context_session:
+            raise SystemExit(
+                "--refresh-context-session 必须与 --context-session 一起使用。"
+            )
+        if args.context_session:
+            from app.context.session import ContextSessionStore
+
+            store = ContextSessionStore(PROJECT_ROOT)
+            try:
+                existed = store.exists(args.context_session)
+                if args.refresh_context_session or not existed:
+                    runtime = retrieval_runtime_from_args(
+                        args,
+                        include_reranker=args.mode == "accurate",
+                    )
+                    context = runtime.build_context(
+                        query=args.query,
+                        mode=args.mode,
+                        retrieval_limit=args.retrieval_limit,
+                        token_budget=args.token_budget,
+                        max_evidence=args.max_evidence,
+                        max_evidence_per_work=args.max_evidence_per_work,
+                        work_id=args.work_id,
+                        document_id=args.document_id,
+                        candidate_limit=args.candidate_limit,
+                        rrf_k=args.rrf_k,
+                    )
+                    session = store.save(args.context_session, context)
+                    session_state = "refreshed" if existed else "created"
+                else:
+                    runtime = None
+                    session = store.load(args.context_session)
+                    context = session.context
+                    session_state = "reused"
+            except (OSError, ValueError) as error:
+                raise SystemExit(f"Context Session 错误：{error}") from error
+            service = GroundedAnswerService(runtime, answer_provider)
+            answer = service.answer_from_context(context, query=args.query)
+            diagnostics = dict(answer.diagnostics)
+            diagnostics["context_session"] = {
+                "session_id": session.session_id,
+                "state": session_state,
+                "context_hash": session.context_hash,
+                "source_query": session.context.query,
+                "retrieval_skipped": session_state == "reused",
+            }
+            answer = replace(answer, diagnostics=diagnostics)
+        else:
+            runtime = retrieval_runtime_from_args(
+                args,
+                include_reranker=args.mode == "accurate",
+            )
+            service = GroundedAnswerService(runtime, answer_provider)
+            answer = service.answer(
+                query=args.query,
+                mode=args.mode,
+                retrieval_limit=args.retrieval_limit,
+                token_budget=args.token_budget,
+                max_evidence=args.max_evidence,
+                max_evidence_per_work=args.max_evidence_per_work,
+                work_id=args.work_id,
+                document_id=args.document_id,
+                candidate_limit=args.candidate_limit,
+                rrf_k=args.rrf_k,
+            )
         print_json(answer.to_dict(include_context=args.include_context))
         if not answer.answerable:
             raise SystemExit(2)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +23,7 @@ class LocalLLMSettings(BaseSettings):
     api_key: SecretStr | None = None
     timeout_seconds: float = 120.0
     max_tokens: int = 1200
+    prompt_layout: Literal["query_first", "context_first"] | None = None
 
 
 def load_local_llm_settings(project_root: Path) -> LocalLLMSettings:
