@@ -28,6 +28,13 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - name: Install project dependencies
         run: uv sync --frozen --all-groups
 
@@ -39,3 +46,7 @@ jobs:
 
       - name: Run MyPy
         run: uv run --no-sync mypy app main.py
+
+      - name: Build React workspace
+        working-directory: web
+        run: npm ci && npm run build

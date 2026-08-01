@@ -863,7 +863,80 @@ nDCG@10、按问题类型聚合的指标以及每道题的排名。当前 21 道
 达到该上限。CPU 下 20 对精排平均 14.01 秒、P95 17.18 秒，吞吐 1.428 pair/s。
 质量提升成立，但当前配置不适合交互式在线查询。
 
-### 启动界面
+### FastAPI + React 科研工作台
+
+可视化层不会启动 CLI 子进程，而是直接复用 `parse_paper()`、
+`AgenticRAGService`、`RetrievalRuntime` 和 `AgenticSessionStore`：
+
+```text
+React / Vite
+  → FastAPI JSON + SSE
+      → background parse/answer jobs
+          → shared Parsing + Agentic RAG services
+              → local paper/index data + SQLite sessions
+```
+
+开发时分别启动后端和 Vite：
+
+```bash
+# 终端 1：FastAPI（模型在此进程中长驻）
+uv run --no-sync python main.py web
+
+# 终端 2：React HMR
+cd web
+npm install
+npm run dev
+```
+
+打开 `http://127.0.0.1:5173`。Vite 会将 `/api` 代理到
+`http://127.0.0.1:8000`，FastAPI 的交互式文档位于 `/docs`。
+
+单进程本地运行使用生产构建：
+
+```bash
+cd web && npm ci && npm run build && cd ..
+uv run --no-sync python main.py web --host 127.0.0.1 --port 8000
+```
+
+此时直接打开 `http://127.0.0.1:8000`。页面包含：
+
+- 论文库：PDF 上传、解析进度、真实标题、作者、页数和质量状态；
+  解析后同一任务会继续构建 Chunk/BM25 并更新 Dense 索引，完成后才标记
+  为可检索；
+- 研究问答：创建/继续 Session，使用 Topic Router 支持追问；
+- 证据面板：显示 `source_id/evidence_id`、论文、章节、页码、Chunk
+  正文和 reused/new 状态；
+- 诊断面板：显示 Routing、Coverage、Coverage-aware Selection 和
+  Harness Stage Trace；
+- 任务进度：上传与问答先返回 `job_id`，再通过 SSE 推送阶段，
+  不会让浏览器表现为卡死。
+
+主要 API：
+
+```text
+GET  /api/system/status
+GET  /api/papers
+POST /api/papers/upload
+POST /api/answers
+GET  /api/jobs/{job_id}
+GET  /api/jobs/{job_id}/events
+GET  /api/sessions
+GET  /api/sessions/{session_id}/transcript
+GET  /api/sessions/{session_id}/evidence
+POST /api/sessions/{session_id}/compact
+```
+
+Web Runtime 默认 `LEO_WEB_LOCAL_FILES_ONLY=true`，不会因打开页面而下载
+模型。API Key 仍只从 `.env` 中的 `LEO_LLM_API_KEY` 或
+`DEEPSEEK_API_KEY` 读取，不返回前端、不进入 SSE 事件。其他长驻模型参数见
+`.env.example` 中的 `LEO_WEB_*`。
+
+当前 Web 任务队列是单机进程内状态；持久化的是论文、索引、Session、Topic
+和 Evidence，正在运行的 `job_id` 不会跨 FastAPI 重启恢复。为了保护本地
+Qdrant 交换和 Agentic Service 诊断，解析/建索与问答在同一 Runtime 内串行进入
+临界区；这符合当前单用户本地工具定位。
+
+### 旧版 Gradio 入库界面
 
 ```bash
 ./.venv/bin/python main.py ui
@@ -1247,6 +1320,7 @@ PDF。
 | 类别感知 Planner、语义引用验证与 Repair | 已完成 |
 | Cache Prefix 诊断与非破坏性 Compaction | 已完成 |
 | Agent Harness Policy、状态机、预算与 Stage Trace | 已完成 |
+| FastAPI + React 本地工作台、SSE 任务和长驻模型 | 已完成 |
 | 自动分类 | 未实现 |
 | 大型多轮生成式人工评测集 | 未实现 |
 
@@ -1281,6 +1355,8 @@ PDF。
 - `app/agentic/`：Session Store、Topic Router、Planner、Reranker、Coverage、
   结构化 Provider、Prompt/Compaction、语义验证、Repair 和端到端编排；
 - `app/agentic/harness.py`：RunPolicy、有限状态机、预算、终止原因与安全 Trace；
+- `app/web/`：FastAPI、后台任务/SSE、长驻 RAG Runtime 与 React 静态托管；
+- `web/`：React/TypeScript/Vite 论文库、多轮问答、证据和诊断工作台；
 - `app/evaluation/retrieval.py`：检索问题校验、qrels 映射和排名指标；
 - `app/embeddings/base.py`：与本地模型/API 解耦的 Embedding 协议；
 - `app/parsing/precheck.py`：pipeline 内部 PDF 预检查；
@@ -1299,6 +1375,7 @@ Ubuntu 环境中自动安装主环境并运行以下检查：
 ./.venv/bin/pytest -q
 ./.venv/bin/ruff check app main.py tests
 ./.venv/bin/mypy app main.py
+cd web && npm run build
 ```
 
 CI 不安装 MinerU，也不下载模型。测试使用小型临时 PDF 和模拟 MinerU 输出，
@@ -1314,6 +1391,7 @@ v0.2 的批量验收会自动生成 5 份独立 PDF 测试夹具和 1 份损坏 
 - 重建前后的 `papers.jsonl` 内容一致；
 - 中文、空格、子目录和大写 `.PDF` 均可识别。
 - Gradio 批量页面能正确展示进度、成功数、复用数和失败列表。
+- FastAPI 能够上传 PDF、执行后台问答、推送 SSE、恢复 Session 并托管 React SPA。
 
 这些夹具只验证工程流程，不代替真实 LEO 论文语料验收。
 

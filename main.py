@@ -175,6 +175,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="启动本地 Gradio 页面。",
     )
 
+    web_command = subparsers.add_parser(
+        "web",
+        help="启动 FastAPI + React 本地可视化应用。",
+    )
+    web_command.add_argument("--host", default="127.0.0.1")
+    web_command.add_argument("--port", type=int, default=8000)
+
     subparsers.add_parser(
         "academic-mcp",
         help="通过 stdio 启动外部学术搜索与开放全文 MCP。",
@@ -846,6 +853,21 @@ def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) ->
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+
+    if args.command == "web":
+        import uvicorn
+
+        from app.web.api import create_app
+
+        if args.port < 1 or args.port > 65_535:
+            raise SystemExit("--port 必须在 1 到 65535 之间。")
+        uvicorn.run(
+            create_app(PROJECT_ROOT),
+            host=args.host,
+            port=args.port,
+            log_level="info",
+        )
+        return
 
     if args.command == "ui":
         from app.ui.gradio_app import main as run_ui

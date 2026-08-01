@@ -5,6 +5,7 @@ description = "Local paper parsing and RAG knowledge base for LEO signals-of-opp
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi>=0.116,<1",
     "filelock>=3.20.0",
     "gradio>=6.20.0",
     "httpx>=0.28.1",
@@ -12,11 +13,13 @@ dependencies = [
     "orjson>=3.11.9",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.14.2",
+    "python-multipart>=0.0.20",
     "pymupdf>=1.28.0",
     "qdrant-client>=1.15,<2",
     "rich>=15.0.0",
     "sentence-transformers>=5,<6",
     "typer>=0.27.0",
+    "uvicorn>=0.35,<1",
 ]
 
 [dependency-groups]
