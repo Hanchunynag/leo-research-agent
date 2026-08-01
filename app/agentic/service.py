@@ -38,6 +38,7 @@ from app.agentic.prompting import (
 from app.agentic.provider import AgenticReasoningProvider
 from app.agentic.reranking import DirectAnswerReranker
 from app.agentic.routing import TopicRouter, extract_entities, rewrite_standalone_query
+from app.agentic.selection import CoverageAwareEvidenceSelector
 from app.agentic.store import AgenticSessionStore, stable_json
 from app.context.assembly import assemble_context_bundle
 from app.context.models import ContextBundle
@@ -130,6 +131,11 @@ class AgenticRAGService:
             allow_model_downloads=config.allow_model_downloads,
         )
         self.planner = QueryPlanner()
+        self.evidence_selector = CoverageAwareEvidenceSelector(
+            mmr_lambda=config.evidence_mmr_lambda,
+            max_per_work=config.max_final_evidence_per_work,
+            min_directness_grade=config.min_final_directness_grade,
+        )
         self._stage_fallbacks: list[str] = []
         self.router = TopicRouter(
             retrieval_runtime.embedding_provider,
@@ -439,33 +445,25 @@ class AgenticRAGService:
 
     def _final_evidence(
         self,
+        query: str,
+        plan: QueryPlan,
         coverage: CoverageReport,
         evidence_by_id: dict[str, dict[str, Any]],
         latest_reranked: Sequence[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """优先选择 Coverage 直接证据，再按本轮精排补足最终上下文。"""
+        """使用 Coverage 必选与 MMR 去冗余/多样性策略分配最终证据预算。"""
 
-        supporting_ids = list(
-            dict.fromkeys(
-                evidence_id
-                for item in coverage.coverage
-                for evidence_id in item.supporting_evidence_ids
-            )
-        )
-        ordered = [
-            evidence_by_id[value]
-            for value in supporting_ids
-            if value in evidence_by_id
+        candidates = [
+            *evidence_by_id.values(),
+            *latest_reranked,
         ]
-        ordered.extend(
-            item
-            for item in latest_reranked
-            if str(item.get("evidence_id")) not in supporting_ids
+        return self.evidence_selector.select(
+            query,
+            plan,
+            coverage,
+            candidates,
+            self.config.final_top_k,
         )
-        selected = [dict(item) for item in ordered[: self.config.final_top_k]]
-        for index, item in enumerate(selected, 1):
-            item["source_id"] = f"S{index}"
-        return selected
 
     def _build_context(
         self,
@@ -481,7 +479,8 @@ class AgenticRAGService:
             list(evidence),
             token_budget=6000,
             max_evidence=self.config.final_top_k,
-            max_evidence_per_work=2,
+            # 来源上限已由 Selector 执行；此处不再二次丢弃 Coverage 必选证据。
+            max_evidence_per_work=self.config.final_top_k,
             retrieval_diagnostics={
                 "retriever": "agentic_hybrid_rrf",
                 "retrieval_rounds": round_count,
@@ -733,6 +732,8 @@ class AgenticRAGService:
 
         with harness.stage(AgenticStage.CONTEXT_BUILDING) as context_trace:
             final_evidence = self._final_evidence(
+                route.standalone_query,
+                plan,
                 coverage,
                 evidence_by_id,
                 last_reranked,
@@ -746,10 +747,22 @@ class AgenticRAGService:
                 {
                     "evidence_count": len(final_evidence),
                     "token_count": context.token_count,
+                    "coverage_preserved": bool(
+                        self.evidence_selector.last_diagnostics.get(
+                            "coverage_preserved"
+                        )
+                    ),
                 }
             )
+        selection_sufficient = bool(
+            self.evidence_selector.last_diagnostics.get("coverage_preserved")
+        )
         budget_exhausted = harness.deadline_exceeded()
-        if budget_exhausted or not coverage.overall_sufficient:
+        if (
+            budget_exhausted
+            or not coverage.overall_sufficient
+            or not selection_sufficient
+        ):
             reason = (
                 "Harness 总运行时限已耗尽。"
                 if budget_exhausted
@@ -759,7 +772,16 @@ class AgenticRAGService:
                         for item in coverage.coverage
                         if item.status != "sufficient"
                     )
-                    or "达到最大检索轮数后证据覆盖仍不足。"
+                    or (
+                        "最终证据预算无法保留所有子问题的直接证据："
+                        + ", ".join(
+                            self.evidence_selector.last_diagnostics.get(
+                                "uncovered_subquestions", []
+                            )
+                        )
+                        if not selection_sufficient
+                        else "达到最大检索轮数后证据覆盖仍不足。"
+                    )
                 )
             )
             answer = self._refusal_result(query, context, reason)
@@ -967,6 +989,8 @@ class AgenticRAGService:
                     attempt=round_number,
                 ) as context_trace:
                     final_evidence = self._final_evidence(
+                        route.standalone_query,
+                        plan,
                         coverage,
                         evidence_by_id,
                         last_reranked,
@@ -980,8 +1004,18 @@ class AgenticRAGService:
                         {
                             "evidence_count": len(final_evidence),
                             "token_count": context.token_count,
+                            "coverage_preserved": bool(
+                                self.evidence_selector.last_diagnostics.get(
+                                    "coverage_preserved"
+                                )
+                            ),
                         }
                     )
+                selection_sufficient = bool(
+                    self.evidence_selector.last_diagnostics.get(
+                        "coverage_preserved"
+                    )
+                )
                 self._append_source_mapping(
                     sid,
                     topic_id,
@@ -1252,7 +1286,7 @@ class AgenticRAGService:
             )
         if answer.answerable:
             termination_reason = TerminationReason.COMPLETED
-        elif not coverage.overall_sufficient:
+        elif not coverage.overall_sufficient or not selection_sufficient:
             termination_reason = TerminationReason.INSUFFICIENT_COVERAGE
         elif any(
             value.startswith("answer_generation")
@@ -1343,6 +1377,7 @@ class AgenticRAGService:
                 }
             ),
             "reranker_rounds": reranker_diagnostics,
+            "evidence_selection": dict(self.evidence_selector.last_diagnostics),
             "retrieval_rounds": [
                 item.model_dump(mode="json") for item in round_reports
             ],

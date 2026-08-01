@@ -12,6 +12,9 @@ class AgenticRAGConfig:
     candidate_limit: int = 20
     rerank_top_k: int = 8
     final_top_k: int = 5
+    evidence_mmr_lambda: float = 0.75
+    max_final_evidence_per_work: int = 2
+    min_final_directness_grade: int = 1
     max_retrieval_rounds: int = 2
     max_structure_repairs: int = 1
     max_answer_repairs: int = 1
@@ -84,6 +87,17 @@ class AgenticRAGConfig:
             candidate_limit=integer("CANDIDATE_LIMIT", defaults.candidate_limit),
             rerank_top_k=integer("RERANK_TOP_K", defaults.rerank_top_k),
             final_top_k=integer("FINAL_TOP_K", defaults.final_top_k),
+            evidence_mmr_lambda=number(
+                "EVIDENCE_MMR_LAMBDA", defaults.evidence_mmr_lambda
+            ),
+            max_final_evidence_per_work=integer(
+                "MAX_FINAL_EVIDENCE_PER_WORK",
+                defaults.max_final_evidence_per_work,
+            ),
+            min_final_directness_grade=integer(
+                "MIN_FINAL_DIRECTNESS_GRADE",
+                defaults.min_final_directness_grade,
+            ),
             max_retrieval_rounds=integer(
                 "MAX_RETRIEVAL_ROUNDS", defaults.max_retrieval_rounds
             ),
@@ -150,6 +164,12 @@ class AgenticRAGConfig:
             raise ValueError("rerank_top_k 不能大于 candidate_limit。")
         if self.final_top_k > self.rerank_top_k:
             raise ValueError("final_top_k 不能大于 rerank_top_k。")
+        if not 0.0 <= self.evidence_mmr_lambda <= 1.0:
+            raise ValueError("evidence_mmr_lambda 必须在 0 到 1 之间。")
+        if not 1 <= self.max_final_evidence_per_work <= 20:
+            raise ValueError("max_final_evidence_per_work 必须在 1 到 20 之间。")
+        if self.min_final_directness_grade not in {0, 1, 2, 3}:
+            raise ValueError("min_final_directness_grade 必须在 0 到 3 之间。")
         if self.rrf_k < 1 or self.rrf_k > 10_000:
             raise ValueError("rrf_k 必须在 1 到 10000 之间。")
         if self.max_structure_repairs not in {0, 1}:

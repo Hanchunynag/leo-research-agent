@@ -321,6 +321,9 @@ def test_coverage_triggers_bounded_second_retrieval_round(tmp_path: Path) -> Non
     assert result["retrieval_rounds"][0]["coverage_status"] != "sufficient"
     assert result["retrieval_rounds"][1]["coverage_status"] == "sufficient"
     assert result["coverage"]["overall_sufficient"] is True
+    selection = result["diagnostics"]["evidence_selection"]
+    assert selection["strategy"] == "coverage_mmr"
+    assert selection["covered_subquestions"] == ["SQ1", "SQ2"]
     assert runtime.calls == 4
     harness = result["diagnostics"]["harness"]
     assert harness["state"] == "completed"
@@ -780,6 +783,9 @@ def test_agentic_config_loads_dotenv_with_environment_precedence(
         (
             "LEO_AGENTIC_CANDIDATE_LIMIT=30\n"
             "LEO_AGENTIC_RRF_K=55\n"
+            "LEO_AGENTIC_EVIDENCE_MMR_LAMBDA=0.65\n"
+            "LEO_AGENTIC_MAX_FINAL_EVIDENCE_PER_WORK=3\n"
+            "LEO_AGENTIC_MIN_FINAL_DIRECTNESS_GRADE=2\n"
             "LEO_AGENTIC_MAX_ANSWER_REPAIRS=0\n"
             "LEO_AGENTIC_MAX_TOTAL_LATENCY_MS=5000\n"
         ),
@@ -791,6 +797,9 @@ def test_agentic_config_loads_dotenv_with_environment_precedence(
 
     assert loaded.candidate_limit == 30
     assert loaded.rrf_k == 61
+    assert loaded.evidence_mmr_lambda == 0.65
+    assert loaded.max_final_evidence_per_work == 3
+    assert loaded.min_final_directness_grade == 2
     assert loaded.max_answer_repairs == 0
     assert loaded.max_total_latency_ms == 5000
 

@@ -595,7 +595,10 @@ User Query
   → Evidence Registry 去重与复用
   → Evidence Coverage Check
       └─ partial/missing → focused query → 补充检索（默认总计最多 2 轮）
-  → Context Builder → Top-5
+  → Coverage-aware Evidence Selector
+      ├─ 每个 subquestion 优先保留一条直接证据
+      └─ MMR 去冗余 + work/document 来源多样性 → 最多 5 条
+  → Context Builder
   → Structured Answer Generator
   → Structural Citation Validation
   → Claim-Citation Semantic Entailment
@@ -746,6 +749,19 @@ Reranker 不只判断主题相关性，还为每个候选赋予 0–3 的 direct
 直接包含答案，2 表示关键支持，1 表示背景，0 表示不支持。因此只重复“星历误差、
 时钟误差”的 Introduction 不会压过明确说明载波相位或多普勒用途的正文。
 
+`final_top_k=5` 现在是 Context 的证据预算上限，不再是对 Reranker 结果的
+机械截断。`CoverageAwareEvidenceSelector` 先从 Coverage 返回的稳定
+Evidence ID 中为每个 subquestion 选择一条直接性最高的必选证据；
+剩余位置使用轻量 MMR，综合 directness、精排名次、Query 词面重合、
+文本冗余度和 work/document 多样性。中英文相似度使用确定性 token
+Jaccard，不增加 LLM 调用或 Embedding 重算。Coverage 必选证据不会被普通
+per-work cap 丢弃，Context Builder 也不再对 Selector 结果二次限流。
+
+输出的 `diagnostics.evidence_selection` 记录候选/选中数、已覆盖与未覆盖
+subquestion、必选 Evidence 数、低直接性/冗余/per-work/预算丢弃数，
+以及每条最终证据的 `required_for_SQ*` 或 `mmr_fill` 原因。这使 Top-5
+从隐式切片变成可解释、可做消融实验的选择阶段。
+
 Coverage 必须逐个 subquestion 返回 `sufficient/partial/missing` 和稳定 Evidence ID。
 缺失项产生 focused follow-up query，重新执行 Hybrid → RRF → Reranker，并按
 `chunk_id` 合并。达到 `max_retrieval_rounds` 仍不足时系统 fail closed，输出具体
@@ -781,7 +797,9 @@ Recall、Evidence Coverage、Citation Precision/Recall、Claim Entailment Accura
 #### Agentic 配置
 
 主要 CLI 参数为 `--candidate-limit 20`、`--rerank-top-k 8`、
-`--final-top-k 5`、`--max-retrieval-rounds 2`、
+`--final-top-k 5`、`--evidence-mmr-lambda 0.75`、
+`--max-final-evidence-per-work 2`、`--min-final-directness-grade 1`、
+`--max-retrieval-rounds 2`、
 `--max-structure-repairs 1`、`--max-answer-repairs 1`、
 `--max-total-latency-ms`、`--rrf-k 60`、
 `--disable-reranker`、

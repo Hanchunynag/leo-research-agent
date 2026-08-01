@@ -387,6 +387,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--final-top-k", type=int, default=agentic_defaults.final_top_k
     )
     answer_command.add_argument(
+        "--evidence-mmr-lambda",
+        type=float,
+        default=agentic_defaults.evidence_mmr_lambda,
+        help="最终证据选择中相关性与去冗余的 MMR 权重，默认 0.75。",
+    )
+    answer_command.add_argument(
+        "--max-final-evidence-per-work",
+        type=int,
+        default=agentic_defaults.max_final_evidence_per_work,
+        help="MMR 补位时每篇论文最多证据数；Coverage 必选项可超过此限制。",
+    )
+    answer_command.add_argument(
+        "--min-final-directness-grade",
+        type=int,
+        choices=[0, 1, 2, 3],
+        default=agentic_defaults.min_final_directness_grade,
+        help="非 Coverage 必选证据进入最终 Context 的最低直接性等级，默认 1。",
+    )
+    answer_command.add_argument(
         "--max-retrieval-rounds",
         type=int,
         default=agentic_defaults.max_retrieval_rounds,
@@ -781,6 +800,9 @@ def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) ->
         candidate_limit=args.candidate_limit,
         rerank_top_k=args.rerank_top_k,
         final_top_k=args.final_top_k,
+        evidence_mmr_lambda=args.evidence_mmr_lambda,
+        max_final_evidence_per_work=args.max_final_evidence_per_work,
+        min_final_directness_grade=args.min_final_directness_grade,
         max_retrieval_rounds=args.max_retrieval_rounds,
         max_structure_repairs=args.max_structure_repairs,
         max_answer_repairs=args.max_answer_repairs,
