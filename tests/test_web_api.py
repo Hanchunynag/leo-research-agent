@@ -206,6 +206,50 @@ def test_web_runtime_config_resolves_relative_model_cache(
     assert config.model_cache == tmp_path / "private" / "models"
 
 
+def test_web_runtime_config_inherits_existing_dense_manifest(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    manifest = tmp_path / "data" / "index" / "dense_manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        (
+            '{"model_name":"fixture/bge-m3",'
+            '"model_revision":"fixed-revision"}'
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "LEO_WEB_RERANKER_REVISION=reranker-revision\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("LEO_WEB_EMBEDDING_MODEL", raising=False)
+    monkeypatch.delenv("LEO_WEB_EMBEDDING_REVISION", raising=False)
+
+    config = WebRuntimeConfig.from_environment(tmp_path)
+
+    assert config.embedding_model == "fixture/bge-m3"
+    assert config.embedding_revision == "fixed-revision"
+    assert config.reranker_revision == "reranker-revision"
+
+
+def test_explicit_web_embedding_revision_overrides_manifest(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    manifest = tmp_path / "data" / "index" / "dense_manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        '{"model_name":"fixture/bge-m3","model_revision":"old"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LEO_WEB_EMBEDDING_REVISION", "explicit")
+
+    config = WebRuntimeConfig.from_environment(tmp_path)
+
+    assert config.embedding_revision == "explicit"
+
+
 def test_web_job_error_redacts_api_key() -> None:
     manager = JobManager(max_workers=1)
     secret = "sk-web-secret-value"

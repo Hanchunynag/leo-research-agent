@@ -929,7 +929,10 @@ POST /api/sessions/{session_id}/compact
 Web Runtime 默认 `LEO_WEB_LOCAL_FILES_ONLY=true`，不会因打开页面而下载
 模型。API Key 仍只从 `.env` 中的 `LEO_LLM_API_KEY` 或
 `DEEPSEEK_API_KEY` 读取，不返回前端、不进入 SSE 事件。其他长驻模型参数见
-`.env.example` 中的 `LEO_WEB_*`。
+`.env.example` 中的 `LEO_WEB_*`。如果未显式设置
+`LEO_WEB_EMBEDDING_MODEL/REVISION`，Web Runtime 会自动继承已有
+`dense_manifest.json` 中的模型名和精确 revision，保证查询 Provider 与建库
+Provider 一致，不会为了修复配置而无效重算向量。
 
 当前 Web 任务队列是单机进程内状态；持久化的是论文、索引、Session、Topic
 和 Evidence，正在运行的 `job_id` 不会跨 FastAPI 重启恢复。为了保护本地

@@ -68,11 +68,22 @@ def search_dense_evidence(
         raise RuntimeError("Dense manifest 与 chunks.jsonl 不一致，请重新构建索引。")
     model_name = getattr(provider, "model_name", None)
     revision = getattr(provider, "revision", None)
-    if (
-        manifest.get("model_name") != model_name
-        or manifest.get("model_revision") != revision
-    ):
-        raise RuntimeError("Dense manifest 与当前 EmbeddingProvider 不一致。")
+    provider_mismatches: list[str] = []
+    if manifest.get("model_name") != model_name:
+        provider_mismatches.append(
+            "model_name "
+            f"manifest={manifest.get('model_name')!r} provider={model_name!r}"
+        )
+    if manifest.get("model_revision") != revision:
+        provider_mismatches.append(
+            "model_revision "
+            f"manifest={manifest.get('model_revision')!r} provider={revision!r}"
+        )
+    if provider_mismatches:
+        raise RuntimeError(
+            "Dense manifest 与当前 EmbeddingProvider 不一致："
+            + "; ".join(provider_mismatches)
+        )
 
     vector = provider.embed_query(cleaned_query)
     expected_dimension = int(manifest.get("vector_dimension", 0))

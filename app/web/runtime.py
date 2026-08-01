@@ -46,10 +46,31 @@ class WebRuntimeConfig:
 
     @classmethod
     def from_environment(cls, project_root: Path) -> WebRuntimeConfig:
-        """从 ``LEO_WEB_*`` 读取长驻运行时配置。"""
+        """从 ``LEO_WEB_*`` 读取配置，未指定时复用现有 Dense Manifest。"""
+
+        root = project_root.expanduser().resolve()
+        file_values: dict[str, str] = {}
+        env_file = root / ".env"
+        if env_file.is_file():
+            try:
+                lines = env_file.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                lines = []
+            for line in lines:
+                cleaned = line.strip()
+                if not cleaned or cleaned.startswith("#") or "=" not in cleaned:
+                    continue
+                key, _, value = cleaned.partition("=")
+                key = key.strip()
+                if key.startswith("LEO_WEB_"):
+                    file_values[key] = value.strip().strip("'\"")
+
+        def raw(name: str) -> str | None:
+            key = f"LEO_WEB_{name}"
+            return os.getenv(key, file_values.get(key))
 
         def boolean(name: str, default: bool) -> bool:
-            value = os.getenv(f"LEO_WEB_{name}")
+            value = raw(name)
             if value is None:
                 return default
             normalized = value.strip().casefold()
@@ -60,26 +81,38 @@ class WebRuntimeConfig:
             raise ValueError(f"LEO_WEB_{name} 必须是布尔值。")
 
         def integer(name: str, default: int) -> int:
-            value = os.getenv(f"LEO_WEB_{name}")
+            value = raw(name)
             return int(value) if value is not None else default
 
         defaults = cls()
-        cache = os.getenv("LEO_WEB_MODEL_CACHE")
+        manifest: dict[str, Any] = {}
+        try:
+            from app.indexing.dense import load_dense_manifest
+
+            manifest = load_dense_manifest(root)
+        except (FileNotFoundError, OSError, ValueError):
+            manifest = {}
+        manifest_model = manifest.get("model_name")
+        if not isinstance(manifest_model, str) or not manifest_model.strip():
+            manifest_model = defaults.embedding_model
+        manifest_revision = manifest.get("model_revision")
+        if not isinstance(manifest_revision, str) or not manifest_revision.strip():
+            manifest_revision = None
+
+        configured_model = raw("EMBEDDING_MODEL")
+        configured_revision = raw("EMBEDDING_REVISION")
+        cache = raw("MODEL_CACHE")
         cache_path = Path(cache).expanduser() if cache else None
         if cache_path is not None and not cache_path.is_absolute():
-            cache_path = project_root / cache_path
+            cache_path = root / cache_path
         return cls(
-            embedding_model=os.getenv(
-                "LEO_WEB_EMBEDDING_MODEL", defaults.embedding_model
-            ),
-            embedding_revision=os.getenv("LEO_WEB_EMBEDDING_REVISION"),
-            reranker_model=os.getenv(
-                "LEO_WEB_RERANKER_MODEL", defaults.reranker_model
-            ),
-            reranker_revision=os.getenv("LEO_WEB_RERANKER_REVISION"),
-            device=os.getenv("LEO_WEB_DEVICE"),
+            embedding_model=(configured_model or str(manifest_model)).strip(),
+            embedding_revision=(configured_revision or manifest_revision),
+            reranker_model=(raw("RERANKER_MODEL") or defaults.reranker_model),
+            reranker_revision=raw("RERANKER_REVISION") or None,
+            device=raw("DEVICE") or None,
             model_cache=cache_path
-            or project_root / "data" / "models" / "huggingface",
+            or root / "data" / "models" / "huggingface",
             embedding_batch_size=integer(
                 "EMBEDDING_BATCH_SIZE", defaults.embedding_batch_size
             ),
