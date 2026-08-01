@@ -112,6 +112,7 @@ class GroundedAnswerService:
             (perf_counter() - started) * 1000,
             3,
         )
+        diagnostics.update(draft.provider_metadata)
 
         validation = validate_answer_draft(draft, context)
         if not validation.valid:

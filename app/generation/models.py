@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from app.context.models import ContextBundle
@@ -26,6 +26,7 @@ class AnswerDraft:
     answerable: bool
     claims: list[AnswerClaim]
     refusal_reason: str | None = None
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -69,12 +70,16 @@ class CitationValidationReport:
     issues: list[CitationValidationIssue]
     citations: list[CitationRecord]
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, include_citations: bool = True) -> dict[str, Any]:
+        payload = {
             "valid": self.valid,
             "issues": [issue.to_dict() for issue in self.issues],
-            "citations": [citation.to_dict() for citation in self.citations],
         }
+        if include_citations:
+            payload["citations"] = [
+                citation.to_dict() for citation in self.citations
+            ]
+        return payload
 
 
 @dataclass(frozen=True)
@@ -90,8 +95,8 @@ class GroundedAnswer:
     diagnostics: dict[str, Any]
     schema_version: str = ANSWER_SCHEMA_VERSION
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, include_context: bool = True) -> dict[str, Any]:
+        payload = {
             "schema_version": self.schema_version,
             "query": self.query,
             "answerable": self.answerable,
@@ -99,7 +104,11 @@ class GroundedAnswer:
             "claims": [claim.to_dict() for claim in self.claims],
             "citations": [citation.to_dict() for citation in self.citations],
             "refusal_reason": self.refusal_reason,
-            "validation": self.validation.to_dict(),
+            "validation": self.validation.to_dict(
+                include_citations=include_context,
+            ),
             "diagnostics": self.diagnostics,
-            "context": self.context.to_dict(),
         }
+        if include_context:
+            payload["context"] = self.context.to_dict()
+        return payload

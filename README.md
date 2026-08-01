@@ -462,21 +462,40 @@ CLI 是一次性进程，仍会在每次执行时加载模型。UI、API 或本�
 ### 生成带逐条引用的回答
 
 先启动支持 OpenAI Chat Completions 接口的本地模型服务，例如 Ollama、LM Studio
-或 vLLM。调用时必须显式给出服务地址和模型名：
+或 vLLM，或者准备一个兼容该接口的远程服务。复制本地配置模板：
+
+```bash
+cp .env.example .env
+```
+
+`.env` 已被 Git 忽略。使用远程 DeepSeek 服务时，在 `.env` 中填写：
+
+```dotenv
+LEO_LLM_BASE_URL=https://api.deepseek.com
+LEO_LLM_MODEL=服务商提供的模型名
+LEO_LLM_API_KEY=新生成的密钥
+LEO_LLM_TIMEOUT_SECONDS=120
+LEO_LLM_MAX_TOKENS=1200
+```
+
+不要把密钥直接写进命令行、Python 文件、日志或 `.env.example`。如果密钥曾经
+出现在终端历史或日志中，应先到服务商控制台撤销，再把新密钥写入 `.env`。
+
+配置完成后，命令不再需要携带 API 参数：
 
 ```bash
 ./.venv/bin/python main.py answer \
   "Which measurements track LEO ephemerides?" \
   --mode fast \
-  --llm-base-url http://127.0.0.1:11434 \
-  --llm-model qwen3:8b \
   --revision 5617a9f61b028005a4858fdac845db406aefb181 \
   --local-files-only
 ```
 
-`--llm-base-url` 可以是服务根地址、`/v1` 地址或完整的
-`/v1/chat/completions` 地址。`accurate` 模式还需固定 Reranker revision，参数与
-`context build` 相同。
+配置优先级为命令行参数、系统环境变量、项目 `.env`。命令行的
+`--llm-base-url`、`--llm-model` 等参数只用于临时覆盖；其中 base URL 可以是
+服务根地址、`/v1` 地址或完整的 `/v1/chat/completions` 地址。本地 Ollama 可将
+地址设为 `http://127.0.0.1:11434`，并将 API Key 留空。`accurate` 模式还需固定
+Reranker revision，参数与 `context build` 相同。
 
 回答模型不能直接输出自由文本引用。它必须返回结构化 claims：
 
@@ -499,6 +518,10 @@ CLI 是一次性进程，仍会在每次执行时加载模型。UI、API 或本�
 章节、页码和 block IDs。空证据、上下文预算或来源完整性异常、无引用 claim、
 重复或未知来源、非法模型 JSON 都不会输出部分回答，而是返回
 `answerable=false`；CLI 对拒答使用退出码 2。
+
+`answer` 默认输出回答、claims、去重后的 citations、校验结果、耗时、服务端返回
+的模型标识和 token usage，不再重复打印完整论文上下文。只有排查检索证据时才
+使用 `--include-context` 输出完整 `ContextBundle`。
 
 这里的校验保证“引用存在且身份可追溯”，不等于已经自动证明 claim 被引用文本
 语义蕴含。语义正确率、引用精确率和拒答质量需要在下一阶段的生成式评测集中
@@ -952,6 +975,7 @@ PDF。
 - `app/context/assembly.py`：来源去重、边界校验和 token budget 组装；
 - `app/generation/base.py`：与具体 LLM 服务解耦的 AnswerProvider 协议；
 - `app/generation/openai_compatible.py`：本地 Chat Completions 适配器；
+- `app/generation/settings.py`：环境变量与本地 `.env` 的安全配置入口；
 - `app/generation/validation.py`：上下文完整性与 claim 级引用校验；
 - `app/generation/service.py`：检索、生成、确定性引用渲染和失败关闭；
 - `app/evaluation/retrieval.py`：检索问题校验、qrels 映射和排名指标；

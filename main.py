@@ -372,13 +372,25 @@ def build_parser() -> argparse.ArgumentParser:
     answer_command.add_argument("--rrf-k", type=int, default=60)
     answer_command.add_argument(
         "--llm-base-url",
-        required=True,
-        help="例如 http://127.0.0.1:11434 或 http://127.0.0.1:1234/v1。",
+        help=(
+            "临时覆盖 LEO_LLM_BASE_URL；也可配置在项目根目录 .env。"
+        ),
     )
-    answer_command.add_argument("--llm-model", required=True)
-    answer_command.add_argument("--llm-api-key")
-    answer_command.add_argument("--llm-timeout", type=float, default=120.0)
-    answer_command.add_argument("--llm-max-tokens", type=int, default=1200)
+    answer_command.add_argument(
+        "--llm-model",
+        help="临时覆盖 LEO_LLM_MODEL。",
+    )
+    answer_command.add_argument(
+        "--llm-api-key",
+        help="临时覆盖本地密钥；推荐改用 .env，避免进入 shell history。",
+    )
+    answer_command.add_argument("--llm-timeout", type=float)
+    answer_command.add_argument("--llm-max-tokens", type=int)
+    answer_command.add_argument(
+        "--include-context",
+        action="store_true",
+        help="调试时在 JSON 中包含完整 ContextBundle；默认省略。",
+    )
     add_embedding_options(answer_command)
     add_reranker_options(answer_command)
 
@@ -494,20 +506,57 @@ def reranker_provider_from_args(args: argparse.Namespace) -> Any:
 
 
 def answer_provider_from_args(args: argparse.Namespace) -> Any:
-    """创建显式配置的 OpenAI-compatible 本地回答模型。"""
+    """按 CLI > 环境变量 > `.env` 的顺序创建回答模型。"""
 
     from app.generation.openai_compatible import (
         OpenAICompatibleAnswerProvider,
         OpenAICompatibleConfig,
     )
+    from app.generation.settings import load_local_llm_settings
+
+    settings = load_local_llm_settings(PROJECT_ROOT)
+    base_url = args.llm_base_url or settings.base_url
+    model = args.llm_model or settings.model
+    missing = [
+        name
+        for name, value in (
+            ("LEO_LLM_BASE_URL", base_url),
+            ("LEO_LLM_MODEL", model),
+        )
+        if not isinstance(value, str) or not value.strip()
+    ]
+    if missing:
+        joined = "、".join(missing)
+        raise ValueError(
+            f"缺少 {joined}；请复制 .env.example 为 .env 后填写。"
+        )
+    assert isinstance(base_url, str)
+    assert isinstance(model, str)
+    settings_api_key = (
+        settings.api_key.get_secret_value() if settings.api_key is not None else None
+    )
+    api_key = (
+        args.llm_api_key
+        if args.llm_api_key is not None
+        else settings_api_key
+    )
+    normalized_api_key = api_key.strip() if api_key is not None else None
 
     return OpenAICompatibleAnswerProvider(
         OpenAICompatibleConfig(
-            base_url=args.llm_base_url,
-            model=args.llm_model,
-            api_key=args.llm_api_key,
-            timeout_seconds=args.llm_timeout,
-            max_tokens=args.llm_max_tokens,
+            base_url=base_url.strip(),
+            model=model.strip(),
+            api_key=normalized_api_key or None,
+            timeout_seconds=(
+                args.llm_timeout
+                if args.llm_timeout is not None
+                else settings.timeout_seconds
+            ),
+            max_tokens=(
+                args.llm_max_tokens
+                if args.llm_max_tokens is not None
+                else settings.max_tokens
+            ),
         )
     )
 
@@ -738,11 +787,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "answer":
         from app.generation.service import GroundedAnswerService
 
+        try:
+            answer_provider = answer_provider_from_args(args)
+        except ValueError as error:
+            raise SystemExit(f"LLM 配置错误：{error}") from error
         runtime = retrieval_runtime_from_args(
             args,
             include_reranker=args.mode == "accurate",
         )
-        service = GroundedAnswerService(runtime, answer_provider_from_args(args))
+        service = GroundedAnswerService(runtime, answer_provider)
         answer = service.answer(
             query=args.query,
             mode=args.mode,
@@ -755,7 +808,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             candidate_limit=args.candidate_limit,
             rrf_k=args.rrf_k,
         )
-        print_json(answer.to_dict())
+        print_json(answer.to_dict(include_context=args.include_context))
         if not answer.answerable:
             raise SystemExit(2)
         return

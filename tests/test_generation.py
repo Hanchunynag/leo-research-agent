@@ -77,6 +77,7 @@ def test_valid_claims_are_rendered_with_traceable_citations() -> None:
         AnswerDraft(
             True,
             [AnswerClaim("C1", "The observations estimate both errors.", ["S1"])],
+            provider_metadata={"response_model": "fixture-served-model"},
         )
     )
 
@@ -85,6 +86,7 @@ def test_valid_claims_are_rendered_with_traceable_citations() -> None:
     assert result.answerable is True
     assert result.answer == "The observations estimate both errors. [S1]"
     assert result.validation.valid is True
+    assert result.diagnostics["response_model"] == "fixture-served-model"
     assert result.citations[0].document_id == "D_alpha"
     assert result.citations[0].page_start == 2
     assert result.citations[0].block_ids == ["B_alpha"]
@@ -172,6 +174,13 @@ class FakeHTTPClient:
 def test_openai_compatible_provider_parses_structured_json_without_network() -> None:
     response = FakeHTTPResponse(
         {
+            "model": "served-local-model",
+            "usage": {
+                "prompt_tokens": 321,
+                "completion_tokens": 42,
+                "total_tokens": 363,
+                "ignored_nested_detail": {"cached_tokens": 10},
+            },
             "choices": [
                 {
                     "message": {
@@ -195,6 +204,14 @@ def test_openai_compatible_provider_parses_structured_json_without_network() -> 
     draft = provider.generate("question", context_bundle())
 
     assert draft.claims[0].source_ids == ["S1"]
+    assert draft.provider_metadata == {
+        "response_model": "served-local-model",
+        "usage": {
+            "prompt_tokens": 321,
+            "completion_tokens": 42,
+            "total_tokens": 363,
+        },
+    }
     assert response.status_checked is True
     assert client.calls[0][0] == "http://127.0.0.1:11434/v1/chat/completions"
     request = client.calls[0][1]
@@ -235,3 +252,82 @@ def test_answer_cli_outputs_grounded_result(
     assert output["answerable"] is True
     assert output["answer"] == "CLI supported fact. [S1]"
     assert output["citations"][0]["source_id"] == "S1"
+    assert "context" not in output
+    assert "citations" not in output["validation"]
+
+
+def test_answer_cli_can_include_full_context_for_debugging(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    provider = FakeAnswerProvider(
+        AnswerDraft(True, [AnswerClaim("C1", "Debug fact.", ["S1"])])
+    )
+    monkeypatch.setattr(
+        cli,
+        "retrieval_runtime_from_args",
+        lambda args, include_reranker: UnusedRuntime(),
+    )
+    monkeypatch.setattr(cli, "answer_provider_from_args", lambda args: provider)
+
+    cli.main(
+        [
+            "answer",
+            "Debug question",
+            "--llm-base-url",
+            "http://127.0.0.1:11434",
+            "--llm-model",
+            "local-model",
+            "--include-context",
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["context"]["evidence_count"] == 1
+    assert output["validation"]["citations"][0]["source_id"] == "S1"
+
+
+def test_answer_provider_reads_local_dotenv_with_safe_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".env").write_text(
+        "LEO_LLM_BASE_URL=https://file.example/v1\n"
+        "LEO_LLM_MODEL=file-model\n"
+        "LEO_LLM_API_KEY=file-test-key\n"
+        "LEO_LLM_TIMEOUT_SECONDS=45\n"
+        "LEO_LLM_MAX_TOKENS=700\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("LEO_LLM_BASE_URL", "https://environment.example/v1")
+    monkeypatch.setenv("LEO_LLM_MODEL", "environment-model")
+    args = cli.build_parser().parse_args(
+        [
+            "answer",
+            "question",
+            "--llm-model",
+            "cli-model",
+        ]
+    )
+
+    provider = cli.answer_provider_from_args(args)
+
+    assert provider.endpoint == "https://environment.example/v1/chat/completions"
+    assert provider.config.model == "cli-model"
+    assert provider.config.api_key == "file-test-key"
+    assert provider.config.timeout_seconds == 45
+    assert provider.config.max_tokens == 700
+
+
+def test_answer_provider_reports_missing_local_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "PROJECT_ROOT", tmp_path)
+    for name in ("LEO_LLM_BASE_URL", "LEO_LLM_MODEL", "LEO_LLM_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    args = cli.build_parser().parse_args(["answer", "question"])
+
+    with pytest.raises(ValueError, match="复制 .env.example 为 .env"):
+        cli.answer_provider_from_args(args)

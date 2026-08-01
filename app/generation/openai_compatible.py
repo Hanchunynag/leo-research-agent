@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -147,4 +147,22 @@ class OpenAICompatibleAnswerProvider:
             raise ValueError("Chat Completions 响应缺少 message.content。") from error
         if not isinstance(content, str) or not content.strip():
             raise ValueError("Chat Completions 返回了空 content。")
-        return _parse_answer_draft(content)
+        metadata: dict[str, Any] = {}
+        response_model = payload.get("model") if isinstance(payload, dict) else None
+        if isinstance(response_model, str) and response_model.strip():
+            metadata["response_model"] = response_model
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        if isinstance(usage, dict):
+            safe_usage = {
+                str(key): value
+                for key, value in usage.items()
+                if isinstance(key, str)
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            }
+            if safe_usage:
+                metadata["usage"] = safe_usage
+        return replace(
+            _parse_answer_draft(content),
+            provider_metadata=metadata,
+        )
