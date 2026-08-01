@@ -16,6 +16,8 @@ class AnswerClaim:
     claim_id: str
     text: str
     source_ids: list[str]
+    category: str | None = None
+    evidence_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -48,6 +50,7 @@ class CitationRecord:
     page_start: int
     page_end: int
     block_ids: list[str]
+    evidence_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

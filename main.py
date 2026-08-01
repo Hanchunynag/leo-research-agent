@@ -115,6 +115,9 @@ def add_mineru_options(command: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from app.agentic.config import AgenticRAGConfig
+
+    agentic_defaults = AgenticRAGConfig.from_environment(PROJECT_ROOT / ".env")
     parser = argparse.ArgumentParser(
         description="本地 LEO 论文解析工具。",
     )
@@ -362,14 +365,35 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["fast", "accurate"],
         default="fast",
     )
+    answer_command.add_argument(
+        "--retrieval-mode",
+        choices=["fast", "agentic"],
+        default="fast",
+        help="fast 保持原单轮流程；agentic 启用 Session、多轮检索和语义验证。",
+    )
     answer_command.add_argument("--retrieval-limit", type=int, default=10)
     answer_command.add_argument("--token-budget", type=int, default=6000)
     answer_command.add_argument("--max-evidence", type=int, default=8)
     answer_command.add_argument("--max-evidence-per-work", type=int, default=2)
     answer_command.add_argument("--work-id")
     answer_command.add_argument("--document-id")
-    answer_command.add_argument("--candidate-limit", type=int, default=20)
-    answer_command.add_argument("--rrf-k", type=int, default=60)
+    answer_command.add_argument(
+        "--candidate-limit", type=int, default=agentic_defaults.candidate_limit
+    )
+    answer_command.add_argument(
+        "--rerank-top-k", type=int, default=agentic_defaults.rerank_top_k
+    )
+    answer_command.add_argument(
+        "--final-top-k", type=int, default=agentic_defaults.final_top_k
+    )
+    answer_command.add_argument(
+        "--max-retrieval-rounds",
+        type=int,
+        default=agentic_defaults.max_retrieval_rounds,
+    )
+    answer_command.add_argument(
+        "--rrf-k", type=int, default=agentic_defaults.rrf_k
+    )
     answer_command.add_argument(
         "--llm-base-url",
         help=(
@@ -399,6 +423,101 @@ def build_parser() -> argparse.ArgumentParser:
         help="创建或复用一个固定 ContextBundle 快照，例如 leo_timing。",
     )
     answer_command.add_argument(
+        "--session-id",
+        help="Agentic Session ID；省略时自动创建并在输出中返回。",
+    )
+    answer_command.add_argument(
+        "--force-new-topic",
+        action="store_true",
+        help="在现有 Agentic Session 中强制创建独立 Topic。",
+    )
+    answer_command.add_argument(
+        "--disable-reranker",
+        action="store_true",
+        default=not agentic_defaults.reranker_enabled,
+        help="Agentic 模式禁用 Cross-Encoder，并显式回退到 RRF。",
+    )
+    answer_command.add_argument(
+        "--enable-reranker",
+        action="store_false",
+        dest="disable_reranker",
+        default=not agentic_defaults.reranker_enabled,
+        help="覆盖环境配置并启用 Agentic Cross-Encoder。",
+    )
+    answer_command.add_argument(
+        "--disable-semantic-validation",
+        action="store_true",
+        default=not agentic_defaults.semantic_validation_enabled,
+        help="只保留结构校验；用于受控消融实验。",
+    )
+    answer_command.add_argument(
+        "--enable-semantic-validation",
+        action="store_false",
+        dest="disable_semantic_validation",
+        default=not agentic_defaults.semantic_validation_enabled,
+        help="覆盖环境配置并启用 Claim-Citation 语义验证。",
+    )
+    answer_command.add_argument(
+        "--session-db-path",
+        type=Path,
+        default=agentic_defaults.session_db_path,
+        help="覆盖本地 Agentic SQLite 路径。",
+    )
+    answer_command.add_argument(
+        "--context-compaction-threshold",
+        type=float,
+        default=agentic_defaults.context_compaction_threshold,
+        help="达到模型窗口比例后追加 Compaction 事件，默认 0.70。",
+    )
+    answer_command.add_argument(
+        "--same-topic-threshold",
+        type=float,
+        default=agentic_defaults.same_topic_threshold,
+        help="Topic Router 同主题阈值，默认 0.75。",
+    )
+    answer_command.add_argument(
+        "--new-topic-threshold",
+        type=float,
+        default=agentic_defaults.new_topic_threshold,
+        help="Topic Router 新主题阈值，默认 0.45。",
+    )
+    answer_command.add_argument(
+        "--model-context-window",
+        type=int,
+        default=agentic_defaults.model_context_window,
+        help="用于自动 Compaction 的模型上下文窗口，默认 32768。",
+    )
+    answer_command.add_argument(
+        "--recent-events-after-compaction",
+        type=int,
+        default=agentic_defaults.recent_events_after_compaction,
+        help="Compaction 保留的最近原始事件数，默认 8。",
+    )
+    answer_command.add_argument(
+        "--semantic-weight",
+        type=float,
+        default=agentic_defaults.semantic_weight,
+        help="Topic Router 语义相似度权重，默认 0.40。",
+    )
+    answer_command.add_argument(
+        "--entity-weight",
+        type=float,
+        default=agentic_defaults.entity_weight,
+        help="Topic Router 实体重合权重，默认 0.25。",
+    )
+    answer_command.add_argument(
+        "--context-dependency-weight",
+        type=float,
+        default=agentic_defaults.context_dependency_weight,
+        help="Topic Router 上下文依赖权重，默认 0.20。",
+    )
+    answer_command.add_argument(
+        "--evidence-overlap-weight",
+        type=float,
+        default=agentic_defaults.evidence_overlap_weight,
+        help="Topic Router 证据重合权重，默认 0.15。",
+    )
+    answer_command.add_argument(
         "--refresh-context-session",
         action="store_true",
         help="用当前问题重新检索并显式覆盖指定 Context Session。",
@@ -410,6 +529,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_embedding_options(answer_command)
     add_reranker_options(answer_command)
+
+    session_command = subparsers.add_parser(
+        "session",
+        help="查看、列出或压缩本地 Agentic Session。",
+    )
+    session_command.add_argument(
+        "--session-db-path",
+        type=Path,
+        default=agentic_defaults.session_db_path,
+    )
+    session_subparsers = session_command.add_subparsers(
+        dest="session_command",
+        required=True,
+    )
+    session_subparsers.add_parser("list", help="列出全部本地 Session。")
+    for action, help_text in (
+        ("show", "查看 Session、Topic 和事件/证据数量。"),
+        ("evidence", "查看 Topic Evidence Registry。"),
+        ("compact", "为活动 Topic 手动追加 Compaction。"),
+    ):
+        command = session_subparsers.add_parser(action, help=help_text)
+        command.add_argument("session_id")
 
     evaluate_command = subparsers.add_parser(
         "evaluate",
@@ -600,6 +741,54 @@ def retrieval_runtime_from_args(
     )
 
 
+def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) -> Any:
+    """延迟组装 Agentic 编排层，fast 模式不导入这些模块。"""
+
+    from app.agentic.config import AgenticRAGConfig
+    from app.agentic.provider import OpenAIAgenticReasoningProvider
+    from app.agentic.reranking import DirectAnswerReranker
+    from app.agentic.service import AgenticRAGService
+    from app.agentic.store import AgenticSessionStore
+
+    runtime = retrieval_runtime_from_args(
+        args,
+        include_reranker=not args.disable_reranker,
+    )
+    config = AgenticRAGConfig(
+        candidate_limit=args.candidate_limit,
+        rerank_top_k=args.rerank_top_k,
+        final_top_k=args.final_top_k,
+        max_retrieval_rounds=args.max_retrieval_rounds,
+        rrf_k=args.rrf_k,
+        reranker_enabled=not args.disable_reranker,
+        semantic_validation_enabled=not args.disable_semantic_validation,
+        same_topic_threshold=args.same_topic_threshold,
+        new_topic_threshold=args.new_topic_threshold,
+        semantic_weight=args.semantic_weight,
+        entity_weight=args.entity_weight,
+        context_dependency_weight=args.context_dependency_weight,
+        evidence_overlap_weight=args.evidence_overlap_weight,
+        context_compaction_threshold=args.context_compaction_threshold,
+        model_context_window=args.model_context_window,
+        recent_events_after_compaction=args.recent_events_after_compaction,
+        session_db_path=args.session_db_path,
+    )
+    store = AgenticSessionStore(
+        PROJECT_ROOT,
+        database_path=args.session_db_path,
+    )
+    return AgenticRAGService(
+        runtime,
+        OpenAIAgenticReasoningProvider(answer_provider),
+        store,
+        DirectAnswerReranker(
+            runtime.reranker_provider,
+            enabled=not args.disable_reranker,
+        ),
+        config,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
 
@@ -614,6 +803,45 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         run_academic_mcp([])
         return
+
+    if args.command == "session":
+        from app.agentic.prompting import compact_topic
+        from app.agentic.store import AgenticSessionStore
+
+        agentic_store = AgenticSessionStore(
+            PROJECT_ROOT,
+            database_path=args.session_db_path,
+        )
+        try:
+            if args.session_command == "list":
+                print_json({"sessions": agentic_store.list_sessions()})
+                return
+            if args.session_command == "show":
+                print_json(agentic_store.session_details(args.session_id))
+                return
+            if args.session_command == "evidence":
+                session_record = agentic_store.get_session(args.session_id)
+                print_json(
+                    {
+                        "session_id": args.session_id,
+                        "active_topic_id": session_record.get("active_topic_id"),
+                        "evidence": agentic_store.list_evidence(args.session_id),
+                    }
+                )
+                return
+            session_record = agentic_store.get_session(args.session_id)
+            topic_id = session_record.get("active_topic_id")
+            if not isinstance(topic_id, str) or not topic_id:
+                raise ValueError("Session 没有可压缩的活动 Topic。")
+            compaction_report = compact_topic(
+                agentic_store,
+                args.session_id,
+                topic_id,
+            )
+            print_json(compaction_report.model_dump(mode="json"))
+            return
+        except (KeyError, OSError, ValueError) as error:
+            raise SystemExit(f"Session 错误：{error}") from error
 
     if args.command == "library":
         if args.library_command == "rebuild":
@@ -809,11 +1037,44 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.command == "answer":
         from app.generation.service import GroundedAnswerService
+        from app.generation.security import redact_sensitive_text
 
         try:
             answer_provider = answer_provider_from_args(args)
         except ValueError as error:
-            raise SystemExit(f"LLM 配置错误：{error}") from error
+            safe_error = redact_sensitive_text(
+                error,
+                known_secrets=(getattr(args, "llm_api_key", None),),
+            )
+            raise SystemExit(f"LLM 配置错误：{safe_error}") from error
+        if args.retrieval_mode == "agentic":
+            if args.context_session:
+                raise SystemExit(
+                    "--context-session 属于固定快照模式，不能与 agentic 同时使用；"
+                    "请改用 --session-id。"
+                )
+            try:
+                agentic_result = agentic_service_from_args(args, answer_provider).answer(
+                    args.query,
+                    session_id=args.session_id,
+                    force_new_topic=args.force_new_topic,
+                    include_context=args.include_context,
+                )
+            except (KeyError, OSError, RuntimeError, ValueError) as error:
+                provider_key = getattr(
+                    getattr(answer_provider, "config", None),
+                    "api_key",
+                    None,
+                )
+                safe_error = redact_sensitive_text(
+                    error,
+                    known_secrets=(args.llm_api_key, provider_key),
+                )
+                raise SystemExit(f"Agentic RAG 错误：{safe_error}") from error
+            print_json(agentic_result)
+            if not agentic_result.get("answerable"):
+                raise SystemExit(2)
+            return
         if args.refresh_context_session and not args.context_session:
             raise SystemExit(
                 "--refresh-context-session 必须与 --context-session 一起使用。"

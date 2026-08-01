@@ -38,8 +38,12 @@ def _canonical_context_payload(context: ContextBundle) -> dict[str, Any]:
 
 
 def context_fingerprint(context: ContextBundle) -> str:
+    return _context_payload_fingerprint(_canonical_context_payload(context))
+
+
+def _context_payload_fingerprint(payload: dict[str, Any]) -> str:
     serialized = json.dumps(
-        _canonical_context_payload(context),
+        payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -111,11 +115,14 @@ class ContextSessionStore:
         created_at = payload.get("created_at")
         if not isinstance(context_hash, str) or not isinstance(created_at, str):
             raise ValueError("Context Session 元数据不完整。")
-        try:
-            context = _CONTEXT_ADAPTER.validate_python(payload.get("context"))
-        except ValidationError as error:
-            raise ValueError("Context Session 中的 ContextBundle 不合法。") from error
-        actual_hash = context_fingerprint(context)
+        context_payload = payload.get("context")
+        if not isinstance(context_payload, dict):
+            raise ValueError("Context Session 中的 ContextBundle 不合法。")
+        actual_hash = _context_payload_fingerprint(context_payload)
         if actual_hash != context_hash:
             raise ValueError("Context Session 完整性指纹不匹配。")
+        try:
+            context = _CONTEXT_ADAPTER.validate_python(context_payload)
+        except ValidationError as error:
+            raise ValueError("Context Session 中的 ContextBundle 不合法。") from error
         return ContextSession(cleaned_id, context_hash, created_at, context)

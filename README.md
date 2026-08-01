@@ -24,7 +24,8 @@ PDF 入库
 现在支持容错批量入库、论文身份归并、真实标题规范命名、增量知识层构建、
 BM25、BGE-M3 单向量召回、Qdrant local、RRF、候选池 Oracle、Cross-Encoder
 精排、证据上下文组装、OpenAI-compatible 本地回答模型、claim 级引用校验和
-fail-closed 拒答。自动分类和生成式回答评测仍是下一阶段。
+fail-closed 拒答。回答入口同时保留单轮 fast RAG，并新增持久化、多轮、可增量
+检索和 Claim-Citation 语义验证的 agentic RAG。
 
 ## 核心设计原则
 
@@ -576,9 +577,158 @@ Reranker revision，参数与 `context build` 相同。
 近似计数，用于本地对照。固定 session 能提高缓存复用，但不会自动判断新问题是否
 仍与旧证据相关；证据不再适用时必须刷新，不能用命中率替代回答质量评测。
 
-这里的校验保证“引用存在且身份可追溯”，不等于已经自动证明 claim 被引用文本
-语义蕴含。语义正确率、引用精确率和拒答质量需要在下一阶段的生成式评测集中
-单独测量。
+fast 模式的校验保证“引用存在且身份可追溯”，不自动证明 claim 被引用文本语义
+蕴含；需要该能力时使用下述 agentic 模式。语义正确率、引用精确率和拒答质量仍
+需要在人工标注的生成式评测集中单独测量。
+
+### Agentic Scientific RAG
+
+`--retrieval-mode fast` 保留原有单轮行为和 JSON 必填字段；
+`--retrieval-mode agentic` 使用 SQLite 恢复会话，并执行完整的有界流程：
+
+```text
+User Query
+  → Topic Router + Standalone Query Rewrite
+  → Category-aware Query Planner
+  → BM25 + BGE-M3 → RRF Top-20
+  → BGE Cross-Encoder + directness grade → Top-8
+  → Evidence Registry 去重与复用
+  → Evidence Coverage Check
+      └─ partial/missing → focused query → 补充检索（默认总计最多 2 轮）
+  → Context Builder → Top-5
+  → Structured Answer Generator
+  → Structural Citation Validation
+  → Claim-Citation Semantic Entailment
+      ├─ retrieve_more 且仍有轮次 → 补充检索并重新生成
+      └─ rewrite/drop → 最多一次 Repair 并重新验证
+  → append-only Session Events + State Delta
+```
+
+首次问答会自动创建 Session；显式 ID 便于独立进程继续同一会话：
+
+```bash
+./.venv/bin/python main.py answer \
+  "哪些观测量用于估计星历和时钟误差？" \
+  --retrieval-mode agentic \
+  --session-id leo_error \
+  --revision 5617a9f61b028005a4858fdac845db406aefb181 \
+  --reranker-revision 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e \
+  --local-files-only
+
+./.venv/bin/python main.py answer \
+  "那为什么多普勒能够估计钟漂？" \
+  --retrieval-mode agentic \
+  --session-id leo_error \
+  --revision 5617a9f61b028005a4858fdac845db406aefb181 \
+  --reranker-revision 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e \
+  --local-files-only
+```
+
+不传 `--session-id` 时，输出的 `session.session_id` 可用于下一次调用。需要显式
+隔离证据时使用 `--force-new-topic`。本地模型权重缺失且指定
+`--local-files-only` 时，Reranker 会记录 `fallback_used=true` 并保持 RRF 顺序，
+不会联网下载或令整个回答崩溃；也可用 `--disable-reranker` 做消融。
+
+#### Topic、Session 与 Evidence Registry
+
+一个 Session 可以包含多个 Topic。Router 同时使用上下文依赖、BGE-M3 语义
+相似度、实体重合和轻量检索后的证据重合，默认权重为 `0.40/0.25/0.20/0.15`：
+
+- `same_topic`：继续当前 append-only 消息流，筛选并复用已有证据；
+- `related_subtopic`：创建以旧 Topic 为父节点的新分支，不默认继承旧证据；
+- `new_topic`：创建完全独立的 Topic，不把旧对话或证据发送给回答模型。
+
+组合分数不小于 `0.75` 倾向同主题，不大于 `0.45` 倾向新主题；中间区间最多
+调用一次 temperature=0 的结构化 Router。常见结果如下：
+
+| 当前主题 | 新问题 | relation | standalone_query |
+|---|---|---|---|
+| LEO 星历与时钟误差观测量 | 那为什么多普勒能够估计钟漂？ | same_topic | 为什么多普勒频率观测能够约束低轨卫星与接收机之间的相对时钟漂移？ |
+| 同上 | RRF 中的 k=60 是什么意思？ | related_subtopic | 原问题已独立 |
+| 同上 | Python 装饰器是什么？ | new_topic | 原问题已独立 |
+
+Session Store 默认位于 `data/runtime/agentic_sessions.sqlite3`，包含
+`sessions/topics/events/evidence_registry`。事件 ordinal 单调递增，类型包括
+`user_query/query_analysis/evidence_added/answer/validation/state_delta/compaction`；
+旧事件从不修改。每个 Topic 中同一 `chunk_id` 获得稳定的 `E001...`，答案内临时
+`S1...` 只负责兼容当前 citation。重复命中的 Chunk 标为 `origin=reused`，不会
+再次追加完整正文；新 Chunk 才产生 `evidence_added`。
+
+```bash
+./.venv/bin/python main.py session list
+./.venv/bin/python main.py session show leo_error
+./.venv/bin/python main.py session evidence leo_error
+./.venv/bin/python main.py session compact leo_error
+```
+
+`session --session-db-path /path/to/sessions.sqlite3 ...` 和 answer 的同名参数可以
+覆盖默认数据库。
+
+#### Planner、Coverage、Entailment 与 Repair
+
+Planner 把问题分类为 fact list、definition、mechanism、comparison、method、
+numeric result、citation lookup 或 synthesis，同时区分 measurement/observable、
+input、prior、state、parameter、method、result、metric、dataset 和 assumption。
+例如用户问“观测量”时，预测星历和 SGP4 传播结果会被放入排除类别约束，只能作为
+辅助输入或先验说明，不能生成 `category=measurement` 的直接 Claim。
+
+Reranker 不只判断主题相关性，还为每个候选赋予 0–3 的 directness grade：3 表示
+直接包含答案，2 表示关键支持，1 表示背景，0 表示不支持。因此只重复“星历误差、
+时钟误差”的 Introduction 不会压过明确说明载波相位或多普勒用途的正文。
+
+Coverage 必须逐个 subquestion 返回 `sufficient/partial/missing` 和稳定 Evidence ID。
+缺失项产生 focused follow-up query，重新执行 Hybrid → RRF → Reranker，并按
+`chunk_id` 合并。达到 `max_retrieval_rounds` 仍不足时系统 fail closed，输出具体
+缺失项，而不是让 LLM 用常识补全。
+
+Structural Validation 检查 JSON、Claim、S 编号和 Chunk 映射；Semantic Validation
+再逐 Claim 检查 `entailed/partially_entailed/not_entailed/contradicted`、问题对齐、
+类别、直接引用、条件扩张和冲突。例如 Claim“预测星历是一种观测量”即使引用了
+“载波相位和预测星历作为算法输入”，也会得到 `category_correct=false`、非完全
+蕴含和 `rewrite/drop`。Repair 最多一次，之后重新执行两层验证；仍无效时明确
+返回 `validation.valid=false`。
+
+#### Append-only Prompt、缓存与 Compaction
+
+每个 Topic 的 Prompt 是固定 System Prompt/Schema 加按 ordinal 稳定序列化的事件
+流。第二轮消息严格为第一轮完整消息的前缀再追加 H2；旧消息、工具顺序和证据正文
+不重排、不重写。时间戳、request ID、耗时和 API usage 只进入数据库元数据或输出
+diagnostics，不进入可缓存前缀。`prompt_cache` 报告稳定 `prefix_hash`、消息数和
+Provider 的真实 usage；服务商不返回缓存 token 时对应字段是 `null`，不会伪造。
+
+上下文估算达到模型窗口的 70% 时自动 Compaction，也可手动执行。Compaction
+只追加新事件，不删除数据库历史；新消息流保留 Topic summary、目标、confirmed
+facts、open questions、Evidence Registry 定位和摘要、未完成任务及最近事件。
+由于它创建新前缀，下一轮缓存重新预热属于预期行为。
+
+缓存命中率高只说明大量 Prompt token 的字节前缀被服务商复用，不能说明检索到了
+正确证据，也不能证明 Claim 被 citation 蕴含。质量仍需分别看 Retrieval/Reranker
+Recall、Evidence Coverage、Citation Precision/Recall、Claim Entailment Accuracy
+和 answerable 判断；本地 `app.agentic.evaluation.aggregate_agentic_metrics()`
+已经提供平均检索轮数、新增 Evidence、复用率、覆盖率、引用精确率 proxy、缓存率
+和延迟的最小聚合接口。
+
+#### Agentic 配置
+
+主要 CLI 参数为 `--candidate-limit 20`、`--rerank-top-k 8`、
+`--final-top-k 5`、`--max-retrieval-rounds 2`、`--rrf-k 60`、
+`--disable-reranker`、
+`--disable-semantic-validation`、`--same-topic-threshold`、
+`--new-topic-threshold`、四个 Router 权重、`--model-context-window` 和
+`--context-compaction-threshold`、`--recent-events-after-compaction`。同名配置可
+通过 `LEO_AGENTIC_*` 环境变量覆盖，
+完整样例见 `.env.example`；CLI 优先于环境默认值。权重之和必须为 1，所有轮次和
+Repair 均有硬上限。
+
+API Key 优先读取 `LEO_LLM_API_KEY`，也兼容 `DEEPSEEK_API_KEY`。推荐只放在权限
+受控的环境变量或被 Git 忽略的 `.env`；配置对象 repr、异常输出、Session DB、
+Prompt、diagnostics 和测试快照不会保存 Key。若旧日志曾出现真实 Key，仅脱敏新
+日志不能使旧 Key 失效，必须在服务商控制台撤销并轮换。
+
+当前限制：CLI 是短进程，每次仍可能加载本地 Embedding/Reranker；交互部署应复用
+长驻 `RetrievalRuntime`。确定性 Planner/Coverage/Semantic guardrail 偏保守，复杂
+跨论文综合仍需要扩充人工评测集。Compaction 的 Evidence 摘要目前是确定性截断，
+不是额外的生成式摘要。Agentic 指标接口已就绪，但仓库尚未包含大型多轮标注集。
 
 ### 运行检索评测基线
 
@@ -1002,8 +1152,12 @@ PDF。
 | AnswerProvider 与 OpenAI-compatible 本地模型 | 已完成 |
 | claim 级引用校验与 fail-closed 拒答 | 已完成 |
 | Context Session、Prompt 布局与缓存诊断 | 已完成 |
+| Agentic Session/Topic 与 append-only 事件 | 已完成 |
+| 增量 Evidence Registry、Coverage 与有界补充检索 | 已完成 |
+| 类别感知 Planner、语义引用验证与 Repair | 已完成 |
+| Cache Prefix 诊断与非破坏性 Compaction | 已完成 |
 | 自动分类 | 未实现 |
-| 生成式回答自动评测 | 未实现 |
+| 大型多轮生成式人工评测集 | 未实现 |
 
 ## 代码入口
 
@@ -1033,6 +1187,8 @@ PDF。
 - `app/generation/settings.py`：环境变量与本地 `.env` 的安全配置入口；
 - `app/generation/validation.py`：上下文完整性与 claim 级引用校验；
 - `app/generation/service.py`：检索、生成、确定性引用渲染和失败关闭；
+- `app/agentic/`：Session Store、Topic Router、Planner、Reranker、Coverage、
+  结构化 Provider、Prompt/Compaction、语义验证、Repair 和端到端编排；
 - `app/evaluation/retrieval.py`：检索问题校验、qrels 映射和排名指标；
 - `app/embeddings/base.py`：与本地模型/API 解耦的 Embedding 协议；
 - `app/parsing/precheck.py`：pipeline 内部 PDF 预检查；

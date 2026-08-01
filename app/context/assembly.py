@@ -218,6 +218,12 @@ def _candidate_item(
         content=content,
         truncated=False,
         token_count=0,
+        evidence_id=(
+            str(candidate["evidence_id"])
+            if isinstance(candidate.get("evidence_id"), str)
+            else None
+        ),
+        origin=str(candidate.get("origin") or "newly_retrieved"),
     )
 
 

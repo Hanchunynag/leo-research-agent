@@ -32,6 +32,8 @@ class EvidenceItem:
     content: str
     truncated: bool
     token_count: int
+    evidence_id: str | None = None
+    origin: str = "newly_retrieved"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

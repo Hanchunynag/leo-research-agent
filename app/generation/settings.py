@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,7 +20,10 @@ class LocalLLMSettings(BaseSettings):
 
     base_url: str | None = None
     model: str | None = None
-    api_key: SecretStr | None = None
+    api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("LEO_LLM_API_KEY", "DEEPSEEK_API_KEY"),
+    )
     timeout_seconds: float = 120.0
     max_tokens: int = 1200
     prompt_layout: Literal["query_first", "context_first"] | None = None

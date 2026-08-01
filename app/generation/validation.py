@@ -192,6 +192,7 @@ def validate_answer_draft(
                     page_start=evidence.page_start,
                     page_end=evidence.page_end,
                     block_ids=evidence.block_ids,
+                    evidence_id=evidence.evidence_id,
                 )
             )
 

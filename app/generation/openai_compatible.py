@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
-from dataclasses import dataclass, replace
+import json
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -33,7 +33,7 @@ PromptLayout = Literal["query_first", "context_first"]
 class OpenAICompatibleConfig:
     base_url: str
     model: str
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
     timeout_seconds: float = 120.0
     max_tokens: int = 1200
     temperature: float = 0.0
@@ -97,13 +97,23 @@ def _parse_answer_draft(content: str) -> AnswerDraft:
         claim_id = value.get("claim_id")
         text = value.get("text")
         source_ids = value.get("source_ids")
+        category = value.get("category")
+        evidence_ids = value.get("evidence_ids", [])
         if not isinstance(claim_id, str) or not isinstance(text, str):
             raise ValueError("claim_id 和 text 必须是字符串。")
         if not isinstance(source_ids, list) or not all(
             isinstance(source_id, str) for source_id in source_ids
         ):
             raise ValueError("source_ids 必须是字符串数组。")
-        claims.append(AnswerClaim(claim_id, text, source_ids))
+        if category is not None and not isinstance(category, str):
+            raise ValueError("category 必须是字符串或 null。")
+        if not isinstance(evidence_ids, list) or not all(
+            isinstance(evidence_id, str) for evidence_id in evidence_ids
+        ):
+            raise ValueError("evidence_ids 必须是字符串数组。")
+        claims.append(
+            AnswerClaim(claim_id, text, source_ids, category, evidence_ids)
+        )
     return AnswerDraft(answerable, claims, refusal_reason)
 
 
@@ -128,6 +138,29 @@ class OpenAICompatibleAnswerProvider:
             headers=headers,
         )
 
+    def chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """供结构化 Agentic 阶段复用同一安全 HTTP 客户端。"""
+
+        response = self._client.post(
+            self.endpoint,
+            json={
+                "model": self.config.model,
+                "messages": messages,
+                "temperature": self.config.temperature,
+                "max_tokens": max_tokens or self.config.max_tokens,
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Chat Completions 必须返回 JSON object。")
+        return payload
+
     def generate(self, query: str, context: ContextBundle) -> AnswerDraft:
         cleaned_query = query.strip()
         if self.config.prompt_layout == "context_first":
@@ -146,17 +179,7 @@ class OpenAICompatibleAnswerProvider:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
-        response = self._client.post(
-            self.endpoint,
-            json={
-                "model": self.config.model,
-                "messages": messages,
-                "temperature": self.config.temperature,
-                "max_tokens": self.config.max_tokens,
-            },
-        )
-        response.raise_for_status()
-        payload = response.json()
+        payload = self.chat_completion(messages)
         try:
             content = payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as error:

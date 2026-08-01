@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -388,6 +389,29 @@ def test_context_session_rejects_unsafe_identifier(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="session ID"):
         store.path_for("../outside")
+
+
+def test_context_session_loads_pre_agentic_evidence_schema(tmp_path: Path) -> None:
+    store = ContextSessionStore(tmp_path)
+    store.save("legacy", context_bundle())
+    path = store.path_for("legacy")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    evidence = payload["context"]["evidence"][0]
+    evidence.pop("evidence_id")
+    evidence.pop("origin")
+    serialized = json.dumps(
+        payload["context"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    payload["context_hash"] = hashlib.sha256(serialized.encode()).hexdigest()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = store.load("legacy")
+
+    assert loaded.context.evidence[0].evidence_id is None
+    assert loaded.context.evidence[0].origin == "newly_retrieved"
 
 
 class CountingRuntime:
