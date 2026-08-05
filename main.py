@@ -838,6 +838,15 @@ def retrieval_runtime_from_args(
     *,
     include_reranker: bool,
 ) -> Any:
+    if getattr(args, "retrieval_mode", None) == "graphrag":
+        from app.runtime.graphrag import GraphRAGRetrievalRuntime
+
+        return GraphRAGRetrievalRuntime(
+            project_root=PROJECT_ROOT,
+            embedding_provider=dense_provider_from_args(args),
+            reranker_provider=(reranker_provider_from_args(args) if include_reranker else None),
+        )
+
     from app.runtime.retrieval import RetrievalRuntime
 
     return RetrievalRuntime(

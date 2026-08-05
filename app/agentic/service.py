@@ -22,6 +22,7 @@ from app.agentic.harness import (
 from app.agentic.models import (
     AgenticAnswerDraft,
     AgenticMetricsRecord,
+    CoverageItem,
     CoverageReport,
     EvidenceStatus,
     QueryPlan,
@@ -30,6 +31,8 @@ from app.agentic.models import (
     SemanticValidationReport,
 )
 from app.agentic.planning import QueryPlanner
+from app.agentic.query_expansion import AdaptiveQueryExpander
+from app.agentic.query_validation import QueryDriftValidator
 from app.agentic.prompting import (
     build_topic_messages,
     compact_topic,
@@ -156,6 +159,12 @@ class AgenticRAGService:
             allow_model_downloads=config.allow_model_downloads,
         )
         self.planner = QueryPlanner()
+        expansion_provider = getattr(reasoning_provider, "provider", None)
+        self.query_expander = AdaptiveQueryExpander(
+            expansion_provider if hasattr(expansion_provider, "chat_completion") else None,
+            max_variants=config.max_query_variants,
+        )
+        self.query_drift_validator = QueryDriftValidator(retrieval_runtime.embedding_provider)
         self.evidence_selector = CoverageAwareEvidenceSelector(
             mmr_lambda=config.evidence_mmr_lambda,
             max_per_work=config.max_final_evidence_per_work,
@@ -193,6 +202,13 @@ class AgenticRAGService:
             )
 
     def _retrieve_queries(self, queries: Sequence[str]) -> list[dict[str, Any]]:
+        if getattr(self.runtime, "is_graphrag", False):
+            result = self.runtime.retrieve_multi(
+                queries, limit=self.config.max_cross_query_candidates,
+                rrf_k=self.config.rrf_k,
+            )
+            raw = result.get("results")
+            return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
         values: list[dict[str, Any]] = []
         for query in list(dict.fromkeys(value.strip() for value in queries if value.strip())):
             result = self.runtime.retrieve(
@@ -751,6 +767,24 @@ class AgenticRAGService:
                     "retrieval_query_count": len(plan.retrieval_queries),
                 }
             )
+        accepted_retrieval_queries = list(plan.retrieval_queries)
+        query_validation_diagnostics: dict[str, Any] = {}
+        if getattr(self.runtime, "is_graphrag", False):
+            harness.begin_query_expansion()
+            with harness.stage(AgenticStage.QUERY_EXPANDING) as expansion_trace:
+                expansion = self.query_expander.expand(route.standalone_query, plan)
+                harness.record_query_variants(len(expansion.queries))
+                expansion_trace.update({"complexity": expansion.complexity,
+                    "retrieval_mode": expansion.retrieval_mode,
+                    "generated_query_count": len(expansion.queries)})
+            with harness.stage(AgenticStage.QUERY_VALIDATING) as validation_trace:
+                validation = self.query_drift_validator.validate(expansion)
+                accepted_retrieval_queries = [value.text for value in validation.accepted_queries]
+                query_validation_diagnostics = validation.model_dump(mode="json")
+                validation_trace.update({"accepted_query_count": len(validation.accepted_queries),
+                    "rejected_query_count": len(validation.rejected_queries),
+                    "query_drift_reasons": [reason for decision in validation.decisions
+                                             for reason in decision.reasons]})
         user_event = self.store.append_event(
             sid,
             topic_id,
@@ -773,7 +807,7 @@ class AgenticRAGService:
         total_new = 0
         total_reused = 0
         generation_failure: dict[str, Any] | None = None
-        queries = list(plan.retrieval_queries)
+        queries = accepted_retrieval_queries
         coverage = CoverageReport(
             overall_sufficient=False,
             coverage=[],
@@ -782,27 +816,45 @@ class AgenticRAGService:
         last_reranked: list[dict[str, Any]] = []
         while harness.can_retrieve():
             round_number = harness.begin_retrieval_round()
-            with harness.stage(
-                AgenticStage.RETRIEVING,
-                attempt=round_number,
-                details={"query_count": len(queries)},
-            ) as retrieval_trace:
-                fresh = [
-                    *(preliminary if round_number == 1 else []),
-                    *self._retrieve_queries(queries),
-                ]
-                reused = (
-                    self._relevant_registry(route.standalone_query, registry)
-                    if route.reuse_previous_evidence
-                    else []
-                )
-                retrieved = self._merge_fresh_and_reused(fresh, reused)
-                retrieval_trace.update(
-                    {
-                        "candidate_count": len(retrieved),
-                        "reused_candidate_count": len(reused),
-                    }
-                )
+            if getattr(self.runtime, "is_graphrag", False):
+                with harness.stage(AgenticStage.RETRIEVAL_DISPATCHING,
+                                   attempt=round_number,
+                                   details={"query_count": len(queries)}) as retrieval_trace:
+                    fresh = [*(preliminary if round_number == 1 else []),
+                             *self._retrieve_queries(queries)]
+                    reused = (self._relevant_registry(route.standalone_query, registry)
+                              if route.reuse_previous_evidence else [])
+                    retrieved = self._merge_fresh_and_reused(fresh, reused)
+                    retrieval_trace.update({"candidate_count": len(retrieved),
+                                            "reused_candidate_count": len(reused)})
+                route_diagnostics = getattr(self.runtime, "last_diagnostics", {})
+                for stage, route_name in (
+                    (AgenticStage.LEXICAL_RETRIEVING, "lexical"),
+                    (AgenticStage.DENSE_RETRIEVING, "dense"),
+                    (AgenticStage.GRAPH_RETRIEVING, "graph_direct"),
+                    (AgenticStage.COMMUNITY_RETRIEVING, "community"),
+                ):
+                    with harness.stage(stage, attempt=round_number, details={
+                        "candidate_count": route_diagnostics.get(
+                            "per_route_candidate_count", {}).get(route_name, 0)
+                    }):
+                        pass
+                with harness.stage(AgenticStage.QUERY_FUSING, attempt=round_number,
+                    details={"cross_query_fusion_count": len(retrieved)}):
+                    pass
+            else:
+                with harness.stage(
+                    AgenticStage.RETRIEVING,
+                    attempt=round_number,
+                    details={"query_count": len(queries)},
+                ) as retrieval_trace:
+                    fresh = [*(preliminary if round_number == 1 else []),
+                             *self._retrieve_queries(queries)]
+                    reused = (self._relevant_registry(route.standalone_query, registry)
+                              if route.reuse_previous_evidence else [])
+                    retrieved = self._merge_fresh_and_reused(fresh, reused)
+                    retrieval_trace.update({"candidate_count": len(retrieved),
+                                            "reused_candidate_count": len(reused)})
             with harness.stage(
                 AgenticStage.RERANKING,
                 attempt=round_number,
@@ -840,6 +892,15 @@ class AgenticRAGService:
                 details={"evidence_count": len(evidence_by_id)},
             ) as coverage_trace:
                 coverage = self._coverage(plan, list(evidence_by_id.values()))
+                if (getattr(self.runtime, "is_graphrag", False) and
+                        getattr(self.runtime, "last_diagnostics", {}).get(
+                            "relationship_status") == "none"):
+                    relation_reason = ("当前知识库分别包含相关实体的定义，但没有检索到"
+                                       "能够证明二者关系的直接证据或可靠路径。")
+                    coverage = CoverageReport(overall_sufficient=False,
+                        coverage=[CoverageItem(subquestion_id=item.id, status="missing",
+                            supporting_evidence_ids=[], missing_information=relation_reason)
+                                  for item in plan.subquestions], followup_queries=[])
                 coverage_trace.update(
                     {
                         "overall_sufficient": coverage.overall_sufficient,
@@ -868,6 +929,8 @@ class AgenticRAGService:
             if coverage.overall_sufficient:
                 break
             queries = coverage.followup_queries
+            if getattr(self.runtime, "is_graphrag", False):
+                queries = queries[: self.config.max_focused_queries_per_round]
             if not queries:
                 break
 
@@ -1621,6 +1684,7 @@ class AgenticRAGService:
             "prompt_cache": prompt_cache,
             "repair_used": repair_used,
             "stage_fallbacks": list(dict.fromkeys(self._stage_fallbacks)),
+            "query_validation": query_validation_diagnostics,
             "metrics": metrics.model_dump(mode="json"),
             "elapsed_ms": elapsed_ms,
             "harness": harness.diagnostics(),
