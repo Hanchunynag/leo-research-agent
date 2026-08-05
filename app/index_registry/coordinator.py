@@ -84,6 +84,7 @@ class KnowledgeSyncService:
             point_id_for_version, sync_incremental_dense,
         )
         from app.indexing.lexical_fts import sync_lexical
+        from app.indexing.incremental_entities import entity_vector_matcher, sync_entity_embeddings
 
         values = [dict(value) for value in chunks
                   if document_id is None or value.get("document_id") == document_id]
@@ -135,7 +136,8 @@ class KnowledgeSyncService:
             _complete_store_operations(self.registry, epoch, "dense")
 
             ensure_schema(self.neo4j_driver, self.neo4j_database)
-            resolver = EntityResolver(self.registry)
+            resolver = EntityResolver(self.registry, vector_matcher=entity_vector_matcher(
+                self.project_root, self.embedding_provider, active_before))
             graph_extracted = entities_created = entities_reused = claims_created = 0
             for item in diffs:
                 if item.kind == "unchanged":
@@ -169,6 +171,14 @@ class KnowledgeSyncService:
                 entities_reused += graph_metrics["entities_reused"]
                 claims_created += graph_metrics["relation_claims_created"]
             _complete_store_operations(self.registry, epoch, "graph")
+            with self.neo4j_driver.session(database=self.neo4j_database) as session:
+                entity_rows = session.run(
+                    """MATCH (e:Entity) WHERE e.updated_epoch=$epoch
+                    RETURN e{.entity_id,.canonical_name,.normalized_name,.entity_type,
+                             .aliases,.description} AS entity""", epoch=epoch,
+                ).data()
+            entity_dense = sync_entity_embeddings(self.project_root,
+                self.embedding_provider, [dict(value["entity"]) for value in entity_rows], epoch)
             aggregate_count = rebuild_aggregate_edges(self.neo4j_driver,
                                                        self.neo4j_database, epoch)
             community_metrics = self._sync_communities(epoch)
@@ -177,6 +187,7 @@ class KnowledgeSyncService:
                 raise RuntimeError("graph source validation failed")
             metrics.update({"graph_extracted_chunks": graph_extracted,
                 "entities_created": entities_created, "entities_reused": entities_reused,
+                "entity_embeddings": entity_dense,
                 "relation_claims_created": claims_created,
                 "aggregate_relations": aggregate_count, "graph_validation": validation,
                 **community_metrics})

@@ -9,6 +9,7 @@ from time import perf_counter
 from typing import Any
 
 from app.index_registry.diff import versioned_chunk
+from app.indexing.tokenization import tokenize
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,11 @@ def _parent_context(chunk: dict[str, Any]) -> str:
 def _overlap_context(chunk: dict[str, Any]) -> str:
     value = chunk.get("overlap_context")
     return str(value.get("content") or "") if isinstance(value, dict) else ""
+
+
+def _fts_text(value: str) -> str:
+    """Materialize the same English/Chinese token stream used for query preprocessing."""
+    return " ".join(tokenize(value))
 
 
 def connect_lexical(path: Path) -> sqlite3.Connection:
@@ -98,8 +104,9 @@ def upsert_chunk(connection: sqlite3.Connection, epoch: int, chunk: dict[str, An
     connection.execute(
         "INSERT INTO chunk_fts(rowid,title,section_path,parent_context,overlap_context,content) "
         "VALUES(?,?,?,?,?,?)",
-        (cursor.lastrowid, str(value.get("title") or ""), section_text,
-         _parent_context(value), _overlap_context(value), str(value.get("content") or "")),
+        (cursor.lastrowid, _fts_text(str(value.get("title") or "")),
+         _fts_text(section_text), _fts_text(_parent_context(value)),
+         _fts_text(_overlap_context(value)), _fts_text(str(value.get("content") or ""))),
     )
     return True
 
