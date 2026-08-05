@@ -62,6 +62,40 @@ class QueryPlan(StrictModel):
     answer_constraints: list[str]
 
 
+class RetrievalQuery(StrictModel):
+    query_id: str
+    text: str
+    purpose: Literal[
+        "original", "paraphrase", "terminology_expansion", "subquestion",
+        "relationship_probe", "focused_followup", "community_probe",
+    ]
+    target_category: str
+    required_entities: list[str]
+    required_constraints: list[str]
+    excluded_categories: list[str]
+    weight: float = Field(gt=0.0, le=1.0)
+
+
+class QueryExpansionResult(StrictModel):
+    original_query: str
+    complexity: Literal["simple", "compound", "multi_hop", "global"]
+    retrieval_mode: Literal["local", "relationship", "global", "drift", "exact"]
+    queries: list[RetrievalQuery] = Field(min_length=1, max_length=5)
+
+
+class QueryValidationDecision(StrictModel):
+    query_id: str
+    accepted: bool
+    reasons: list[str] = Field(default_factory=list)
+    semantic_similarity: float | None = Field(default=None, ge=-1.0, le=1.0)
+
+
+class QueryValidationResult(StrictModel):
+    accepted_queries: list[RetrievalQuery]
+    rejected_queries: list[RetrievalQuery]
+    decisions: list[QueryValidationDecision]
+
+
 class CoverageItem(StrictModel):
     subquestion_id: str
     status: EvidenceStatus

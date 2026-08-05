@@ -34,6 +34,13 @@ export type AgenticResult = {
   answerable: boolean;
   answer: string;
   refusal_reason: string | null;
+  outcome?: {
+    code: "answered" | "insufficient_evidence" | "generation_failed" | "validation_failed" | "budget_exhausted" | string;
+    stage: string;
+    message: string | null;
+    retryable: boolean;
+    details?: Record<string, any>;
+  };
   claims: Array<{
     claim_id: string;
     text: string;
@@ -83,7 +90,7 @@ export const api = {
   evidence: (sessionId: string) =>
     request<{ evidence: Evidence[] }>(`/api/sessions/${encodeURIComponent(sessionId)}/evidence`),
   transcript: (sessionId: string) =>
-    request<{ messages: Array<{ role: "user" | "assistant"; text: string; answerable?: boolean }> }>(
+    request<{ messages: Array<{ role: "user" | "assistant"; text: string; answerable?: boolean; outcome?: AgenticResult["outcome"] }> }>(
       `/api/sessions/${encodeURIComponent(sessionId)}/transcript`,
     ),
   answer: (query: string, sessionId: string | null, forceNewTopic = false) =>

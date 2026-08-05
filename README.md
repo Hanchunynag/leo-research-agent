@@ -476,8 +476,15 @@ LEO_LLM_BASE_URL=https://api.deepseek.com
 LEO_LLM_MODEL=服务商提供的模型名
 LEO_LLM_API_KEY=新生成的密钥
 LEO_LLM_TIMEOUT_SECONDS=120
-LEO_LLM_MAX_TOKENS=1200
+LEO_LLM_MAX_TOKENS=8192
+LEO_LLM_JSON_MODE=true
 ```
+
+`JSON_MODE` 会向 OpenAI-compatible 服务发送
+`response_format={"type":"json_object"}`。对会在 `usage` 中报告
+`reasoning_tokens` 的模型，`max_tokens` 同时包含隐藏推理与最终正文；
+预算过小可能出现 `finish_reason=length` 且 `content` 为空。Agentic
+Provider 会识别该情况并在唯一一次结构修复中扩大预算。
 
 不要把密钥直接写进命令行、Python 文件、日志或 `.env.example`。如果密钥曾经
 出现在终端历史或日志中，应先到服务商控制台撤销，再把新密钥写入 `.env`。
@@ -745,6 +752,11 @@ input、prior、state、parameter、method、result、metric、dataset 和 assum
 例如用户问“观测量”时，预测星历和 SGP4 传播结果会被放入排除类别约束，只能作为
 辅助输入或先验说明，不能生成 `category=measurement` 的直接 Claim。
 
+“研究路线/演进/时间线”问题会被规划为 `method` 型跨论文
+`synthesis`，拆分为核心方法、估计策略递进和后续扩展。Coverage
+允许多篇论文对各自方法的直接证据组合支持跨文献结论，不再
+错误要求某一篇论文显式写出整体演进路线。
+
 Reranker 不只判断主题相关性，还为每个候选赋予 0–3 的 directness grade：3 表示
 直接包含答案，2 表示关键支持，1 表示背景，0 表示不支持。因此只重复“星历误差、
 时钟误差”的 Introduction 不会压过明确说明载波相位或多普勒用途的正文。
@@ -756,6 +768,9 @@ Evidence ID 中为每个 subquestion 选择一条直接性最高的必选证据�
 文本冗余度和 work/document 多样性。中英文相似度使用确定性 token
 Jaccard，不增加 LLM 调用或 Embedding 重算。Coverage 必选证据不会被普通
 per-work cap 丢弃，Context Builder 也不再对 Selector 结果二次限流。
+如 Context token budget 截断了 Selector 结果，后续 source mapping、生成和
+语义验证都只使用 Context Builder 实际保留的 Evidence；历史中已加载
+但本轮未选中的 Evidence 不得被引用。
 
 输出的 `diagnostics.evidence_selection` 记录候选/选中数、已覆盖与未覆盖
 subquestion、必选 Evidence 数、低直接性/冗余/per-work/预算丢弃数，
@@ -773,6 +788,11 @@ Structural Validation 检查 JSON、Claim、S 编号和 Chunk 映射；Semantic 
 “载波相位和预测星历作为算法输入”，也会得到 `category_correct=false`、非完全
 蕴含和 `rewrite/drop`。Repair 最多一次，之后重新执行两层验证；仍无效时明确
 返回 `validation.valid=false`。
+
+Agentic 输出的 `outcome.code` 区分 `answered`、
+`insufficient_evidence`、`generation_failed`、`validation_failed` 和
+`budget_exhausted`。Web 前端不再把模型结构失败或引用验证失败统一
+显示为“证据不足”。
 
 #### Append-only Prompt、缓存与 Compaction
 
@@ -1402,3 +1422,19 @@ v0.2 的批量验收会自动生成 5 份独立 PDF 测试夹具和 1 份损坏 
 
 项目代码使用 [MIT License](LICENSE)。该许可证不覆盖用户导入的论文、论文
 图片、MinerU 解析出的论文内容、第三方模型或第三方依赖。
+> The default answer path is now incremental Agentic Scientific GraphRAG. The original
+> BM25+dense path remains available with `--retrieval-mode legacy` for regression and ablation.
+
+The GraphRAG architecture, schemas, constraints, collection layout, state machine, migration,
+and operational commands are documented in
+[`docs/graphrag_architecture.md`](docs/graphrag_architecture.md).
+
+Quick start:
+
+```bash
+cp .env.example .env                # set Neo4j and local LLM credentials
+docker compose -f docker-compose.graph.yml up -d
+uv sync --group dev
+uv run python main.py knowledge migrate-to-graphrag
+uv run python main.py answer "伪距率与速度状态有什么关系？"
+```

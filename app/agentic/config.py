@@ -9,13 +9,20 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class AgenticRAGConfig:
-    candidate_limit: int = 20
-    rerank_top_k: int = 8
+    candidate_limit: int = 40
+    rerank_top_k: int = 20
     final_top_k: int = 5
     evidence_mmr_lambda: float = 0.75
     max_final_evidence_per_work: int = 2
     min_final_directness_grade: int = 1
     max_retrieval_rounds: int = 2
+    max_query_expansion_calls: int = 1
+    max_query_variants: int = 5
+    max_graph_hops: int = 2
+    max_graph_paths: int = 20
+    max_focused_queries_per_round: int = 2
+    max_cross_query_candidates: int = 40
+    max_rerank_candidates: int = 20
     max_structure_repairs: int = 1
     max_answer_repairs: int = 1
     max_total_latency_ms: int | None = None
@@ -101,6 +108,21 @@ class AgenticRAGConfig:
             max_retrieval_rounds=integer(
                 "MAX_RETRIEVAL_ROUNDS", defaults.max_retrieval_rounds
             ),
+            max_query_expansion_calls=integer(
+                "MAX_QUERY_EXPANSION_CALLS", defaults.max_query_expansion_calls
+            ),
+            max_query_variants=integer("MAX_QUERY_VARIANTS", defaults.max_query_variants),
+            max_graph_hops=integer("MAX_GRAPH_HOPS", defaults.max_graph_hops),
+            max_graph_paths=integer("MAX_GRAPH_PATHS", defaults.max_graph_paths),
+            max_focused_queries_per_round=integer(
+                "MAX_FOCUSED_QUERIES_PER_ROUND", defaults.max_focused_queries_per_round
+            ),
+            max_cross_query_candidates=integer(
+                "MAX_CROSS_QUERY_CANDIDATES", defaults.max_cross_query_candidates
+            ),
+            max_rerank_candidates=integer(
+                "MAX_RERANK_CANDIDATES", defaults.max_rerank_candidates
+            ),
             max_structure_repairs=integer(
                 "MAX_STRUCTURE_REPAIRS", defaults.max_structure_repairs
             ),
@@ -164,6 +186,20 @@ class AgenticRAGConfig:
             raise ValueError("rerank_top_k 不能大于 candidate_limit。")
         if self.final_top_k > self.rerank_top_k:
             raise ValueError("final_top_k 不能大于 rerank_top_k。")
+        if self.max_query_expansion_calls != 1:
+            raise ValueError("max_query_expansion_calls must equal 1")
+        if not 1 <= self.max_query_variants <= 5:
+            raise ValueError("max_query_variants must be 1..5")
+        if self.max_graph_hops not in {1, 2}:
+            raise ValueError("max_graph_hops must be 1 or 2")
+        if not 1 <= self.max_graph_paths <= 100:
+            raise ValueError("max_graph_paths must be 1..100")
+        if not 1 <= self.max_focused_queries_per_round <= 2:
+            raise ValueError("max_focused_queries_per_round must be 1..2")
+        if not 1 <= self.max_cross_query_candidates <= 100:
+            raise ValueError("max_cross_query_candidates must be 1..100")
+        if not 1 <= self.max_rerank_candidates <= self.max_cross_query_candidates:
+            raise ValueError("max_rerank_candidates exceeds cross-query budget")
         if not 0.0 <= self.evidence_mmr_lambda <= 1.0:
             raise ValueError("evidence_mmr_lambda 必须在 0 到 1 之间。")
         if not 1 <= self.max_final_evidence_per_work <= 20:

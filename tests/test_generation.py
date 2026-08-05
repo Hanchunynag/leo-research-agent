@@ -243,6 +243,7 @@ def test_openai_compatible_provider_parses_structured_json_without_network() -> 
     assert client.calls[0][0] == "http://127.0.0.1:11434/v1/chat/completions"
     request = client.calls[0][1]
     assert request["model"] == "local-model"
+    assert request["response_format"] == {"type": "json_object"}
     assert "[S1]" in request["messages"][1]["content"]
     user_content = request["messages"][1]["content"]
     assert user_content.index("Evidence bundle:") < user_content.index("Question:")

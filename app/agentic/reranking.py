@@ -76,6 +76,54 @@ def directness_grade(candidate: dict[str, Any], plan: QueryPlan) -> int:
         if measurement:
             return 2 if not background else 1
         return 0
+    if plan.intent == "synthesis" and plan.target_category == "method":
+        section = normalize_search_text(
+            " ".join(str(value) for value in candidate.get("section_path") or [])
+        )
+        method_section = any(
+            marker in section
+            for marker in (
+                "abstract",
+                "method",
+                "framework",
+                "approach",
+                "algorithm",
+                "conclusion",
+                "result",
+                "experiment",
+            )
+        )
+        contribution = any(
+            marker in text
+            for marker in (
+                "we propose",
+                "is proposed",
+                "proposed method",
+                "we develop",
+                "is developed",
+                "this paper presented",
+                "this article studied",
+                "framework",
+                "scheme",
+                "approach",
+                "method",
+                "estimate",
+                "tracking",
+                "compensation",
+                "correction",
+                "refinement",
+                "prediction",
+                "validation",
+                "experiment",
+            )
+        )
+        if contribution and method_section and not background:
+            return 3
+        if contribution and not background:
+            return 2
+        if contribution or method_section:
+            return 1
+        return 0
     query_terms = set(
         normalize_search_text(" ".join(plan.retrieval_queries)).split()
     )

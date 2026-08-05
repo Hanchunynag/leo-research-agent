@@ -35,7 +35,7 @@ from app.agentic.prompting import (
     compact_topic,
     prompt_cache_diagnostics,
 )
-from app.agentic.provider import AgenticReasoningProvider
+from app.agentic.provider import AgenticReasoningProvider, StructuredOutputError
 from app.agentic.reranking import DirectAnswerReranker
 from app.agentic.routing import TopicRouter, extract_entities, rewrite_standalone_query
 from app.agentic.selection import CoverageAwareEvidenceSelector
@@ -83,6 +83,31 @@ def _render_answer(draft: AgenticAnswerDraft) -> str:
         f"{claim.text.strip()} "
         + "".join(f"[{source_id}]" for source_id in claim.source_ids)
         for claim in draft.claims
+    )
+
+
+def _generation_failure(error: Exception, *, stage: str) -> dict[str, Any]:
+    """将生成异常转换为不含原始响应和秘密的诊断。"""
+
+    if isinstance(error, StructuredOutputError):
+        return error.to_diagnostics()
+    return {
+        "stage": stage,
+        "failure_kind": type(error).__name__,
+        "validation_issues": [],
+    }
+
+
+def _generation_failure_message(details: dict[str, Any]) -> str:
+    kind = str(details.get("failure_kind") or "unknown")
+    issues = details.get("validation_issues")
+    suffix = ""
+    if isinstance(issues, list) and issues and isinstance(issues[0], dict):
+        location = str(issues[0].get("location") or "$")
+        suffix = f"，首个不匹配字段为 {location}"
+    return (
+        f"回答模型返回的结构不符合约束（{kind}{suffix}）。"
+        "检索证据已保留，这不是证据不足。"
     )
 
 
@@ -241,6 +266,7 @@ class AgenticRAGService:
         evidence: Sequence[dict[str, Any]],
     ) -> CoverageReport:
         known_ids = {str(item.get("evidence_id")) for item in evidence}
+        deterministic = deterministic_coverage(plan, evidence)
         try:
             report = self.reasoning_provider.check_coverage(plan, evidence)
             expected_subquestions = {item.id for item in plan.subquestions}
@@ -261,10 +287,19 @@ class AgenticRAGService:
             )
             if report.overall_sufficient != computed_sufficient:
                 raise ValueError("Coverage 的 overall_sufficient 与逐项状态不一致。")
+            if (
+                plan.intent == "synthesis"
+                and plan.target_category == "method"
+                and deterministic.overall_sufficient
+                and not report.overall_sufficient
+            ):
+                # 综述问题不应被“没有单篇论文直接写出整体路线”拒答。
+                self._stage_fallbacks.append("coverage_compositional_synthesis")
+                return deterministic
             return report
         except Exception:
             self._stage_fallbacks.append("coverage")
-            return deterministic_coverage(plan, evidence)
+            return deterministic
 
     def _semantic_validate(
         self,
@@ -375,6 +410,69 @@ class AgenticRAGService:
             citations=structural.citations if not issues else [],
         )
 
+    @staticmethod
+    def _restrict_draft_to_context(
+        draft: AgenticAnswerDraft,
+        context: ContextBundle,
+    ) -> tuple[AgenticAnswerDraft, int, int]:
+        """只保留当前 source_id 与 evidence_id 稳定映射内的引用。"""
+
+        if not draft.answerable:
+            return draft, 0, 0
+        mapping = {
+            item.source_id: item.evidence_id
+            for item in context.evidence
+            if item.evidence_id
+        }
+        kept = []
+        dropped = 0
+        narrowed = 0
+        for claim in draft.claims:
+            claimed_evidence = set(claim.evidence_ids)
+            valid_sources = [
+                source_id
+                for source_id in claim.source_ids
+                if mapping.get(source_id) in claimed_evidence
+            ]
+            valid_evidence = list(
+                dict.fromkeys(
+                    str(mapping[source_id]) for source_id in valid_sources
+                )
+            )
+            if not valid_sources or not valid_evidence:
+                dropped += 1
+                continue
+            if (
+                valid_sources != claim.source_ids
+                or valid_evidence != claim.evidence_ids
+            ):
+                narrowed += 1
+            kept.append(
+                claim.model_copy(
+                    update={
+                        "source_ids": valid_sources,
+                        "evidence_ids": valid_evidence,
+                    }
+                )
+            )
+        if not kept:
+            return (
+                AgenticAnswerDraft(
+                    answerable=False,
+                    claims=[],
+                    refusal_reason=(
+                        "回答模型未使用本轮 Context 中的合法证据映射。"
+                    ),
+                ),
+                dropped,
+                narrowed,
+            )
+        return (
+            draft.model_copy(update={"claims": kept, "refusal_reason": None}),
+            dropped,
+            narrowed,
+        )
+
     def _register_round_evidence(
         self,
         session_id: str,
@@ -408,6 +506,9 @@ class AgenticRAGService:
                         "work_id": record.get("work_id"),
                         "document_id": record.get("document_id"),
                         "title": record.get("title"),
+                        "authors": record.get("authors") or [],
+                        "year": record.get("year"),
+                        "doi": record.get("doi"),
                         "section_path": record.get("section_path"),
                         "page_start": record.get("page_start"),
                         "page_end": record.get("page_end"),
@@ -487,6 +588,42 @@ class AgenticRAGService:
             },
         )
 
+    @staticmethod
+    def _align_evidence_with_context(
+        selected: Sequence[dict[str, Any]],
+        context: ContextBundle,
+    ) -> list[dict[str, Any]]:
+        """以 Context Builder 实际保留的条目为唯一可引用证据集。"""
+
+        by_chunk = {
+            str(item.get("chunk_id") or ""): item
+            for item in selected
+            if item.get("chunk_id")
+        }
+        aligned: list[dict[str, Any]] = []
+        for context_item in context.evidence:
+            original = by_chunk.get(context_item.chunk_id, {})
+            value = {**original, **context_item.to_dict()}
+            value["source_id"] = context_item.source_id
+            value["evidence_id"] = context_item.evidence_id
+            aligned.append(value)
+        return aligned
+
+    @staticmethod
+    def _context_preserves_coverage(
+        coverage: CoverageReport,
+        evidence: Sequence[dict[str, Any]],
+    ) -> bool:
+        available = {
+            str(item.get("evidence_id") or "")
+            for item in evidence
+            if item.get("evidence_id")
+        }
+        return all(
+            bool(available & set(item.supporting_evidence_ids))
+            for item in coverage.coverage
+        )
+
     def _append_source_mapping(
         self,
         session_id: str,
@@ -507,6 +644,9 @@ class AgenticRAGService:
                         "source_id": item["source_id"],
                         "evidence_id": item["evidence_id"],
                         "chunk_id": item["chunk_id"],
+                        "title": item.get("title"),
+                        "year": item.get("year"),
+                        "section_path": item.get("section_path"),
                         "origin": item.get("origin"),
                     }
                     for item in evidence
@@ -632,6 +772,7 @@ class AgenticRAGService:
         evidence_by_id: dict[str, dict[str, Any]] = {}
         total_new = 0
         total_reused = 0
+        generation_failure: dict[str, Any] | None = None
         queries = list(plan.retrieval_queries)
         coverage = CoverageReport(
             overall_sufficient=False,
@@ -743,11 +884,22 @@ class AgenticRAGService:
                 final_evidence,
                 len(round_reports),
             )
+            selected_before_context = len(final_evidence)
+            final_evidence = self._align_evidence_with_context(
+                final_evidence,
+                context,
+            )
+            context_coverage_preserved = self._context_preserves_coverage(
+                coverage,
+                final_evidence,
+            )
             context_trace.update(
                 {
                     "evidence_count": len(final_evidence),
+                    "selected_before_context": selected_before_context,
                     "token_count": context.token_count,
-                    "coverage_preserved": bool(
+                    "coverage_preserved": context_coverage_preserved
+                    and bool(
                         self.evidence_selector.last_diagnostics.get(
                             "coverage_preserved"
                         )
@@ -756,7 +908,7 @@ class AgenticRAGService:
             )
         selection_sufficient = bool(
             self.evidence_selector.last_diagnostics.get("coverage_preserved")
-        )
+        ) and context_coverage_preserved
         budget_exhausted = harness.deadline_exceeded()
         if (
             budget_exhausted
@@ -843,15 +995,24 @@ class AgenticRAGService:
                     self._stage_fallbacks.append("answer_generation")
                     generation_trace["fallback_used"] = True
                     generation_trace["error_type"] = type(error).__name__
+                    generation_failure = _generation_failure(
+                        error,
+                        stage="answer",
+                    )
+                    generation_trace["structured_output"] = generation_failure
                     draft = AgenticAnswerDraft(
                         answerable=False,
                         claims=[],
-                        refusal_reason=(
-                            "回答模型未返回合法结构："
-                            f"{type(error).__name__}"
+                        refusal_reason=_generation_failure_message(
+                            generation_failure
                         ),
                     )
                     generation_metadata = {}
+                draft, citation_dropped, citation_narrowed = (
+                    self._restrict_draft_to_context(draft, context)
+                )
+                if citation_dropped or citation_narrowed:
+                    self._stage_fallbacks.append("citation_scope_guardrail")
                 structure_repairs = generation_metadata.get(
                     "structure_repair_attempts",
                     0,
@@ -862,6 +1023,8 @@ class AgenticRAGService:
                     {
                         "answerable": draft.answerable,
                         "claim_count": len(draft.claims),
+                        "citation_claims_dropped": citation_dropped,
+                        "citation_claims_narrowed": citation_narrowed,
                         "structure_repair_attempts": (
                             structure_repairs
                             if isinstance(structure_repairs, int)
@@ -1000,11 +1163,24 @@ class AgenticRAGService:
                         final_evidence,
                         len(round_reports),
                     )
+                    selected_before_context = len(final_evidence)
+                    final_evidence = self._align_evidence_with_context(
+                        final_evidence,
+                        context,
+                    )
+                    context_coverage_preserved = (
+                        self._context_preserves_coverage(
+                            coverage,
+                            final_evidence,
+                        )
+                    )
                     context_trace.update(
                         {
                             "evidence_count": len(final_evidence),
+                            "selected_before_context": selected_before_context,
                             "token_count": context.token_count,
-                            "coverage_preserved": bool(
+                            "coverage_preserved": context_coverage_preserved
+                            and bool(
                                 self.evidence_selector.last_diagnostics.get(
                                     "coverage_preserved"
                                 )
@@ -1015,7 +1191,7 @@ class AgenticRAGService:
                     self.evidence_selector.last_diagnostics.get(
                         "coverage_preserved"
                     )
-                )
+                ) and context_coverage_preserved
                 self._append_source_mapping(
                     sid,
                     topic_id,
@@ -1041,15 +1217,26 @@ class AgenticRAGService:
                         )
                         generation_trace["fallback_used"] = True
                         generation_trace["error_type"] = type(error).__name__
+                        generation_failure = _generation_failure(
+                            error,
+                            stage="answer_after_retrieval",
+                        )
+                        generation_trace["structured_output"] = generation_failure
                         draft = AgenticAnswerDraft(
                             answerable=False,
                             claims=[],
-                            refusal_reason=(
-                                "补充检索后的回答模型未返回合法结构："
-                                f"{type(error).__name__}"
+                            refusal_reason=_generation_failure_message(
+                                generation_failure
                             ),
                         )
                         generation_metadata = {}
+                    draft, citation_dropped, citation_narrowed = (
+                        self._restrict_draft_to_context(draft, context)
+                    )
+                    if citation_dropped or citation_narrowed:
+                        self._stage_fallbacks.append(
+                            "citation_scope_guardrail_after_retrieval"
+                        )
                     structure_repairs = generation_metadata.get(
                         "structure_repair_attempts",
                         0,
@@ -1060,6 +1247,8 @@ class AgenticRAGService:
                         {
                             "answerable": draft.answerable,
                             "claim_count": len(draft.claims),
+                            "citation_claims_dropped": citation_dropped,
+                            "citation_claims_narrowed": citation_narrowed,
                             "structure_repair_attempts": (
                                 structure_repairs
                                 if isinstance(structure_repairs, int)
@@ -1128,10 +1317,19 @@ class AgenticRAGService:
                         repair_trace["fallback_used"] = True
                         repair_trace["error_type"] = type(error).__name__
                         draft = deterministic_repair(draft, semantic)
+                    draft, citation_dropped, citation_narrowed = (
+                        self._restrict_draft_to_context(draft, context)
+                    )
+                    if citation_dropped or citation_narrowed:
+                        self._stage_fallbacks.append(
+                            "citation_scope_guardrail_after_repair"
+                        )
                     repair_trace.update(
                         {
                             "answerable": draft.answerable,
                             "claim_count": len(draft.claims),
+                            "citation_claims_dropped": citation_dropped,
+                            "citation_claims_narrowed": citation_narrowed,
                         }
                     )
                 with harness.stage(
@@ -1219,6 +1417,44 @@ class AgenticRAGService:
                 ),
             )
 
+        deadline_exhausted = harness.deadline_exceeded()
+        if answer.answerable:
+            outcome = {
+                "code": "answered",
+                "stage": "completed",
+                "message": "回答已通过结构和语义验证。",
+                "retryable": False,
+            }
+        elif generation_failure is not None:
+            outcome = {
+                "code": "generation_failed",
+                "stage": str(generation_failure.get("stage") or "answer"),
+                "message": answer.refusal_reason,
+                "retryable": True,
+                "details": generation_failure,
+            }
+        elif deadline_exhausted:
+            outcome = {
+                "code": "budget_exhausted",
+                "stage": "harness",
+                "message": answer.refusal_reason,
+                "retryable": True,
+            }
+        elif not coverage.overall_sufficient or not selection_sufficient:
+            outcome = {
+                "code": "insufficient_evidence",
+                "stage": "coverage",
+                "message": answer.refusal_reason,
+                "retryable": False,
+            }
+        else:
+            outcome = {
+                "code": "validation_failed",
+                "stage": "semantic_validation",
+                "message": answer.refusal_reason,
+                "retryable": True,
+            }
+
         with harness.stage(AgenticStage.PERSISTING) as persistence_trace:
             validation_payload = semantic.model_dump(mode="json")
             validation_payload["structural"] = answer.validation.to_dict()
@@ -1234,6 +1470,7 @@ class AgenticRAGService:
                     "answer": answer.answer,
                     "claims": [claim.to_dict() for claim in answer.claims],
                     "refusal_reason": answer.refusal_reason,
+                    "outcome": outcome,
                 },
             )
             self.store.append_event(sid, topic_id, "validation", validation_payload)
@@ -1284,15 +1521,14 @@ class AgenticRAGService:
                     "event_count_added": 3,
                 }
             )
-        if answer.answerable:
+        if outcome["code"] == "answered":
             termination_reason = TerminationReason.COMPLETED
-        elif not coverage.overall_sufficient or not selection_sufficient:
+        elif outcome["code"] == "insufficient_evidence":
             termination_reason = TerminationReason.INSUFFICIENT_COVERAGE
-        elif any(
-            value.startswith("answer_generation")
-            for value in self._stage_fallbacks
-        ):
+        elif outcome["code"] == "generation_failed":
             termination_reason = TerminationReason.GENERATION_FAILED
+        elif outcome["code"] == "budget_exhausted":
+            termination_reason = TerminationReason.BUDGET_EXHAUSTED
         else:
             termination_reason = TerminationReason.SEMANTIC_VALIDATION_FAILED
         harness.finish(
@@ -1334,6 +1570,7 @@ class AgenticRAGService:
             compaction_count=compaction_count,
         )
         result = answer.to_dict(include_context=include_context)
+        result["outcome"] = outcome
         result["validation"] = validation_payload
         result["session"] = {
             "session_id": sid,

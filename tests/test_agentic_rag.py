@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 import pytest
@@ -31,6 +32,7 @@ from app.agentic.reranking import DirectAnswerReranker
 from app.agentic.routing import TopicRouter
 from app.agentic.service import AgenticRAGService
 from app.agentic.store import AgenticSessionStore, stable_json
+from app.context.assembly import assemble_context_bundle
 from app.generation.security import redact_sensitive_text
 from app.generation.settings import load_local_llm_settings
 
@@ -291,6 +293,53 @@ def test_query_planner_excludes_predicted_ephemeris_from_measurements() -> None:
     assert any("预测星历" in value for value in plan.answer_constraints)
 
 
+def test_query_planner_decomposes_cross_paper_evolution() -> None:
+    plan = QueryPlanner().plan("这些论文的研究路线如何演进？")
+
+    assert plan.intent == "synthesis"
+    assert plan.target_category == "method"
+    assert [item.id for item in plan.subquestions] == ["SQ1", "SQ2", "SQ3"]
+    assert any("proposed method" in value for value in plan.retrieval_queries)
+    assert all("不要求任何单篇论文" in item.requirement for item in plan.required_evidence)
+    assert any("跨论文综合" in value for value in plan.answer_constraints)
+
+
+def test_synthesis_coverage_combines_direct_evidence_from_multiple_papers() -> None:
+    plan = QueryPlanner().plan("这些论文的研究路线如何演进？")
+    evidence = [
+        dict(
+            EPHEMERIS,
+            evidence_id="E001",
+            directness_grade=3,
+            content=(
+                "This paper proposed a pseudorange-based ephemeris correction "
+                "framework with state estimation."
+            ),
+        ),
+        dict(
+            CLOCK,
+            evidence_id="E002",
+            directness_grade=3,
+            content=(
+                "The extended method jointly compensates clock and ephemeris "
+                "errors and validates navigation experimentally."
+            ),
+        ),
+    ]
+
+    coverage = deterministic_coverage(plan, evidence)
+
+    assert coverage.overall_sufficient is True
+    assert all(item.status == "sufficient" for item in coverage.coverage)
+    assert {"E001", "E002"}.issubset(
+        {
+            evidence_id
+            for item in coverage.coverage
+            for evidence_id in item.supporting_evidence_ids
+        }
+    )
+
+
 def test_direct_answer_reranker_beats_background_and_can_fallback() -> None:
     plan = QueryPlanner().plan("哪些观测量用于估计时钟误差？")
     reranker = DirectAnswerReranker(FakeRerankerProvider())
@@ -351,6 +400,39 @@ def test_harness_refuses_when_retrieval_budget_ends_without_coverage(
     assert harness["state"] == "refused"
     assert harness["termination_reason"] == "insufficient_coverage"
     assert harness["budget"]["retrieval_rounds_used"] == 1
+
+
+def test_generation_failure_is_not_reported_as_insufficient_evidence(
+    tmp_path: Path,
+) -> None:
+    class BrokenGenerationProvider(FakeReasoningProvider):
+        def generate_answer(
+            self,
+            messages: list[dict[str, str]],
+        ) -> tuple[AgenticAnswerDraft, dict[str, Any]]:
+            raise ValueError("invalid structured response")
+
+    runtime = FakeRuntime(staged=False)
+    service = AgenticRAGService(
+        runtime,  # type: ignore[arg-type]
+        BrokenGenerationProvider(),
+        AgenticSessionStore(tmp_path),
+        DirectAnswerReranker(runtime.reranker_provider),
+        config(),
+    )
+
+    result = service.answer(
+        "哪些观测量用于估计星历和时钟误差？",
+        session_id="generation_failure",
+    )
+
+    assert result["coverage"]["overall_sufficient"] is True
+    assert result["answerable"] is False
+    assert result["outcome"]["code"] == "generation_failed"
+    assert "这不是证据不足" in result["refusal_reason"]
+    assert result["diagnostics"]["harness"]["termination_reason"] == (
+        "generation_failed"
+    )
 
 
 def test_session_persists_events_and_reuses_stable_evidence(tmp_path: Path) -> None:
@@ -426,6 +508,49 @@ def test_semantic_validation_rejects_predicted_ephemeris_as_observable() -> None
     assert claim_result.repair_action in {"rewrite", "drop"}
     assert repaired.answerable is False
     assert repaired.claims == []
+
+
+def test_citation_scope_guardrail_drops_history_only_evidence() -> None:
+    current = dict(
+        EPHEMERIS,
+        evidence_id="E001",
+        source_id="S1",
+        directness_grade=3,
+    )
+    context = assemble_context_bundle(
+        "ephemeris method",
+        "accurate",
+        [current],
+        token_budget=1000,
+    )
+    draft = AgenticAnswerDraft(
+        answerable=True,
+        claims=[
+            AgenticClaim(
+                claim_id="C1",
+                text="Current supported method.",
+                category="method",
+                source_ids=["S1"],
+                evidence_ids=["E001"],
+            ),
+            AgenticClaim(
+                claim_id="C2",
+                text="History-only method.",
+                category="method",
+                source_ids=["S9"],
+                evidence_ids=["E009"],
+            ),
+        ],
+    )
+
+    restricted, dropped, narrowed = AgenticRAGService._restrict_draft_to_context(  # noqa: SLF001
+        draft,
+        context,
+    )
+
+    assert [claim.claim_id for claim in restricted.claims] == ["C1"]
+    assert dropped == 1
+    assert narrowed == 0
 
 
 def test_append_only_prompt_is_strict_prefix_and_serialization_is_stable(
@@ -690,6 +815,63 @@ def test_agentic_provider_can_disable_structure_repair() -> None:
         )
 
     assert inner.calls == 1
+
+
+def test_agentic_provider_expands_budget_after_reasoning_only_truncation() -> None:
+    class TruncatedThenValidProvider:
+        model_name = "fixture/reasoning-model"
+        config = SimpleNamespace(max_tokens=1200)
+
+        def __init__(self) -> None:
+            self.max_token_requests: list[int | None] = []
+
+        def chat_completion(
+            self,
+            messages: list[dict[str, str]],
+            *,
+            max_tokens: int | None = None,
+        ) -> dict[str, Any]:
+            self.max_token_requests.append(max_tokens)
+            if len(self.max_token_requests) == 1:
+                return {
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"content": ""},
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 8000,
+                        "completion_tokens": 1200,
+                    },
+                }
+            content = RoutingLLMDecision(
+                relation="same_topic",
+                confidence=0.9,
+                reason="follow-up",
+                context_dependent=True,
+                standalone_query="standalone",
+                reuse_previous_evidence=True,
+                requires_new_retrieval=True,
+            ).model_dump_json()
+            return {
+                "choices": [
+                    {"finish_reason": "stop", "message": {"content": content}}
+                ]
+            }
+
+    inner = TruncatedThenValidProvider()
+    provider = OpenAIAgenticReasoningProvider(inner)  # type: ignore[arg-type]
+
+    result, diagnostics = provider._complete(  # noqa: SLF001
+        "router_test",
+        [{"role": "user", "content": "route as JSON"}],
+        RoutingLLMDecision,
+    )
+
+    assert result.relation == "same_topic"
+    assert inner.max_token_requests == [None, 4096]
+    assert diagnostics["structure_repair_attempts"] == 1
 
 
 def test_deepseek_api_key_alias_and_redaction(

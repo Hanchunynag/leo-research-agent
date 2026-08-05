@@ -140,6 +140,8 @@ h1, h2, h3, p { margin-top: 0; }
 .message.user .message-body { background: #efeee8; border-left-color: var(--blue); }
 .message.assistant .message-body { padding-left: 0; border: 0; }
 .refusal-tag { display: block; width: max-content; margin-top: 10px; padding: 3px 7px; background: #f6e2d3; color: #955025; font: 9px "IBM Plex Mono", monospace; }
+.refusal-tag.generation_failed, .refusal-tag.validation_failed { background: #f1dddd; color: #9b3c3c; }
+.refusal-tag.budget_exhausted { background: #eee3cf; color: #7f5c19; }
 
 .working-card { max-width: 780px; margin: 0 auto 18px; padding: 13px 15px; border: 1px solid var(--line); background: #f5f4ef; }
 .working-line { display: flex; justify-content: space-between; font: 10px "IBM Plex Mono", monospace; text-transform: uppercase; }

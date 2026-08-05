@@ -1,0 +1,12 @@
+services:
+  neo4j:
+    image: neo4j:5.26
+    restart: unless-stopped
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - ./data/neo4j/data:/data
+      - ./data/neo4j/logs:/logs
+    environment:
+      NEO4J_AUTH: "${LEO_NEO4J_USER}/${LEO_NEO4J_PASSWORD}"

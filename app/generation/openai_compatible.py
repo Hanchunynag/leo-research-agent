@@ -35,9 +35,10 @@ class OpenAICompatibleConfig:
     model: str
     api_key: str | None = field(default=None, repr=False)
     timeout_seconds: float = 120.0
-    max_tokens: int = 1200
+    max_tokens: int = 8192
     temperature: float = 0.0
     prompt_layout: PromptLayout = "query_first"
+    json_mode: bool = True
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.base_url)
@@ -53,6 +54,8 @@ class OpenAICompatibleConfig:
             raise ValueError("temperature 不能小于 0。")
         if self.prompt_layout not in {"query_first", "context_first"}:
             raise ValueError("prompt_layout 必须是 query_first 或 context_first。")
+        if not isinstance(self.json_mode, bool):
+            raise ValueError("json_mode 必须是布尔值。")
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -73,13 +76,37 @@ def _strip_json_fence(content: str) -> str:
     return cleaned
 
 
-def _parse_answer_draft(content: str) -> AnswerDraft:
+def parse_json_object(content: str) -> dict[str, Any]:
+    """解析唯一 JSON object，并容忍常见的 Markdown 或简短前后缀。"""
+
+    cleaned = _strip_json_fence(content)
+    decoder = json.JSONDecoder()
     try:
-        payload = json.loads(_strip_json_fence(content))
-    except json.JSONDecodeError as error:
-        raise ValueError("回答模型未返回合法 JSON。") from error
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError as original_error:
+        payload = None
+        for index, character in enumerate(cleaned):
+            if character != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(cleaned[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                payload = candidate
+                break
+        if payload is None:
+            raise ValueError(
+                "回答模型未返回可解析的 JSON object（"
+                f"line={original_error.lineno}, column={original_error.colno}）。"
+            ) from original_error
     if not isinstance(payload, dict):
         raise ValueError("回答模型必须返回 JSON object。")
+    return payload
+
+
+def _parse_answer_draft(content: str) -> AnswerDraft:
+    payload = parse_json_object(content)
     answerable = payload.get("answerable")
     claims_payload = payload.get("claims")
     refusal_reason = payload.get("refusal_reason")
@@ -146,14 +173,17 @@ class OpenAICompatibleAnswerProvider:
     ) -> dict[str, Any]:
         """供结构化 Agentic 阶段复用同一安全 HTTP 客户端。"""
 
+        request_payload: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            "max_tokens": max_tokens or self.config.max_tokens,
+        }
+        if self.config.json_mode:
+            request_payload["response_format"] = {"type": "json_object"}
         response = self._client.post(
             self.endpoint,
-            json={
-                "model": self.config.model,
-                "messages": messages,
-                "temperature": self.config.temperature,
-                "max_tokens": max_tokens or self.config.max_tokens,
-            },
+            json=request_payload,
         )
         response.raise_for_status()
         payload = response.json()

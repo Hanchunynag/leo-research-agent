@@ -25,8 +25,9 @@ class LocalLLMSettings(BaseSettings):
         validation_alias=AliasChoices("LEO_LLM_API_KEY", "DEEPSEEK_API_KEY"),
     )
     timeout_seconds: float = 120.0
-    max_tokens: int = 1200
+    max_tokens: int = 8192
     prompt_layout: Literal["query_first", "context_first"] | None = None
+    json_mode: bool = True
 
 
 def load_local_llm_settings(project_root: Path) -> LocalLLMSettings:

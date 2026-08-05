@@ -5,6 +5,15 @@ type ChatMessage = {
   role: "user" | "assistant";
   text: string;
   answerable?: boolean;
+  outcome?: AgenticResult["outcome"];
+};
+
+const OUTCOME_LABELS: Record<string, string> = {
+  insufficient_evidence: "证据不足",
+  generation_failed: "生成格式失败",
+  validation_failed: "引用验证失败",
+  budget_exhausted: "运行预算耗尽",
+  legacy_refusal: "历史拒答",
 };
 
 const SUGGESTIONS = [
@@ -80,6 +89,7 @@ function App() {
           role: "assistant",
           text: answer.answerable ? answer.answer : answer.refusal_reason || "当前证据不足以回答。",
           answerable: answer.answerable,
+          outcome: answer.outcome,
         },
       ]);
       setActivePanel("evidence");
@@ -227,7 +237,11 @@ function App() {
               <div className="message-label">{message.role === "user" ? "YOU" : "RESEARCH AGENT"}</div>
               <div className="message-body">
                 {message.text}
-                {message.role === "assistant" && message.answerable === false && <span className="refusal-tag">证据不足</span>}
+                {message.role === "assistant" && message.answerable === false && (
+                  <span className={`refusal-tag ${message.outcome?.code || "unknown"}`}>
+                    {OUTCOME_LABELS[message.outcome?.code || ""] || "未完成"}
+                  </span>
+                )}
               </div>
             </article>
           ))}

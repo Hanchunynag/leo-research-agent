@@ -213,6 +213,7 @@ class LocalRAGWebRuntime:
                 timeout_seconds=llm.timeout_seconds,
                 max_tokens=llm.max_tokens,
                 prompt_layout=llm.prompt_layout or "context_first",
+                json_mode=llm.json_mode,
             )
         )
         retrieval = self._retrieval_runtime()
@@ -361,11 +362,22 @@ class LocalRAGWebRuntime:
                 refusal = content.get("refusal_reason")
                 text = answer if answerable else refusal
                 if isinstance(text, str) and text:
+                    outcome = content.get("outcome")
                     messages.append(
                         {
                             "role": "assistant",
                             "text": text,
                             "answerable": answerable,
+                            "outcome": (
+                                outcome
+                                if isinstance(outcome, dict)
+                                else {
+                                    "code": "legacy_refusal",
+                                    "stage": "unknown",
+                                    "message": text,
+                                    "retryable": False,
+                                }
+                            ),
                         }
                     )
         return {

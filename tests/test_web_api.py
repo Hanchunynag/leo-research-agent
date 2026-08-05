@@ -32,6 +32,12 @@ class FakeWebRuntime:
             "claims": [],
             "citations": [],
             "refusal_reason": None,
+            "outcome": {
+                "code": "answered",
+                "stage": "completed",
+                "message": "ok",
+                "retryable": False,
+            },
             "validation": {"valid": True},
             "diagnostics": {"retrieval_mode": "agentic"},
             "session": {

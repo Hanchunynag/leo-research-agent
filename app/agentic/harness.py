@@ -38,6 +38,15 @@ class AgenticStage(StrEnum):
     INITIALIZED = "initialized"
     ROUTING = "routing"
     PLANNING = "planning"
+    QUERY_EXPANDING = "query_expanding"
+    QUERY_VALIDATING = "query_validating"
+    RETRIEVAL_DISPATCHING = "retrieval_dispatching"
+    LEXICAL_RETRIEVING = "lexical_retrieving"
+    DENSE_RETRIEVING = "dense_retrieving"
+    GRAPH_RETRIEVING = "graph_retrieving"
+    COMMUNITY_RETRIEVING = "community_retrieving"
+    QUERY_FUSING = "query_fusing"
+    # Backward-compatible legacy stage used by the ablation path.
     RETRIEVING = "retrieving"
     RERANKING = "reranking"
     COVERAGE_CHECKING = "coverage_checking"
@@ -79,6 +88,13 @@ class HarnessConstraintError(RuntimeError):
 class AgenticRunPolicy:
     """与业务配置解耦的单次运行硬约束。"""
 
+    max_query_expansion_calls: int = 1
+    max_query_variants: int = 5
+    max_graph_hops: int = 2
+    max_graph_paths: int = 20
+    max_focused_queries_per_round: int = 2
+    max_cross_query_candidates: int = 40
+    max_rerank_candidates: int = 20
     max_retrieval_rounds: int = 2
     max_structure_repairs: int = 1
     max_answer_repairs: int = 1
@@ -87,6 +103,20 @@ class AgenticRunPolicy:
     allow_model_downloads: bool = True
 
     def __post_init__(self) -> None:
+        if self.max_query_expansion_calls != 1:
+            raise ValueError("max_query_expansion_calls must equal 1")
+        if not 1 <= self.max_query_variants <= 5:
+            raise ValueError("max_query_variants must be 1..5")
+        if not 1 <= self.max_graph_hops <= 2:
+            raise ValueError("max_graph_hops must be 1..2")
+        if not 1 <= self.max_graph_paths <= 100:
+            raise ValueError("max_graph_paths must be 1..100")
+        if not 1 <= self.max_focused_queries_per_round <= 2:
+            raise ValueError("max_focused_queries_per_round must be 1..2")
+        if not 1 <= self.max_cross_query_candidates <= 100:
+            raise ValueError("max_cross_query_candidates must be 1..100")
+        if not 1 <= self.max_rerank_candidates <= self.max_cross_query_candidates:
+            raise ValueError("max_rerank_candidates exceeds fusion candidate budget")
         if not 1 <= self.max_retrieval_rounds <= 5:
             raise ValueError("max_retrieval_rounds 必须在 1 到 5 之间。")
         if self.max_structure_repairs not in {0, 1}:
@@ -134,13 +164,32 @@ class StageTrace:
 _ALLOWED_TRANSITIONS: dict[AgenticStage, set[AgenticStage]] = {
     AgenticStage.INITIALIZED: {AgenticStage.ROUTING},
     AgenticStage.ROUTING: {AgenticStage.PLANNING},
-    AgenticStage.PLANNING: {
-        AgenticStage.RETRIEVING,
-        AgenticStage.CONTEXT_BUILDING,
+    AgenticStage.PLANNING: {AgenticStage.QUERY_EXPANDING, AgenticStage.RETRIEVING,
+                            AgenticStage.CONTEXT_BUILDING},
+    AgenticStage.QUERY_EXPANDING: {AgenticStage.QUERY_VALIDATING},
+    AgenticStage.QUERY_VALIDATING: {AgenticStage.RETRIEVAL_DISPATCHING},
+    AgenticStage.RETRIEVAL_DISPATCHING: {
+        AgenticStage.LEXICAL_RETRIEVING, AgenticStage.DENSE_RETRIEVING,
+        AgenticStage.GRAPH_RETRIEVING, AgenticStage.COMMUNITY_RETRIEVING,
+        AgenticStage.QUERY_FUSING,
     },
+    AgenticStage.LEXICAL_RETRIEVING: {
+        AgenticStage.DENSE_RETRIEVING, AgenticStage.GRAPH_RETRIEVING,
+        AgenticStage.COMMUNITY_RETRIEVING, AgenticStage.QUERY_FUSING,
+    },
+    AgenticStage.DENSE_RETRIEVING: {
+        AgenticStage.GRAPH_RETRIEVING, AgenticStage.COMMUNITY_RETRIEVING,
+        AgenticStage.QUERY_FUSING,
+    },
+    AgenticStage.GRAPH_RETRIEVING: {
+        AgenticStage.COMMUNITY_RETRIEVING, AgenticStage.QUERY_FUSING,
+    },
+    AgenticStage.COMMUNITY_RETRIEVING: {AgenticStage.QUERY_FUSING},
+    AgenticStage.QUERY_FUSING: {AgenticStage.RERANKING},
     AgenticStage.RETRIEVING: {AgenticStage.RERANKING},
     AgenticStage.RERANKING: {AgenticStage.COVERAGE_CHECKING},
     AgenticStage.COVERAGE_CHECKING: {
+        AgenticStage.RETRIEVAL_DISPATCHING,
         AgenticStage.RETRIEVING,
         AgenticStage.CONTEXT_BUILDING,
     },
@@ -184,6 +233,8 @@ class AgenticRunHarness:
         self._state = AgenticStage.INITIALIZED
         self._traces: list[StageTrace] = []
         self._retrieval_rounds_used = 0
+        self._query_expansion_calls_used = 0
+        self._generated_query_count = 0
         self._structure_repairs_used = 0
         self._answer_repairs_used = 0
         self._pending_termination: TerminationReason | None = None
@@ -225,6 +276,21 @@ class AgenticRunHarness:
             raise HarnessConstraintError("检索轮数预算已耗尽。")
         self._retrieval_rounds_used += 1
         return self._retrieval_rounds_used
+
+    def begin_query_expansion(self) -> int:
+        if self._query_expansion_calls_used >= self.policy.max_query_expansion_calls:
+            self._pending_termination = TerminationReason.BUDGET_EXHAUSTED
+            raise HarnessConstraintError("query expansion budget exhausted")
+        self._query_expansion_calls_used += 1
+        return self._query_expansion_calls_used
+
+    def record_query_variants(self, count: int, *, focused: bool = False) -> None:
+        maximum = (self.policy.max_focused_queries_per_round if focused
+                   else self.policy.max_query_variants)
+        if count < 1 or count > maximum:
+            self._pending_termination = TerminationReason.BUDGET_EXHAUSTED
+            raise HarnessConstraintError("query variant budget exceeded")
+        self._generated_query_count += count
 
     def can_retrieve(self) -> bool:
         """判断是否仍允许执行补充检索。"""
@@ -322,6 +388,8 @@ class AgenticRunHarness:
             ),
             "budget": {
                 "retrieval_rounds_used": self._retrieval_rounds_used,
+                "query_expansion_calls_used": self._query_expansion_calls_used,
+                "generated_query_count": self._generated_query_count,
                 "structure_repairs_used": self._structure_repairs_used,
                 "answer_repairs_used": self._answer_repairs_used,
                 "elapsed_ms": self.elapsed_ms(),
