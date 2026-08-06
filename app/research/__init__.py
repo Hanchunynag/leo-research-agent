@@ -11,6 +11,13 @@ from app.research.harness import (
     RunTraceStore,
 )
 from app.research.memory import ResearchStateStore
+from app.research.providers import (
+    AcademicLiteratureProviderAdapter,
+    BootstrapProviderComposition,
+    CandidateKnowledgeRepository,
+    CanonicalDocumentParseProviderAdapter,
+    build_bootstrap_provider_composition,
+)
 from app.research.runtime import (
     HarnessAgentService,
     ResearchRuntime,
@@ -32,6 +39,10 @@ from app.research.workflows import (
 __all__ = [
     "BudgetExceeded",
     "AgenticReasoningGeneratorAdapter",
+    "AcademicLiteratureProviderAdapter",
+    "BootstrapProviderComposition",
+    "CandidateKnowledgeRepository",
+    "CanonicalDocumentParseProviderAdapter",
     "ClaimEvidenceValidator",
     "DeepResearchWorkflow",
     "DirectQAWorkflow",
@@ -52,6 +63,7 @@ __all__ = [
     "WorkflowName",
     "WorkflowRequest",
     "build_default_gateway",
+    "build_bootstrap_provider_composition",
     "build_harness_agent_service",
     "build_research_runtime",
     "unified_tool_handlers",

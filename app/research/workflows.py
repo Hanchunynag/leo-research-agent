@@ -300,6 +300,33 @@ class DeepResearchWorkflow(BaseWorkflow):
 class ResearchBootstrapWorkflow(BaseWorkflow):
     name = WorkflowName.RESEARCH_BOOTSTRAP
 
+    def _resolve_job_result(
+        self,
+        value: Mapping[str, Any],
+        request: Any,
+        harness: ResearchRunHarness,
+    ) -> tuple[Mapping[str, Any] | None, str | None]:
+        job_id = value.get("job_id")
+        if not job_id:
+            return value, None
+        status = self.gateway.invoke(
+            "job.get_status",
+            {"job_id": str(job_id)},
+            context=_tool_context(self.name, request),
+            harness=harness,
+        )
+        state = str(status.get("status") or "").casefold()
+        if state == "succeeded":
+            result = status.get("result")
+            if not isinstance(result, Mapping):
+                raise ValueError("已完成 Job 缺少结构化 result。")
+            return result, None
+        if state in {"failed", "cancelled"}:
+            raise RuntimeError(
+                f"Bootstrap Job {job_id} {state}: {status.get('error_type')}"
+            )
+        return None, str(job_id)
+
     def execute(self, request: Any, harness: ResearchRunHarness) -> WorkflowExecution:
         with harness.step("KNOWLEDGE_READINESS_CHECK"):
             scope = self._scope(request, harness)
@@ -355,14 +382,61 @@ class ResearchBootstrapWorkflow(BaseWorkflow):
                     context=_tool_context(self.name, request),
                     harness=harness,
                 )
+                downloaded_result, pending_job_id = self._resolve_job_result(
+                    downloaded, request, harness
+                )
+                if pending_job_id is not None:
+                    return WorkflowExecution(
+                        {
+                            "answerable": False,
+                            "claims": [],
+                            "refusal_reason": "文献下载已提交后台任务，完成后可恢复原问题。",
+                        },
+                        (),
+                        scope,
+                        (),
+                        {"sufficient": False},
+                        {
+                            "scope_proposal": proposal,
+                            "pending_job_id": pending_job_id,
+                            "pending_stage": "literature.download",
+                            "resumed_original_question": False,
+                        },
+                    )
+                assert downloaded_result is not None
                 parsed = self.gateway.invoke(
                     "document.parse",
-                    {"path": str(downloaded.get("path") or ""), "mode": "formal"},
+                    {
+                        "path": str(downloaded_result.get("path") or ""),
+                        "mode": "formal",
+                    },
                     context=_tool_context(self.name, request),
                     harness=harness,
                 )
-                if parsed.get("document_id"):
-                    ingested.append(str(parsed["document_id"]))
+                parsed_result, pending_job_id = self._resolve_job_result(
+                    parsed, request, harness
+                )
+                if pending_job_id is not None:
+                    return WorkflowExecution(
+                        {
+                            "answerable": False,
+                            "claims": [],
+                            "refusal_reason": "文献解析已提交后台任务，完成后可恢复原问题。",
+                        },
+                        (),
+                        scope,
+                        (),
+                        {"sufficient": False},
+                        {
+                            "scope_proposal": proposal,
+                            "pending_job_id": pending_job_id,
+                            "pending_stage": "document.parse",
+                            "resumed_original_question": False,
+                        },
+                    )
+                assert parsed_result is not None
+                if parsed_result.get("document_id"):
+                    ingested.append(str(parsed_result["document_id"]))
         resumed_request = request
         if ingested:
             updated_scope = self.gateway.invoke(
