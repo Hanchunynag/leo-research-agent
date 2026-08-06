@@ -214,7 +214,10 @@ class JobManager:
         return self.snapshot(job_id)
 
     def snapshot(self, job_id: str) -> JobSnapshot:
-        record = self.repository.get(job_id)
+        try:
+            record = self.repository.get(job_id)
+        except KeyError as error:
+            raise KeyError(f"任务不存在：{job_id}") from error
         kind = record.job_type.removeprefix("web.")
         events = [JobEvent(**dict(value)) for value in self.repository.list_events(job_id)]
         result: dict[str, Any] | None = None
@@ -245,5 +248,3 @@ class JobManager:
 
     def close(self) -> None:
         self._executor.shutdown(wait=True, cancel_futures=False)
-        if self._temporary is not None:
-            self._temporary.cleanup()
