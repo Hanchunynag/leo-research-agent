@@ -23,15 +23,33 @@ class UnifiedKnowledgeService:
         official_runtime: Any,
         evidence: EvidenceIntelligencePipeline,
         *,
+        official_engine_name: str = "legacy",
+        official_engine: Any | None = None,
+        official_generation_id: str | None = None,
         shadow_engine: Any | None = None,
+        shadow_engine_name: str | None = None,
+        shadow_generation_id: str | None = None,
         report_store: ShadowReportStore | None = None,
         workspace_id: str = "default",
         scope_version: int = 1,
         supports_advanced_retrieval: bool = False,
     ) -> None:
         self.official_runtime = official_runtime
+        if official_engine_name not in {"legacy", "lightrag"}:
+            raise ValueError(f"未知 Official Engine：{official_engine_name}")
+        if official_engine_name == "lightrag" and (
+            official_engine is None or not official_generation_id
+        ):
+            raise ValueError("LightRAG Official 必须提供 Engine 和 Generation Pin。")
+        self.official_engine_name = official_engine_name
+        self.official_engine = official_engine
+        self.official_generation_id = official_generation_id
         self.evidence = evidence
         self.shadow_engine = shadow_engine
+        self.shadow_engine_name = shadow_engine_name or (
+            "lightrag" if shadow_engine is not None else "none"
+        )
+        self.shadow_generation_id = shadow_generation_id
         self.report_store = report_store
         self.workspace_id = workspace_id
         self.scope_version = scope_version
@@ -72,6 +90,14 @@ class UnifiedKnowledgeService:
 
     def _govern(self, request: EvidenceRequest, values: Sequence[dict[str, Any]]) -> tuple[list[dict[str, Any]], tuple[CandidateEvidence, ...]]:
         candidates = tuple(self.mapper.candidate_from_mapping(request, value, fallback_rank=index) for index, value in enumerate(values, 1))
+        return self._govern_candidates(request, candidates)
+
+    def _govern_candidates(
+        self,
+        request: EvidenceRequest,
+        candidates: Sequence[CandidateEvidence],
+    ) -> tuple[list[dict[str, Any]], tuple[CandidateEvidence, ...]]:
+        candidates = tuple(candidates)
         bundle = self.evidence.verify(request, candidates)
         selected = self.evidence.select(request, bundle)
         output: list[dict[str, Any]] = []
@@ -101,7 +127,18 @@ class UnifiedKnowledgeService:
         if self.shadow_engine is None:
             return
         started = perf_counter()
-        raw_shadow = tuple(self.shadow_engine.retrieve_candidates(request))
+        if hasattr(self.shadow_engine, "retrieve_candidates"):
+            raw_shadow = tuple(self.shadow_engine.retrieve_candidates(request))
+        elif hasattr(self.shadow_engine, "retrieve"):
+            raw = self.shadow_engine.retrieve(request.query, limit=request.top_k)
+            values = raw.get("results", []) if isinstance(raw, dict) else []
+            raw_shadow = tuple(
+                self.mapper.candidate_from_mapping(request, value, fallback_rank=index)
+                for index, value in enumerate(values, 1)
+                if isinstance(value, dict)
+            )
+        else:
+            raise RuntimeError("Shadow Engine 不支持 retrieve_candidates/retrieve。")
         bundle = self.evidence.verify(request, raw_shadow)
         selected = self.evidence.select(request, bundle)
         shadow = tuple(value.evidence for value in selected)
@@ -130,22 +167,35 @@ class UnifiedKnowledgeService:
             scope_version=int(scope_version) if scope_version is not None else None,
         )
         started = perf_counter()
-        result = self.official_runtime.retrieve(query, **official_kwargs)
-        raw = result.get("results") if isinstance(result, dict) else None
-        values = [value for value in raw if isinstance(value, dict)] if isinstance(raw, list) else []
-        governed, candidates = self._govern(request, values)
+        if self.official_engine_name == "lightrag":
+            assert self.official_engine is not None
+            if getattr(self.official_engine, "serving_generation_id", None) != self.official_generation_id:
+                raise RuntimeError("LightRAG Engine 与 Official Generation Pin 不一致。")
+            candidates = tuple(self.official_engine.retrieve_candidates(request))
+            governed, candidates = self._govern_candidates(request, candidates)
+            result: dict[str, Any] = {
+                "retriever": "lightrag",
+                "results": governed,
+                "result_count": len(governed),
+            }
+        else:
+            result = self.official_runtime.retrieve(query, **official_kwargs)
+            raw = result.get("results") if isinstance(result, dict) else None
+            values = [value for value in raw if isinstance(value, dict)] if isinstance(raw, list) else []
+            governed, candidates = self._govern(request, values)
         official_ms = (perf_counter() - started) * 1000
         self.last_diagnostics = {
             **dict(getattr(self.official_runtime, "last_diagnostics", {})),
-            "official_engine": "legacy_adapter",
-            "active_engine": "legacy",
+            "official_engine": self.official_engine_name,
+            "official_generation_id": self.official_generation_id,
+            "active_engine": self.official_engine_name,
             "evidence_intelligence": dict(self.evidence.last_diagnostics),
         }
         self._shadow(request, candidates, official_ms)
         return {**result, "results": governed, "result_count": len(governed)}
 
     def retrieve_multi(self, queries: Sequence[str], *, limit: int = 40, rrf_k: int = 60) -> dict[str, Any]:
-        if hasattr(self.official_runtime, "retrieve_multi"):
+        if self.official_engine_name == "legacy" and hasattr(self.official_runtime, "retrieve_multi"):
             query = next(iter(queries), "")
             request = self._request(query, limit)
             started = perf_counter()
@@ -156,7 +206,8 @@ class UnifiedKnowledgeService:
             official_ms = (perf_counter() - started) * 1000
             self.last_diagnostics = {
                 **dict(getattr(self.official_runtime, "last_diagnostics", {})),
-                "official_engine": "legacy_adapter",
+                "official_engine": "legacy",
+                "official_generation_id": None,
                 "active_engine": "legacy",
                 "evidence_intelligence": dict(self.evidence.last_diagnostics),
             }
@@ -166,7 +217,7 @@ class UnifiedKnowledgeService:
         for query in queries:
             merged.extend(self.retrieve(query, limit=limit, rrf_k=rrf_k).get("results", []))
         unique = {str(value.get("evidence_id") or value.get("chunk_id")): value for value in merged}
-        return {"retriever": "unified_legacy", "results": list(unique.values())[:limit], "result_count": min(len(unique), limit), "diagnostics": self.last_diagnostics}
+        return {"retriever": f"unified_{self.official_engine_name}", "results": list(unique.values())[:limit], "result_count": min(len(unique), limit), "diagnostics": self.last_diagnostics}
 
     def close(self) -> None:
         close = getattr(self.official_runtime, "close", None)

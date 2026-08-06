@@ -63,6 +63,7 @@ class LightRAGKnowledgeEngine:
         generations: Any | None = None,
         client_config: LightRAGClientConfig | None = None,
         client_factory: ClientFactory | None = None,
+        serving_generation_id: str | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve()
         self.corpus = corpus or CanonicalCorpusService(self.project_root)
@@ -72,6 +73,7 @@ class LightRAGKnowledgeEngine:
 
             generations = IndexGenerationRepository(self.project_root)
         self.generations = generations
+        self.serving_generation_id = serving_generation_id
         if client_factory is None and client_config is None:
             raise ValueError("必须提供 LightRAGClientConfig 或 client_factory。")
         self.client_factory = client_factory or client_config.create  # type: ignore[union-attr]
@@ -219,9 +221,23 @@ class LightRAGKnowledgeEngine:
         return self.retrieve_candidates(request)
 
     def retrieve_candidates(self, request: EvidenceRequest) -> Sequence[CandidateEvidence]:
-        generation = self.generations.active(request.workspace_id)
+        generation = (
+            self.generations.get(self.serving_generation_id)
+            if self.serving_generation_id is not None
+            else self.generations.active(request.workspace_id)
+        )
         if generation is None:
+            if self.serving_generation_id is not None:
+                raise RuntimeError(
+                    f"Pinned LightRAG generation 不存在：{self.serving_generation_id}"
+                )
             return ()
+        if generation.workspace_id != request.workspace_id:
+            raise PermissionError("Pinned generation workspace 与请求不一致。")
+        if generation.state not in {"active", "retired"}:
+            raise RuntimeError(
+                f"Pinned generation 状态不可服务：{generation.state}"
+            )
         if generation.scope_version != request.scope_version:
             raise ValueError("请求 scope_version 与 active generation 不一致。")
         profile = IndexProfile(
@@ -337,6 +353,7 @@ class LightRAGKnowledgeEngine:
     def get_status(self) -> Mapping[str, Any]:
         return {
             "engine": "lightrag",
+            "serving_generation_id": self.serving_generation_id,
             "active_generations": {value.workspace_id: value.generation_id for value in self.generations.list() if value.state == "active"},
             "generations": [value.generation_id for value in self.generations.list()],
         }
