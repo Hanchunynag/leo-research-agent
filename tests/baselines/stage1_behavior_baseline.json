@@ -1,0 +1,120 @@
+{
+  "schema_version": "1.0",
+  "captured_on": "2026-08-06",
+  "scope": "stage1-current-behavior",
+  "corpus": {
+    "document_count": 7,
+    "section_count": 122,
+    "searchable_block_count": 797,
+    "chunk_count": 135,
+    "chunks_sha256": "ea590e61f7a3c6e99ab07e912f12b535d8633bafc40c13832e1ff375d95097ab"
+  },
+  "indexes": {
+    "legacy_bm25_document_count": 135,
+    "legacy_dense_chunk_count": 135,
+    "legacy_dense_vector_dimension": 1024,
+    "legacy_dense_model": "BAAI/bge-m3",
+    "legacy_dense_revision": "5617a9f61b028005a4858fdac845db406aefb181",
+    "active_graphrag_epoch": null,
+    "graphrag_epoch_count": 0
+  },
+  "retrieval_evaluation": {
+    "question_count": 21,
+    "artifacts": {
+      "bm25": {
+        "path": "data/evaluation/bm25_baseline.json",
+        "sha256": "ef89e2084df70e9b545495e0efa270cde45b1899d7d1d86ee2df97d169cbaadf",
+        "metrics": {"mrr": 0.513681, "ndcg@10": 0.568536, "recall@10": 0.785714}
+      },
+      "dense": {
+        "path": "data/evaluation/dense_baseline.json",
+        "sha256": "fd8c2e24acaeadfb15f1ecaa4369ade6d57c166fe88f51a665abed610ffa1aa5",
+        "metrics": {"mrr": 0.448016, "ndcg@10": 0.544102, "recall@10": 0.833333}
+      },
+      "rrf": {
+        "path": "data/evaluation/rrf_baseline.json",
+        "sha256": "a4569f4c5c843d0d8dbf57b45ba914b3ea29e851b23406584a3602f64ed96a7f",
+        "metrics": {"mrr": 0.540873, "ndcg@10": 0.623224, "recall@10": 0.880952}
+      },
+      "reranker": {
+        "path": "data/evaluation/reranker_baseline.json",
+        "sha256": "8cc0aecc1c83638c8888f53cfdabe3f8fc86d430eb8b1ffd3453cc8de4e7d1bc",
+        "metrics": {"mrr": 0.710979, "ndcg@10": 0.741598, "recall@10": 0.928571},
+        "latency_ms": {
+          "candidate_mean": 136.741,
+          "reranking_mean": 14010.145,
+          "total_mean": 14146.983,
+          "total_p50": 14346.666,
+          "total_p95": 17299.847
+        }
+      }
+    },
+    "representative_top_10": {
+      "question_id": "Q001",
+      "question": "When ground-truth satellite ephemerides are unavailable, what target is used to train the orbit-prediction neural network?",
+      "relevant_document_ids": ["D_060e764f208c"],
+      "relevant_chunk_ids": ["D_060e764f208c_cp02_c000012"],
+      "bm25": [
+        "D_060e764f208c_cp02_c000015", "D_060e764f208c_cp02_c000012",
+        "D_060e764f208c_cp02_c000004", "D_060e764f208c_cp02_c000021",
+        "D_fa1317a2ed10_cp02_c000010", "D_060e764f208c_cp02_c000002",
+        "D_060e764f208c_cp02_c000011", "D_060e764f208c_cp02_c000003",
+        "D_d113a234a7c3_cp02_c000024", "D_fa1317a2ed10_cp02_c000009"
+      ],
+      "dense": [
+        "D_060e764f208c_cp02_c000012", "D_060e764f208c_cp02_c000004",
+        "D_060e764f208c_cp02_c000002", "D_060e764f208c_cp02_c000001",
+        "D_060e764f208c_cp02_c000011", "D_2e250a42c5f9_cp02_c000001",
+        "D_060e764f208c_cp02_c000003", "D_d113a234a7c3_cp02_c000001",
+        "D_060e764f208c_cp02_c000013", "D_060e764f208c_cp02_c000021"
+      ],
+      "rrf": [
+        "D_060e764f208c_cp02_c000012", "D_060e764f208c_cp02_c000004",
+        "D_060e764f208c_cp02_c000002", "D_060e764f208c_cp02_c000011",
+        "D_060e764f208c_cp02_c000021", "D_060e764f208c_cp02_c000003",
+        "D_060e764f208c_cp02_c000015", "D_060e764f208c_cp02_c000001",
+        "D_2e250a42c5f9_cp02_c000001", "D_d113a234a7c3_cp02_c000005"
+      ],
+      "reranker": [
+        "D_060e764f208c_cp02_c000012", "D_060e764f208c_cp02_c000002",
+        "D_060e764f208c_cp02_c000004", "D_d113a234a7c3_cp02_c000024",
+        "D_060e764f208c_cp02_c000003", "D_060e764f208c_cp02_c000001",
+        "D_2c0f609ffedb_cp02_c000003", "D_060e764f208c_cp02_c000021",
+        "D_060e764f208c_cp02_c000011", "D_f66bd01d218d_cp02_c000002"
+      ]
+    }
+  },
+  "answer_and_citation_history": {
+    "session_count": 7,
+    "topic_count": 7,
+    "evidence_registry_count": 62,
+    "answer_event_count": 8,
+    "answerable_event_count": 1,
+    "validation_event_count": 8,
+    "structurally_valid_count": 5,
+    "structural_valid_rate": 0.625,
+    "claim_count": 14,
+    "citation_record_count": 5,
+    "citation_records_per_claim": 0.357143,
+    "metric_caveat": "History includes fail-closed refusals; this is not answered-run citation recall."
+  },
+  "usage": {
+    "llm_call_count": null,
+    "token_usage": null,
+    "reason": "Provider usage is available on some generation responses but is not uniformly aggregated or persisted across routing, coverage, validation, repair, graph extraction and community reporting."
+  },
+  "behavior_inventory": [
+    {"id": "pdf_parse", "status": "automated", "tests": ["tests/test_pipeline.py", "tests/test_pipeline_errors.py"]},
+    {"id": "canonical_chunk", "status": "automated", "tests": ["tests/test_knowledge_retrieval.py"]},
+    {"id": "bm25", "status": "automated_and_snapshot", "tests": ["tests/test_knowledge_retrieval.py", "data/evaluation/bm25_baseline.json"]},
+    {"id": "dense", "status": "automated_and_snapshot", "tests": ["tests/test_dense_retrieval.py", "data/evaluation/dense_baseline.json"]},
+    {"id": "graph_relation", "status": "unit_automated_e2e_pending", "tests": ["tests/test_stage1_behavior_baseline.py", "tests/test_graphrag_integration.py"]},
+    {"id": "rrf_reranker", "status": "automated_and_snapshot", "tests": ["tests/test_dense_retrieval.py", "tests/test_reranking.py", "data/evaluation/rrf_baseline.json", "data/evaluation/reranker_baseline.json"]},
+    {"id": "ordinary_qa", "status": "automated", "tests": ["tests/test_generation.py", "tests/test_agentic_rag.py"]},
+    {"id": "relationship_qa", "status": "graph_branch_automated_e2e_pending", "tests": ["tests/test_stage1_behavior_baseline.py"]},
+    {"id": "citation_mapping", "status": "automated", "tests": ["tests/test_generation.py", "tests/test_agentic_rag.py"]},
+    {"id": "add_paper", "status": "automated", "tests": ["tests/test_web_api.py", "tests/test_pipeline.py"]},
+    {"id": "delete_paper", "status": "unsupported_current_behavior", "tests": []},
+    {"id": "job_state_after_restart", "status": "automated_volatile", "tests": ["tests/test_stage1_behavior_baseline.py"]}
+  ]
+}

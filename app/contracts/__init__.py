@@ -1,0 +1,63 @@
+"""统一领域模型、服务 Protocol 与阶段一 Legacy Adapter。"""
+
+from app.contracts.adapters import (
+    LegacyAgentRuntimeAdapter,
+    LegacyEvidenceMapper,
+    LegacyKnowledgeEngineAdapter,
+)
+from app.contracts.domain import (
+    AgentRun,
+    CandidateEvidence,
+    ContextPack,
+    Document,
+    EvidenceDirectness,
+    EvidenceGrade,
+    EvidenceRequest,
+    EvidenceState,
+    IndexGeneration,
+    IndexProfile,
+    ResearchDirection,
+    ResearchScope,
+    ResearchWorkspace,
+    SelectedEvidence,
+    VerifiedEvidence,
+    VerifiedEvidenceBundle,
+    Work,
+    WorkspaceDocument,
+)
+from app.contracts.protocols import (
+    ContextBuilder,
+    EvidenceIntelligenceService,
+    KnowledgeEngine,
+    ResearchHarness,
+    ToolGateway,
+)
+
+__all__ = [
+    "AgentRun",
+    "CandidateEvidence",
+    "ContextBuilder",
+    "ContextPack",
+    "Document",
+    "EvidenceDirectness",
+    "EvidenceGrade",
+    "EvidenceIntelligenceService",
+    "EvidenceRequest",
+    "EvidenceState",
+    "IndexGeneration",
+    "IndexProfile",
+    "KnowledgeEngine",
+    "LegacyAgentRuntimeAdapter",
+    "LegacyEvidenceMapper",
+    "LegacyKnowledgeEngineAdapter",
+    "ResearchDirection",
+    "ResearchScope",
+    "ResearchHarness",
+    "ResearchWorkspace",
+    "SelectedEvidence",
+    "ToolGateway",
+    "VerifiedEvidence",
+    "VerifiedEvidenceBundle",
+    "Work",
+    "WorkspaceDocument",
+]
