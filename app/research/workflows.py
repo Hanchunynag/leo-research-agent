@@ -145,6 +145,7 @@ class BaseWorkflow:
         usage = draft.get("usage") if isinstance(draft, Mapping) else None
         if isinstance(usage, Mapping):
             harness.consume("total_tokens", int(usage.get("total_tokens") or 0))
+            harness.record_provider_usage("answer_generation", dict(usage))
         return dict(draft)
 
 

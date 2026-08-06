@@ -141,6 +141,8 @@ class ResearchRunHarness:
         self.state_history: list[str] = [self.state.value]
         self.trace: list[TraceEvent] = []
         self.recovery_actions: list[dict[str, Any]] = []
+        self.context_usage: dict[str, int] = {}
+        self.provider_usage: list[dict[str, Any]] = []
         self.termination_reason: str | None = None
         self._started = perf_counter()
 
@@ -195,6 +197,24 @@ class ResearchRunHarness:
             )
         )
 
+    def record_context(self, audience: str, token_count: int) -> None:
+        if token_count < 0:
+            raise ValueError("Context token_count 不能为负数。")
+        self.consume("context_tokens", token_count)
+        self.consume("total_tokens", token_count)
+        self.context_usage[audience] = self.context_usage.get(audience, 0) + token_count
+
+    def record_provider_usage(
+        self, stage: str, usage: dict[str, Any]
+    ) -> None:
+        safe = {
+            str(key): value
+            for key, value in usage.items()
+            if isinstance(value, (int, float, str, bool)) or value is None
+        }
+        safe["stage"] = stage
+        self.provider_usage.append(safe)
+
     def recover(self, level: RecoveryLevel, action: str, *, outcome: str) -> None:
         if self.state != HarnessState.RECOVERING:
             raise HarnessError("Recovery action 只能在 RECOVERING 状态记录。")
@@ -226,6 +246,8 @@ class ResearchRunHarness:
             "state_history": list(self.state_history),
             "policy": asdict(self.policy),
             "usage": asdict(self.usage),
+            "context_usage": dict(self.context_usage),
+            "provider_usage": list(self.provider_usage),
             "trace": [asdict(item) for item in self.trace],
             "recovery_actions": list(self.recovery_actions),
             "termination_reason": self.termination_reason,

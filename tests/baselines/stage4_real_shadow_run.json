@@ -1,0 +1,45 @@
+{
+  "schema_version": "1.0",
+  "captured_on": "2026-08-06",
+  "measurement_source": "real_lightrag_shadow_provider",
+  "command": "PYTHONPATH=. .venv/bin/python scripts/evaluate_stage2_shadow.py",
+  "dataset": {
+    "retrieval_questions": 21,
+    "relation_questions": 8,
+    "confirmed_relation_questions": 0
+  },
+  "quality": {
+    "legacy_direct_ndcg_at_10": 0.6219670953720152,
+    "lightrag_direct_ndcg_at_10": 0.4910431522189493,
+    "source_backfill_rate": 1.0,
+    "workspace_leakage_count": 0,
+    "excluded_evidence_leakage_count": 0
+  },
+  "provider_usage": {
+    "llm_calls": 28,
+    "llm_failures": 0,
+    "llm_retries": 0,
+    "prompt_tokens": 18395,
+    "completion_tokens": 1214,
+    "total_tokens": 19609,
+    "embedding_calls": 29,
+    "embedded_texts": 85
+  },
+  "elapsed_seconds": 51.106,
+  "llm_cache_hit": false,
+  "monetary_cost": null,
+  "monetary_cost_reason": "Provider price was not configured; no currency cost was fabricated.",
+  "acceptance": {
+    "passed": false,
+    "official_cutover_approved": false,
+    "failed_checks": [
+      "relation_dataset_confirmed",
+      "direct_qa_ndcg",
+      "relation_path_precision",
+      "relation_coverage",
+      "incremental_no_unrelated_reprocess",
+      "delete_no_residual",
+      "legacy_rollback_smoke"
+    ]
+  }
+}

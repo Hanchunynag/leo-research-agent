@@ -62,8 +62,7 @@ class ResearchContextManager:
         rendered = f"{query}\n{dict(workspace_summary)}\n{recent}"
         count = token_count(rendered)
         if harness is not None:
-            harness.consume("context_tokens", count)
-            harness.consume("total_tokens", count)
+            harness.record_context("router", count)
         return PhaseContextPack(
             context_id=f"RC_{secrets.token_hex(8)}",
             audience="router",
@@ -99,8 +98,13 @@ class ResearchContextManager:
         rendered = f"{query}\n{tuple(scope_constraints)}\n{selected}\n{list(conflicts)}\n{dict(output_format)}"
         count = token_count(rendered)
         if harness is not None:
-            harness.consume("context_tokens", count)
-            harness.consume("total_tokens", count)
+            harness.record_context("generator", count)
+            selected_tokens = token_count(
+                "\n".join(str(value.get("content") or "") for value in selected)
+            )
+            harness.context_usage["selected_evidence"] = (
+                harness.context_usage.get("selected_evidence", 0) + selected_tokens
+            )
         return PhaseContextPack(
             context_id=f"GC_{secrets.token_hex(8)}",
             audience="generator",

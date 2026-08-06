@@ -7,8 +7,16 @@ from app.evaluation.retrieval import (
     evaluate_hybrid_rrf,
     evaluate_reranked,
 )
+from app.evaluation.costs import (
+    ProviderPricing,
+    RealCostMetricsCollector,
+    RealRunCostMetrics,
+)
 
 __all__ = [
+    "ProviderPricing",
+    "RealCostMetricsCollector",
+    "RealRunCostMetrics",
     "evaluate_bm25",
     "evaluate_candidate_pool_oracle",
     "evaluate_dense",
