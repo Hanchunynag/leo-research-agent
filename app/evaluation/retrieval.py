@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -28,6 +28,11 @@ class RetrievalQuestion:
     relevant_document_ids: list[str]
     relevant_block_ids: list[str]
     question_type: str
+    workspace_id: str = "default"
+    relevant_chunk_ids: list[str] = field(default_factory=list)
+    acceptable_evidence_ids: list[str] = field(default_factory=list)
+    excluded_document_ids: list[str] = field(default_factory=list)
+    notes: str = ""
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> RetrievalQuestion:
@@ -45,24 +50,41 @@ class RetrievalQuestion:
                 raise ValueError(f"{field} 必须是非空字符串数组。")
             return list(dict.fromkeys(item))
 
+        raw_question = value.get("query", value.get("question"))
         question = cls(
             question_id=required_text("question_id"),
-            question=required_text("question"),
+            question=(
+                str(raw_question).strip()
+                if isinstance(raw_question, str) and raw_question.strip()
+                else required_text("question")
+            ),
             relevant_work_ids=string_list("relevant_work_ids"),
             relevant_document_ids=string_list("relevant_document_ids"),
             relevant_block_ids=string_list("relevant_block_ids"),
             question_type=required_text("question_type"),
+            workspace_id=(
+                str(value.get("workspace_id") or "default").strip()
+            ),
+            relevant_chunk_ids=string_list("relevant_chunk_ids"),
+            acceptable_evidence_ids=string_list("acceptable_evidence_ids"),
+            excluded_document_ids=string_list("excluded_document_ids"),
+            notes=str(value.get("notes") or "").strip(),
         )
         if not (
-            question.relevant_block_ids
+            question.relevant_chunk_ids
+            or question.relevant_block_ids
             or question.relevant_document_ids
             or question.relevant_work_ids
         ):
             raise ValueError("至少需要一种 relevant identity。")
+        if not question.workspace_id:
+            raise ValueError("workspace_id 不能为空。")
         return question
 
     @property
     def target_level(self) -> str:
+        if self.relevant_chunk_ids:
+            return "chunk"
         if self.relevant_block_ids:
             return "block"
         if self.relevant_document_ids:
@@ -71,6 +93,8 @@ class RetrievalQuestion:
 
     @property
     def target_ids(self) -> set[str]:
+        if self.relevant_chunk_ids:
+            return set(self.relevant_chunk_ids)
         if self.relevant_block_ids:
             return set(self.relevant_block_ids)
         if self.relevant_document_ids:
@@ -107,6 +131,9 @@ def load_retrieval_questions(path: Path) -> list[RetrievalQuestion]:
 
 
 def chunk_evidence_ids(chunk: dict[str, Any], level: str) -> set[str]:
+    if level == "chunk":
+        chunk_id = chunk.get("chunk_id")
+        return {chunk_id} if isinstance(chunk_id, str) else set()
     if level == "work":
         work_id = chunk.get("work_id")
         return {work_id} if isinstance(work_id, str) else set()
