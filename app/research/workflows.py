@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Any, Mapping, Protocol, Sequence
 
 from app.research.context import PhaseContextPack, ResearchContextManager
+from app.research.coverage import DimensionCoverageAnalyzer, QueryFrameBuilder
 from app.research.harness import HarnessState, RecoveryLevel, ResearchRunHarness
 from app.research.tools import ToolGatewayRegistry
 
@@ -182,20 +183,23 @@ class DirectQAWorkflow(BaseWorkflow):
 class RelationReasoningWorkflow(BaseWorkflow):
     name = WorkflowName.RELATION_REASONING
 
-    @staticmethod
-    def _sufficient(evidence: Sequence[Mapping[str, Any]]) -> bool:
-        direct = [value for value in evidence if value.get("directness") in {"direct", "indirect"}]
-        return len(evidence) >= 2 and bool(direct)
-
     def execute(self, request: Any, harness: ResearchRunHarness) -> WorkflowExecution:
         with harness.step("SCOPE_CHECK"):
             scope = self._scope(request, harness)
         with harness.step("QUERY_FRAME"):
-            framed = f"关系与机制：{request.query}"
+            query_frame = QueryFrameBuilder().build(request.query)
+            framed = (
+                f"关系与机制：{request.query}；必需维度："
+                + ", ".join(query_frame.required_dimensions)
+            )
         with harness.step("RELATIONAL_RETRIEVE"):
             retrieval = self._retrieve(request, harness, framed)
             evidence = list(_selected(retrieval))
-        sufficient = self._sufficient(evidence)
+        conflicts = _conflicts(retrieval)
+        coverage = DimensionCoverageAnalyzer().evaluate(
+            query_frame, evidence, conflicts
+        )
+        sufficient = coverage.overall_sufficient and len(evidence) >= 2
         gap_failed = False
         if not sufficient and harness.usage.retrieval_rounds < harness.policy.max_retrieval_rounds:
             self._record_recovery(
@@ -206,7 +210,13 @@ class RelationReasoningWorkflow(BaseWorkflow):
             )
             with harness.step("OPTIONAL_GAP_RETRIEVE"):
                 try:
-                    gap = self._retrieve(request, harness, f"限定证据缺口：{request.query}")
+                    gap = self._retrieve(
+                        request,
+                        harness,
+                        "限定证据缺口："
+                        + ", ".join(coverage.missing_dimensions)
+                        + f"；原问题：{request.query}",
+                    )
                 except (ConnectionError, TimeoutError, OSError):
                     gap_failed = True
                     self._degrade_and_continue(harness, "continue_after_gap_retrieval_failure")
@@ -215,10 +225,18 @@ class RelationReasoningWorkflow(BaseWorkflow):
                     evidence.extend(
                         value for value in _selected(gap) if str(value.get("evidence_id")) not in seen
                     )
-                    sufficient = self._sufficient(evidence)
-        conflicts = _conflicts(retrieval)
+                    coverage = DimensionCoverageAnalyzer().evaluate(
+                        query_frame, evidence, conflicts
+                    )
+                    sufficient = coverage.overall_sufficient and len(evidence) >= 2
         with harness.step("EVIDENCE_EVALUATE") as trace:
-            trace.update({"selected_count": len(evidence), "coverage_sufficient": sufficient})
+            trace.update(
+                {
+                    "selected_count": len(evidence),
+                    "coverage_sufficient": sufficient,
+                    "missing_dimensions": list(coverage.missing_dimensions),
+                }
+            )
         draft: Mapping[str, Any]
         if not evidence:
             draft = {"answerable": False, "claims": [], "refusal_reason": "关系证据不足。"}
@@ -230,10 +248,11 @@ class RelationReasoningWorkflow(BaseWorkflow):
             tuple(evidence),
             scope,
             conflicts,
-            {"sufficient": sufficient},
+            {**coverage.to_dict(), "sufficient": sufficient},
             {
                 "gap_retrievals": max(0, harness.usage.retrieval_rounds - 1),
                 "gap_retrieval_failed": gap_failed,
+                "query_frame": query_frame.to_dict(),
             },
         )
 

@@ -2,6 +2,12 @@
 
 from app.research.adapters import AgenticReasoningGeneratorAdapter
 from app.research.context import PhaseContextPack, ResearchContextManager
+from app.research.coverage import (
+    DimensionCoverageAnalyzer,
+    DimensionCoverageReport,
+    QueryFrame,
+    QueryFrameBuilder,
+)
 from app.research.harness import (
     BudgetExceeded,
     HarnessState,
@@ -45,10 +51,14 @@ __all__ = [
     "CanonicalDocumentParseProviderAdapter",
     "ClaimEvidenceValidator",
     "DeepResearchWorkflow",
+    "DimensionCoverageAnalyzer",
+    "DimensionCoverageReport",
     "DirectQAWorkflow",
     "HarnessAgentService",
     "HarnessState",
     "PhaseContextPack",
+    "QueryFrame",
+    "QueryFrameBuilder",
     "RecoveryLevel",
     "RelationReasoningWorkflow",
     "ResearchBootstrapWorkflow",
