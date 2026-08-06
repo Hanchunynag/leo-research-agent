@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0",
+  "thresholds": {
+    "minimum_retrieval_questions": 21,
+    "minimum_confirmed_relation_questions": 8,
+    "workspace_leakage_max": 0,
+    "excluded_evidence_leakage_max": 0,
+    "source_backfill_rate_min": 0.95,
+    "direct_qa_ndcg_ratio_min": 0.95,
+    "relation_path_precision_min": 0.8,
+    "relation_coverage_ratio_min": 1.0,
+    "unrelated_reprocessed_documents_max": 0,
+    "delete_residual_max": 0,
+    "require_legacy_rollback_smoke": true,
+    "require_failure_diagnostics": true
+  }
+}

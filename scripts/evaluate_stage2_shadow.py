@@ -16,8 +16,11 @@ from app.contracts import CandidateEvidence, EvidenceRequest, VerifiedEvidence
 from app.contracts.adapters import LegacyKnowledgeEngineAdapter
 from app.corpus import CanonicalCorpusService
 from app.embeddings.bge_m3 import BGEM3Config, BGEM3EmbeddingProvider
+from app.evaluation.acceptance import CutoverAcceptanceConfig, evaluate_cutover
+from app.evaluation.retrieval import load_retrieval_questions
 from app.evaluation.shadow import compare_retrievals
-from app.evidence import EvidenceIntelligencePipeline
+from app.evaluation.stage4 import load_relation_questions, relation_quality
+from app.evidence import EvidenceIntelligencePipeline, SelectedEvidenceContextBuilder
 from app.generation.openai_compatible import (
     OpenAICompatibleAnswerProvider,
     OpenAICompatibleConfig,
@@ -33,18 +36,6 @@ from app.runtime.retrieval import RetrievalRuntime
 from app.storage import write_json_atomic
 from app.web.runtime import WebRuntimeConfig
 from app.workspaces import WorkspaceService
-
-
-REPRESENTATIVE_QUERY = (
-    "When ground-truth satellite ephemerides are unavailable, what target is used "
-    "to train the orbit-prediction neural network?"
-)
-RELATION_QUERY = (
-    "How are LEO-NNPON, SGP4, and TLE data related when training an orbit-prediction "
-    "neural network without ground-truth satellite ephemerides?"
-)
-REPRESENTATIVE_RELEVANT = {"D_060e764f208c_cp02_c000012"}
-GRAPH_BACKFILL_THRESHOLD = 0.95
 
 
 def _usage_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
@@ -79,6 +70,8 @@ def _evaluate_query(
     query_id: str,
     query: str,
     relevant: set[str] | None,
+    relevant_documents: set[str] | None,
+    excluded_documents: set[str] | None,
     workspace_id: str,
     scope_version: int,
     official: LegacyKnowledgeEngineAdapter,
@@ -109,9 +102,19 @@ def _evaluate_query(
     shadow_ms = (perf_counter() - shadow_started) * 1000
     query_usage = _usage_delta(before, usage.to_dict())
 
+    evidence_started = perf_counter()
     bundle = evidence.verify(request, shadow_candidates)
     verified = tuple(bundle.evidence)
-    selected = tuple(value.evidence for value in evidence.select(request, bundle))
+    selected_values = tuple(evidence.select(request, bundle))
+    selected = tuple(value.evidence for value in selected_values)
+    evidence_ms = (perf_counter() - evidence_started) * 1000
+    context_started = perf_counter()
+    context = SelectedEvidenceContextBuilder().build(
+        request,
+        selected_values,
+        token_budget=int(request.retrieval_options.get("token_budget", 100_000)),
+    )
+    context_ms = (perf_counter() - context_started) * 1000
     diagnostics = dict(evidence.last_diagnostics)
     comparison = compare_retrievals(
         query,
@@ -119,6 +122,8 @@ def _evaluate_query(
         selected,
         k=request.top_k,
         relevant_chunk_ids=relevant,
+        relevant_document_ids=relevant_documents,
+        excluded_document_ids=excluded_documents,
         official_elapsed_ms=official_ms,
         shadow_elapsed_ms=shadow_ms,
         shadow_diagnostics=diagnostics,
@@ -134,12 +139,18 @@ def _evaluate_query(
     comparison["shadow"]["selected"] = _verified_summary(selected)
     comparison["shadow"]["rejected_candidate_ids"] = list(bundle.rejected_candidate_ids)
     comparison["shadow"]["evidence_diagnostics"] = diagnostics
+    comparison["shadow"]["evidence_intelligence_elapsed_ms"] = evidence_ms
+    comparison["shadow"]["context_build_elapsed_ms"] = context_ms
+    comparison["shadow"]["selected_evidence_tokens"] = context.token_count
+    comparison["shadow"]["relation_paths"] = [
+        list(value.relation_path) for value in selected if value.relation_path
+    ]
     return comparison
 
 
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
-    output = root / "data" / "evaluation" / "stage2_shadow_comparison.json"
+    output = root / "data" / "evaluation" / "stage4_shadow_acceptance.json"
     prior_report: dict[str, Any] = {}
     if output.is_file():
         value = json.loads(output.read_text(encoding="utf-8"))
@@ -211,47 +222,116 @@ def main() -> None:
         max_selected_per_document=100,
     )
 
+    retrieval_questions = load_retrieval_questions(
+        root / "data" / "evaluation" / "retrieval_questions.jsonl"
+    )
+    relation_questions = load_relation_questions(
+        root / "data" / "evaluation" / "relation_questions.jsonl"
+    )
     started = perf_counter()
     reports = [
         _evaluate_query(
-            query_id="Q001",
-            query=REPRESENTATIVE_QUERY,
-            relevant=REPRESENTATIVE_RELEVANT,
+            query_id=question.question_id,
+            query=question.question,
+            relevant=set(question.relevant_chunk_ids),
+            relevant_documents=set(question.relevant_document_ids),
+            excluded_documents=set(question.excluded_document_ids),
             workspace_id=workspace.workspace_id,
             scope_version=workspace.scope_version,
             official=legacy,
             shadow=shadow,
             evidence=evidence,
             usage=usage,
-        ),
-        _evaluate_query(
-            query_id="REL001",
-            query=RELATION_QUERY,
-            relevant=None,
-            workspace_id=workspace.workspace_id,
-            scope_version=workspace.scope_version,
-            official=legacy,
-            shadow=shadow,
-            evidence=evidence,
-            usage=usage,
-        ),
+        )
+        for question in retrieval_questions
     ]
-    relation = reports[1]["shadow"]
-    graph_count = int(relation["evidence_diagnostics"].get("graph_candidate_count") or 0)
-    backfill_rate = relation.get("graph_backfill_rate")
-    acceptance = {
-        "representative_recall_preserved": reports[0]["shadow"]["recall_at_k"] == 1.0,
-        "relation_candidates_present": graph_count > 0,
-        "graph_backfill_threshold": GRAPH_BACKFILL_THRESHOLD,
-        "graph_backfill_passed": isinstance(backfill_rate, (int, float))
-        and backfill_rate >= GRAPH_BACKFILL_THRESHOLD,
-        "cross_workspace_leakage_passed": all(
-            value["shadow"]["cross_workspace_leakage_count"] == 0 for value in reports
-        ),
+    relation_reports = []
+    for question in relation_questions:
+        value = _evaluate_query(
+            query_id=question.question_id,
+            query=question.query,
+            relevant=set(question.source_chunk_ids) or None,
+            relevant_documents=None,
+            excluded_documents=None,
+            workspace_id=workspace.workspace_id,
+            scope_version=workspace.scope_version,
+            official=legacy,
+            shadow=shadow,
+            evidence=evidence,
+            usage=usage,
+        )
+        value["relation_quality"] = relation_quality(
+            question,
+            predicted_paths=value["shadow"]["relation_paths"],
+            selected_evidence_ids=value["shadow"]["selected"]["evidence_ids"],
+        )
+        relation_reports.append(value)
+
+    def average(values: list[Any]) -> float | None:
+        numeric = [float(value) for value in values if isinstance(value, (int, float))]
+        return sum(numeric) / len(numeric) if numeric else None
+
+    all_reports = reports + relation_reports
+    graph_counts = [
+        int(value["shadow"]["evidence_diagnostics"].get("graph_candidate_count") or 0)
+        for value in all_reports
+    ]
+    graph_backfills = [
+        int(value["shadow"]["evidence_diagnostics"].get("graph_backfilled_count") or 0)
+        for value in all_reports
+    ]
+    evaluation_summary = {
+        "dataset": {
+            "retrieval_question_count": len(retrieval_questions),
+            "relation_question_count": len(relation_questions),
+            "confirmed_relation_question_count": sum(
+                value.annotation_status == "confirmed" for value in relation_questions
+            ),
+        },
+        "quality": {
+            "legacy_direct_ndcg_at_10": average(
+                [value["official"].get("ndcg_at_10") for value in reports]
+            ),
+            "lightrag_direct_ndcg_at_10": average(
+                [value["shadow"].get("ndcg_at_10") for value in reports]
+            ),
+            "relation_path_precision": average(
+                [value["relation_quality"].get("relation_path_precision") for value in relation_reports]
+            ),
+            "legacy_relation_coverage": average(
+                [value["official"].get("chunk_hit_rate") for value in relation_reports]
+            ),
+            "lightrag_relation_coverage": average(
+                [value["relation_quality"].get("relation_path_coverage") for value in relation_reports]
+            ),
+        },
+        "safety": {
+            "workspace_leakage_count": sum(
+                int(value["shadow"]["cross_workspace_leakage_count"])
+                for value in all_reports
+            ),
+            "excluded_evidence_leakage_count": sum(
+                int(value["shadow"]["excluded_evidence_leakage_count"])
+                for value in all_reports
+            ),
+            "source_backfill_rate": sum(graph_backfills) / sum(graph_counts)
+            if sum(graph_counts)
+            else None,
+        },
+        # 这些结果由独立增量、删除、回滚验收合并；缺失时必须 fail closed。
+        "incremental": {},
+        "deletion": {},
+        "rollback": {},
+        "diagnostics": {
+            "all_failures_classified": all(
+                isinstance(value.get("shadow"), dict) for value in all_reports
+            )
+        },
     }
-    acceptance["passed"] = all(
-        value for key, value in acceptance.items() if key.endswith("_passed") or key in {"representative_recall_preserved", "relation_candidates_present"}
+    acceptance_config = CutoverAcceptanceConfig.load(
+        root / "tests" / "baselines" / "lightrag_cutover_acceptance.json"
     )
+    acceptance = evaluate_cutover(acceptance_config, evaluation_summary)
     aggregate_usage = usage.to_dict()
     prior_usage = prior_report.get("cold_query_usage_observed")
     if not isinstance(prior_usage, dict) or int(prior_usage.get("llm_calls") or 0) < 1:
@@ -275,6 +355,8 @@ def main() -> None:
             "profile_id": active.index_profile_id,
         },
         "queries": reports,
+        "relation_queries": relation_reports,
+        **evaluation_summary,
         "aggregate_usage": aggregate_usage,
         "cold_query_usage_observed": cold_usage,
         "llm_cache_hit": aggregate_usage["llm_calls"] == 0,
