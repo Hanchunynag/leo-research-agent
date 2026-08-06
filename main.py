@@ -182,6 +182,19 @@ def build_parser() -> argparse.ArgumentParser:
     web_command.add_argument("--host", default="127.0.0.1")
     web_command.add_argument("--port", type=int, default=8000)
 
+    jobs_command = subparsers.add_parser(
+        "jobs", help="查询、取消或执行持久化后台任务。"
+    )
+    jobs_subparsers = jobs_command.add_subparsers(
+        dest="jobs_command", required=True
+    )
+    jobs_status = jobs_subparsers.add_parser("status")
+    jobs_status.add_argument("job_id", nargs="?")
+    jobs_cancel = jobs_subparsers.add_parser("cancel")
+    jobs_cancel.add_argument("job_id")
+    jobs_work = jobs_subparsers.add_parser("work")
+    jobs_work.add_argument("--max-jobs", type=int, default=10)
+
     subparsers.add_parser(
         "academic-mcp",
         help="通过 stdio 启动外部学术搜索与开放全文 MCP。",
@@ -870,19 +883,27 @@ def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) ->
         args,
         include_reranker=not args.disable_reranker,
     )
-    from app.knowledge_engine import build_legacy_unified_service
+    from app.knowledge_engine import build_configured_unified_service
 
-    knowledge = build_legacy_unified_service(
+    knowledge = build_configured_unified_service(
         PROJECT_ROOT,
         runtime,
-        supports_advanced_retrieval=(getattr(args, "retrieval_mode", None) == "graphrag"),
+        answer_provider,
+        llm_model_name=str(getattr(answer_provider, "model_name", "configured-model")),
     )
     store = AgenticSessionStore(
         PROJECT_ROOT,
         database_path=args.session_db_path,
     )
     workspaces = WorkspaceService(PROJECT_ROOT)
-    return build_harness_agent_service(
+    from app.academic_mcp.service import AcademicDiscoveryService
+    from app.research import build_bootstrap_provider_composition
+
+    backend = AcademicDiscoveryService.create(PROJECT_ROOT)
+    bootstrap = build_bootstrap_provider_composition(
+        PROJECT_ROOT, backend, worker_id="cli-bootstrap-worker"
+    )
+    service = build_harness_agent_service(
         PROJECT_ROOT,
         knowledge,
         workspaces,
@@ -891,7 +912,11 @@ def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) ->
             max_structure_repairs=args.max_structure_repairs,
         ),
         session_store=store,
+        extra_tools=bootstrap.gateway_handlers,
     )
+    service.bootstrap_backend = backend
+    service.bootstrap_composition = bootstrap
+    return service
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -910,6 +935,34 @@ def main(argv: Sequence[str] | None = None) -> None:
             port=args.port,
             log_level="info",
         )
+        return
+
+    if args.command == "jobs":
+        from app.jobs import PersistentJobRepository
+
+        repository = PersistentJobRepository(PROJECT_ROOT)
+        if args.jobs_command == "status":
+            if args.job_id:
+                print_json(asdict(repository.get(args.job_id)))
+            else:
+                print_json({"jobs": [asdict(value) for value in repository.list()]})
+            return
+        if args.jobs_command == "cancel":
+            print_json(asdict(repository.request_cancel(args.job_id)))
+            return
+        if args.max_jobs < 1:
+            raise SystemExit("--max-jobs 必须为正数。")
+        from app.academic_mcp.service import AcademicDiscoveryService
+        from app.research import build_bootstrap_provider_composition
+
+        backend = AcademicDiscoveryService.create(PROJECT_ROOT)
+        composition = build_bootstrap_provider_composition(
+            PROJECT_ROOT, backend, worker_id="cli-bootstrap-worker"
+        )
+        composition.worker.recover_after_restart()
+        completed = composition.worker.run_until_idle(max_jobs=args.max_jobs)
+        asyncio.run(backend.close())
+        print_json({"jobs": [asdict(value) for value in completed]})
         return
 
     if args.command == "ui":
@@ -1096,7 +1149,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         registry = IndexRegistryStore(PROJECT_ROOT)
         if args.knowledge_command == "status":
-            print_json(registry.status())
+            from app.knowledge_engine import knowledge_serving_status
+
+            status = registry.status()
+            print_json(
+                {
+                    **status,
+                    "knowledge_serving": knowledge_serving_status(PROJECT_ROOT),
+                }
+            )
             return
         if args.knowledge_command == "retry-failed":
             print_json({"retried_epochs": registry.retry_failed(args.epoch)})
@@ -1267,12 +1328,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "请改用 --session-id。"
                 )
             try:
-                agentic_result = agentic_service_from_args(args, answer_provider).answer(
+                agentic_service = agentic_service_from_args(args, answer_provider)
+                agentic_result = agentic_service.answer(
                     args.query,
                     session_id=args.session_id,
                     force_new_topic=args.force_new_topic,
                     include_context=args.include_context,
                 )
+                backend = getattr(agentic_service, "bootstrap_backend", None)
+                if backend is not None:
+                    asyncio.run(backend.close())
             except (KeyError, OSError, RuntimeError, ValueError) as error:
                 provider_key = getattr(
                     getattr(answer_provider, "config", None),

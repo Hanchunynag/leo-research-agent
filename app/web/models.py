@@ -47,7 +47,7 @@ class JobEvent(WebModel):
 class JobSnapshot(WebModel):
     job_id: str
     kind: Literal["answer", "parse"]
-    status: Literal["queued", "running", "succeeded", "failed"]
+    status: Literal["queued", "running", "succeeded", "failed", "cancelled"]
     events: list[JobEvent]
     result: dict[str, Any] | None = None
     error: str | None = None

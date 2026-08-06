@@ -71,12 +71,15 @@ def create_app(
 
     root = (project_root or Path(__file__).resolve().parents[2]).resolve()
     web_runtime: WebRuntime = runtime or LocalRAGWebRuntime(root)
-    job_manager = jobs or JobManager(max_workers=2)
+    job_manager = jobs or JobManager(max_workers=2, project_root=root)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         yield
         job_manager.close()
+        close_runtime = getattr(web_runtime, "close", None)
+        if callable(close_runtime):
+            close_runtime()
 
     app = FastAPI(
         title="LEO Research Agent API",
@@ -190,6 +193,13 @@ def create_app(
         except KeyError as error:
             raise HTTPException(status_code=404, detail=str(error).strip("'")) from error
 
+    @app.post("/api/jobs/{job_id}/cancel", response_model=JobSnapshot)
+    def cancel_job(job_id: str) -> JobSnapshot:
+        try:
+            return job_manager.cancel(job_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail=str(error).strip("'")) from error
+
     @app.get("/api/jobs/{job_id}/events")
     async def job_events(job_id: str) -> StreamingResponse:
         try:
@@ -216,7 +226,7 @@ def create_app(
                         f"data: {payload}\n\n"
                     )
                     last_sequence = event.sequence
-                if snapshot.status in {"succeeded", "failed"}:
+                if snapshot.status in {"succeeded", "failed", "cancelled"}:
                     done = json.dumps(
                         {"status": snapshot.status},
                         ensure_ascii=False,

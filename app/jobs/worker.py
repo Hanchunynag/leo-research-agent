@@ -77,7 +77,9 @@ class PersistentJobWorker:
                 return
 
     def run_once(self) -> JobRecord | None:
-        job = self.repository.claim_next(self.worker_id)
+        job = self.repository.claim_next(
+            self.worker_id, job_types=tuple(sorted(self.handlers))
+        )
         if job is None:
             return None
         handler = self.handlers.get(job.job_type)

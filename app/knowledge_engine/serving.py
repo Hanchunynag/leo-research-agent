@@ -151,7 +151,10 @@ class EngineCutoverService:
             operation="cutover",
             actor=actor,
             previous=current,
-            details={"profile_id": generation.index_profile_id},
+            details={
+                "profile_id": generation.index_profile_id,
+                "acceptance_passed": True,
+            },
         )
 
     def switch_to_legacy(self, *, actor: str, reason: str) -> KnowledgeServingConfig:
@@ -228,3 +231,23 @@ class EngineCutoverService:
             actor=actor,
             previous=current,
         )
+
+
+def knowledge_serving_status(project_root: Path) -> dict[str, Any]:
+    """Web 与 CLI 共用的只读展示投影。"""
+
+    repository = KnowledgeServingConfigRepository(project_root)
+    serving = repository.load()
+    generation = (
+        IndexGenerationRepository(project_root).get(serving.official_generation_id)
+        if serving.official_generation_id
+        else None
+    )
+    return {
+        "official_engine": serving.official_engine,
+        "official_generation_id": serving.official_generation_id,
+        "official_profile_id": generation.index_profile_id if generation else None,
+        "shadow_engine": serving.shadow_engine,
+        "shadow_generation_id": serving.shadow_generation_id,
+        "config_revision": serving.revision,
+    }

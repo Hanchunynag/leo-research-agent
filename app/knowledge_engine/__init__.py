@@ -8,8 +8,13 @@ from app.knowledge_engine.serving import (
     EngineCutoverService,
     KnowledgeServingConfig,
     KnowledgeServingConfigRepository,
+    knowledge_serving_status,
 )
-from app.knowledge_engine.unified_service import UnifiedKnowledgeService, build_legacy_unified_service
+from app.knowledge_engine.unified_service import (
+    UnifiedKnowledgeService,
+    build_configured_unified_service,
+    build_legacy_unified_service,
+)
 
 __all__ = [
     "IndexGenerationRepository",
@@ -20,7 +25,9 @@ __all__ = [
     "EngineCutoverService",
     "KnowledgeServingConfig",
     "KnowledgeServingConfigRepository",
+    "knowledge_serving_status",
     "UnifiedKnowledgeService",
+    "build_configured_unified_service",
     "build_legacy_unified_service",
     "build_lightrag_client_config",
 ]

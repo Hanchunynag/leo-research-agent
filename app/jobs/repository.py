@@ -125,6 +125,17 @@ class PersistentJobRepository:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_status_created ON jobs(status, created_at)"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS job_events (
+                    job_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    event_json TEXT NOT NULL,
+                    PRIMARY KEY (job_id, sequence),
+                    FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+                )
+                """
+            )
 
     @staticmethod
     def _record(row: sqlite3.Row) -> JobRecord:
@@ -223,17 +234,26 @@ class PersistentJobRepository:
             rows = connection.execute(query, parameters).fetchall()
         return tuple(self._record(row) for row in rows)
 
-    def claim_next(self, worker_id: str) -> JobRecord | None:
+    def claim_next(
+        self, worker_id: str, *, job_types: tuple[str, ...] | None = None
+    ) -> JobRecord | None:
         now = _now()
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            type_clause = ""
+            parameters: tuple[Any, ...] = ()
+            if job_types:
+                type_clause = " AND job_type IN (" + ",".join("?" for _ in job_types) + ")"
+                parameters = job_types
             row = connection.execute(
-                """
+                f"""
                 SELECT * FROM jobs
                 WHERE status IN ('QUEUED', 'RETRY_PENDING')
                   AND attempt < max_attempts
+                  {type_clause}
                 ORDER BY created_at, job_id LIMIT 1
-                """
+                """,  # noqa: S608 - placeholders are used for every job_type value.
+                parameters,
             ).fetchone()
             if row is None:
                 return None
@@ -252,6 +272,53 @@ class PersistentJobRepository:
             ).fetchone()
             assert claimed is not None
             return self._record(claimed)
+
+    def claim(self, job_id: str, worker_id: str) -> JobRecord:
+        now = _now()
+        with self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE jobs
+                SET status='RUNNING', attempt=attempt+1, worker_id=?,
+                    started_at=COALESCE(started_at, ?), heartbeat_at=?
+                WHERE job_id=? AND status IN ('QUEUED', 'RETRY_PENDING')
+                  AND attempt < max_attempts
+                """,
+                (worker_id, now, now, job_id),
+            ).rowcount
+        if changed != 1:
+            raise RuntimeError("Job 无法由指定 Worker claim。")
+        return self.get(job_id)
+
+    def append_event(self, job_id: str, event: Mapping[str, Any]) -> int:
+        encoded = _json(event)
+        with self._lock, self._connect() as connection:
+            if connection.execute(
+                "SELECT 1 FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone() is None:
+                raise KeyError(f"Job 不存在：{job_id}")
+            row = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) AS value FROM job_events WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+            sequence = int(row["value"]) + 1
+            connection.execute(
+                "INSERT INTO job_events(job_id, sequence, event_json) VALUES (?, ?, ?)",
+                (job_id, sequence, encoded),
+            )
+        return sequence
+
+    def list_events(self, job_id: str) -> tuple[Mapping[str, Any], ...]:
+        self.get(job_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT sequence, event_json FROM job_events WHERE job_id=? ORDER BY sequence",
+                (job_id,),
+            ).fetchall()
+        return tuple(
+            {"sequence": int(row["sequence"]), **json.loads(row["event_json"])}
+            for row in rows
+        )
 
     def heartbeat(
         self, job_id: str, *, worker_id: str, checkpoint: Mapping[str, Any] | None = None

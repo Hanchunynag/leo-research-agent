@@ -11,11 +11,13 @@ from app.knowledge_engine import (
     IndexGenerationRepository,
     KnowledgeServingConfigRepository,
     UnifiedKnowledgeService,
+    knowledge_serving_status,
 )
 from app.corpus import CanonicalCorpusService
 from app.evidence import EvidenceIntelligencePipeline
 from app.workspaces import WorkspaceService
 from tests.test_stage2_corpus_workspace import write_fixture
+from app.web.runtime import LocalRAGWebRuntime, WebRuntimeConfig
 
 
 def _generation(generation_id: str, state: str = "pending") -> IndexGeneration:
@@ -167,3 +169,21 @@ def test_generation_pin_mismatch_fails_closed(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="Generation Pin 不一致"):
         service.retrieve("query", limit=5)
 
+
+def test_web_and_cli_status_use_same_serving_projection(tmp_path: Path) -> None:
+    generations = IndexGenerationRepository(tmp_path)
+    _active(generations, "IG_status")
+    repository = KnowledgeServingConfigRepository(tmp_path)
+    EngineCutoverService(repository, generations).switch_to_lightrag(
+        "IG_status", _accepted(), actor="operator"
+    )
+
+    cli_projection = knowledge_serving_status(tmp_path)
+    web_status = LocalRAGWebRuntime(
+        tmp_path, config=WebRuntimeConfig()
+    ).public_status()
+
+    assert {
+        key: web_status[key] for key in cli_projection
+    } == cli_projection
+    assert web_status["official_profile_id"] == "profile-pinned"

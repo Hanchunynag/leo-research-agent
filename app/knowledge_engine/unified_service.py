@@ -256,6 +256,112 @@ def build_legacy_unified_service(
     )
 
 
+def build_configured_unified_service(
+    project_root: Path,
+    legacy_runtime: Any,
+    completion_provider: Any,
+    *,
+    llm_model_name: str,
+) -> UnifiedKnowledgeService:
+    """生产组装点：严格按审计配置和 Generation Pin 选择引擎。"""
+
+    from app.corpus import CanonicalCorpusService
+    from app.knowledge_engine.generations import IndexGenerationRepository
+    from app.knowledge_engine.lightrag_engine import LightRAGKnowledgeEngine
+    from app.knowledge_engine.model_bridge import build_lightrag_client_config
+    from app.knowledge_engine.serving import KnowledgeServingConfigRepository
+    from app.workspaces import WorkspaceService
+
+    root = project_root.expanduser().resolve()
+    serving = KnowledgeServingConfigRepository(root)
+    config = serving.load()
+    generations = IndexGenerationRepository(root)
+    corpus = CanonicalCorpusService(root)
+    workspaces = WorkspaceService(root, corpus=corpus)
+    workspace = workspaces.ensure_default()
+    evidence = EvidenceIntelligencePipeline(
+        corpus,
+        workspaces,
+        max_candidates_per_document=100,
+        max_selected_per_document=100,
+    )
+
+    def require_pin(generation_id: str | None) -> Any:
+        if not generation_id:
+            raise ValueError("LightRAG 服务配置缺少 Generation Pin。")
+        generation = generations.get(generation_id)
+        if generation is None or generation.state not in {"active", "retired"}:
+            raise ValueError(f"Pinned Generation 不可服务：{generation_id}")
+        if generation.workspace_id != workspace.workspace_id:
+            raise PermissionError("Pinned Generation workspace 不匹配。")
+        return generation
+
+    client_config = None
+
+    def lightrag(generation_id: str | None) -> Any:
+        nonlocal client_config
+        require_pin(generation_id)
+        if client_config is None:
+            client_config, _ = build_lightrag_client_config(
+                legacy_runtime.embedding_provider,
+                completion_provider,
+                llm_model_name=llm_model_name,
+            )
+        return LightRAGKnowledgeEngine(
+            root,
+            corpus=corpus,
+            workspaces=workspaces,
+            generations=generations,
+            client_config=client_config,
+            serving_generation_id=generation_id,
+        )
+
+    official_engine = (
+        lightrag(config.official_generation_id)
+        if config.official_engine == "lightrag"
+        else None
+    )
+    if config.official_engine == "lightrag":
+        latest = serving.audit_records()[-1:] or ()
+        if not latest:
+            raise PermissionError("LightRAG Official 缺少 Cutover 审计。")
+        record = latest[0]
+        details = record.get("details")
+        target = record.get("to")
+        accepted_operation = record.get("operation") == "rollback_previous" or (
+            record.get("operation") == "cutover"
+            and isinstance(details, dict)
+            and details.get("acceptance_passed") is True
+        )
+        if (
+            not accepted_operation
+            or not isinstance(target, dict)
+            or target.get("official_engine") != "lightrag"
+            or target.get("official_generation_id")
+            != config.official_generation_id
+        ):
+            raise PermissionError("LightRAG Official 配置没有匹配的合格审计记录。")
+    shadow: Any | None = None
+    if config.shadow_engine == "lightrag":
+        shadow = lightrag(config.shadow_generation_id)
+    elif config.shadow_engine == "legacy":
+        shadow = legacy_runtime
+    return UnifiedKnowledgeService(
+        legacy_runtime,
+        evidence,
+        official_engine_name=config.official_engine,
+        official_engine=official_engine,
+        official_generation_id=config.official_generation_id,
+        shadow_engine=shadow,
+        shadow_engine_name=config.shadow_engine,
+        shadow_generation_id=config.shadow_generation_id,
+        report_store=ShadowReportStore(root),
+        workspace_id=workspace.workspace_id,
+        scope_version=workspace.scope_version,
+        supports_advanced_retrieval=config.official_engine == "lightrag",
+    )
+
+
 def legacy_advanced_capability(runtime: Any) -> bool:
     """仅供尚未迁移的测试/嵌入式调用；生产组装不依赖该旧标志。"""
 

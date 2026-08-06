@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.jobs import PersistentJobRepository, PersistentJobWorker
+from app.web.jobs import JobManager
 
 
 def test_job_repository_persists_and_deduplicates_submission(tmp_path: Path) -> None:
@@ -158,3 +159,50 @@ def test_worker_retries_then_succeeds_with_reference_only(tmp_path: Path) -> Non
     assert completed.attempt == 2
     assert completed.result_reference == "data/results/index-1.json"
     assert completed.checkpoint == {"stage": "indexing", "attempt": 2}
+
+
+def test_web_job_result_and_events_survive_manager_restart(tmp_path: Path) -> None:
+    manager = JobManager(max_workers=1, project_root=tmp_path)
+    created = manager.submit(
+        "parse", lambda emit: (emit("parse", "parsed", 0.8), {"document_id": "D_1"})[1]
+    )
+    for _ in range(100):
+        snapshot = manager.snapshot(created.job_id)
+        if snapshot.status == "succeeded":
+            break
+        __import__("time").sleep(0.005)
+    manager.close()
+
+    restored_manager = JobManager(max_workers=1, project_root=tmp_path)
+    restored = restored_manager.snapshot(created.job_id)
+    restored_manager.close()
+
+    assert restored.status == "succeeded"
+    assert restored.result == {"document_id": "D_1"}
+    assert [value.stage for value in restored.events] == [
+        "queued",
+        "running",
+        "parse",
+        "completed",
+    ]
+
+
+def test_web_running_closure_is_explicitly_failed_after_restart(
+    tmp_path: Path,
+) -> None:
+    repository = PersistentJobRepository(tmp_path)
+    job, _ = repository.submit(
+        "web.parse",
+        workspace_id="default",
+        scope_version=1,
+        idempotency_key="web.parse:orphan",
+        max_attempts=2,
+    )
+    repository.claim(job.job_id, "dead-web-thread")
+
+    manager = JobManager(max_workers=1, project_root=tmp_path)
+    snapshot = manager.snapshot(job.job_id)
+    manager.close()
+
+    assert snapshot.status == "failed"
+    assert "cannot be reconstructed" in str(snapshot.error)

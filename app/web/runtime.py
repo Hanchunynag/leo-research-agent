@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+import asyncio
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import Any, Protocol
 
 from app.agentic.config import AgenticRAGConfig
@@ -155,6 +156,41 @@ class LocalRAGWebRuntime:
         self._retrieval: Any | None = None
         self._service: Any | None = None
         self._operation_lock = Lock()
+        self._bootstrap_backend: Any | None = None
+        self._bootstrap_composition: Any | None = None
+        self._bootstrap_stop = Event()
+        self._bootstrap_thread: Thread | None = None
+
+    def _ensure_bootstrap_providers(self) -> Any:
+        if self._bootstrap_composition is not None:
+            return self._bootstrap_composition
+        from app.academic_mcp.service import AcademicDiscoveryService
+        from app.research import build_bootstrap_provider_composition
+
+        self._bootstrap_backend = AcademicDiscoveryService.create(
+            self.project_root,
+            contact_email=os.getenv("LEO_ACADEMIC_CONTACT_EMAIL"),
+        )
+        self._bootstrap_composition = build_bootstrap_provider_composition(
+            self.project_root,
+            self._bootstrap_backend,
+            worker_id="web-bootstrap-worker",
+        )
+
+        def work() -> None:
+            self._bootstrap_composition.worker.recover_after_restart()
+            while not self._bootstrap_stop.is_set():
+                result = self._bootstrap_composition.worker.run_once()
+                if result is None:
+                    self._bootstrap_stop.wait(0.25)
+
+        self._bootstrap_thread = Thread(
+            target=work,
+            name="leo-bootstrap-worker",
+            daemon=True,
+        )
+        self._bootstrap_thread.start()
+        return self._bootstrap_composition
 
     def _build_retrieval_runtime(self) -> Any:
         from app.embeddings.bge_m3 import BGEM3Config, BGEM3EmbeddingProvider
@@ -218,10 +254,16 @@ class LocalRAGWebRuntime:
             )
         )
         retrieval = self._retrieval_runtime()
-        from app.knowledge_engine import build_legacy_unified_service
+        from app.knowledge_engine import build_configured_unified_service
 
-        knowledge = build_legacy_unified_service(self.project_root, retrieval)
+        knowledge = build_configured_unified_service(
+            self.project_root,
+            retrieval,
+            answer_provider,
+            llm_model_name=llm.model,
+        )
         workspaces = WorkspaceService(self.project_root)
+        bootstrap = self._ensure_bootstrap_providers()
         return build_harness_agent_service(
             self.project_root,
             knowledge,
@@ -231,7 +273,18 @@ class LocalRAGWebRuntime:
                 max_structure_repairs=self.agentic_config.max_structure_repairs,
             ),
             session_store=self.store,
+            extra_tools=bootstrap.gateway_handlers,
         )
+
+    def close(self) -> None:
+        self._bootstrap_stop.set()
+        if self._bootstrap_thread is not None:
+            self._bootstrap_thread.join(timeout=2.0)
+        if self._bootstrap_backend is not None:
+            try:
+                asyncio.run(self._bootstrap_backend.close())
+            except RuntimeError:
+                pass
 
     def answer(self, request: AnswerRequest, emit: EmitProgress) -> dict[str, Any]:
         """串行执行问答，避免共享 Service 的运行诊断互相污染。"""
@@ -441,6 +494,9 @@ class LocalRAGWebRuntime:
         """只返回可展示配置，绝不包含 API Key。"""
 
         llm = load_local_llm_settings(self.project_root)
+        from app.knowledge_engine import knowledge_serving_status
+
+        serving = knowledge_serving_status(self.project_root)
         return {
             "service": "leo-research-agent-web",
             "rag_mode": "agentic",
@@ -452,6 +508,7 @@ class LocalRAGWebRuntime:
             "reranker_revision": self.config.reranker_revision,
             "local_files_only": self.config.local_files_only,
             "models_initialized": self._retrieval is not None,
+            **serving,
             "candidate_limit": self.agentic_config.candidate_limit,
             "rerank_top_k": self.agentic_config.rerank_top_k,
             "final_top_k": self.agentic_config.final_top_k,
