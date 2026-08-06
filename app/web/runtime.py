@@ -12,6 +12,7 @@ from app.agentic.config import AgenticRAGConfig
 from app.agentic.prompting import compact_topic
 from app.agentic.store import AgenticSessionStore
 from app.generation.settings import load_local_llm_settings
+from app.ingestion.ingest import calculate_sha256
 from app.knowledge.catalog import library_status, load_catalog, rebuild_catalog
 from app.parsing.pipeline import PaperParseConfig, parse_paper
 from app.web.models import AnswerRequest, ParseOptions
@@ -192,12 +193,12 @@ class LocalRAGWebRuntime:
 
     def _build_service(self) -> Any:
         from app.agentic.provider import OpenAIAgenticReasoningProvider
-        from app.agentic.reranking import DirectAnswerReranker
-        from app.agentic.service import AgenticRAGService
         from app.generation.openai_compatible import (
             OpenAICompatibleAnswerProvider,
             OpenAICompatibleConfig,
         )
+        from app.research import build_harness_agent_service
+        from app.workspaces import WorkspaceService
 
         llm = load_local_llm_settings(self.project_root)
         if not llm.base_url or not llm.model:
@@ -217,18 +218,19 @@ class LocalRAGWebRuntime:
             )
         )
         retrieval = self._retrieval_runtime()
-        return AgenticRAGService(
-            retrieval,
+        from app.knowledge_engine import build_legacy_unified_service
+
+        knowledge = build_legacy_unified_service(self.project_root, retrieval)
+        workspaces = WorkspaceService(self.project_root)
+        return build_harness_agent_service(
+            self.project_root,
+            knowledge,
+            workspaces,
             OpenAIAgenticReasoningProvider(
                 answer_provider,
                 max_structure_repairs=self.agentic_config.max_structure_repairs,
             ),
-            self.store,
-            DirectAnswerReranker(
-                retrieval.reranker_provider,
-                enabled=self.agentic_config.reranker_enabled,
-            ),
-            self.agentic_config,
+            session_store=self.store,
         )
 
     def answer(self, request: AnswerRequest, emit: EmitProgress) -> dict[str, Any]:
@@ -238,7 +240,7 @@ class LocalRAGWebRuntime:
             if self._service is None:
                 emit("loading_models", "正在加载 Embedding 和 Reranker。", 0.08)
                 self._service = self._build_service()
-            emit("agentic_rag", "正在执行路由、检索、覆盖和验证。", 0.20)
+            emit("research_harness", "正在执行受预算约束的工作流、检索和验证。", 0.20)
             result = self._service.answer(
                 request.query,
                 session_id=request.session_id,
@@ -278,6 +280,50 @@ class LocalRAGWebRuntime:
             emit(stage, f"PDF 处理阶段：{stage}", stage_progress.get(stage, 0.1))
 
         with self._operation_lock:
+            from app.corpus import CanonicalCorpusService
+
+            corpus = CanonicalCorpusService(self.project_root)
+            duplicate = corpus.duplicate_for_hash(calculate_sha256(pdf_path))
+            if duplicate is not None:
+                from app.knowledge_engine import KnowledgeIndexService
+
+                emit(
+                    "writing",
+                    "检测到相同 content_hash，复用已有 Canonical Document。",
+                    0.9,
+                    {"document_id": duplicate.document_id},
+                )
+                indexes = KnowledgeIndexService(
+                    project_root=self.project_root
+                ).synchronize_after_parse(
+                    self._retrieval_runtime().embedding_provider,
+                    emit=emit,
+                    catalog_builder=rebuild_catalog,
+                )
+                # Scope/索引代际可能已推进，下次问答重新组合并固定新版本。
+                self._service = None
+                canonical = corpus.documents.canonical(duplicate.document_id) or {}
+                pipeline = canonical.get("pipeline")
+                mineru_value = (
+                    pipeline.get("mineru_output_directory")
+                    if isinstance(pipeline, dict)
+                    else None
+                )
+                mineru_path = Path(str(mineru_value)) if mineru_value else Path("")
+                if mineru_value and not mineru_path.is_absolute():
+                    mineru_path = self.project_root / mineru_path
+                return {
+                    "paper": {
+                        "paper_id": duplicate.paper_id,
+                        "document_id": duplicate.document_id,
+                        "sha256": duplicate.source_sha256,
+                        "paper_json": str(self.project_root / duplicate.canonical_path),
+                        "mineru_directory": str(mineru_path) if mineru_value else "",
+                    },
+                    "catalog": indexes["catalog"],
+                    "knowledge": indexes["knowledge"],
+                    "dense": indexes["dense"],
+                }
             result = parse_paper(
                 input_path=pdf_path,
                 config=PaperParseConfig(
@@ -290,20 +336,17 @@ class LocalRAGWebRuntime:
                 ),
                 progress_callback=progress,
             )
-            catalog = rebuild_catalog(self.project_root)
-            emit("building_knowledge", "正在更新 Chunk 和 BM25 索引。", 0.96)
-            from app.chunking.builder import build_knowledge_base
+            from app.knowledge_engine import KnowledgeIndexService
 
-            knowledge = build_knowledge_base(self.project_root)
-            if knowledge.issues:
-                raise RuntimeError("知识库构建存在未解决问题。")
-            emit("building_dense", "正在更新 Dense 向量索引。", 0.98)
-            from app.indexing.dense import build_dense_index
-
-            dense = build_dense_index(
-                self.project_root,
+            indexes = KnowledgeIndexService(
+                project_root=self.project_root
+            ).synchronize_after_parse(
                 self._retrieval_runtime().embedding_provider,
+                emit=emit,
+                catalog_builder=rebuild_catalog,
             )
+            # Scope/索引代际可能已推进，下次问答重新组合并固定新版本。
+            self._service = None
             return {
                 "paper": {
                     **asdict(result),
@@ -313,9 +356,9 @@ class LocalRAGWebRuntime:
                         result.mineru_output_directory
                     ),
                 },
-                "catalog": catalog.summary(),
-                "knowledge": knowledge.to_dict(),
-                "dense": dense.to_dict(),
+                "catalog": indexes["catalog"],
+                "knowledge": indexes["knowledge"],
+                "dense": indexes["dense"],
             }
 
     def list_papers(self) -> dict[str, Any]:

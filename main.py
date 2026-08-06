@@ -859,63 +859,38 @@ def retrieval_runtime_from_args(
 
 
 def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) -> Any:
-    """延迟组装 Agentic 编排层，fast 模式不导入这些模块。"""
+    """延迟组装 Research Harness；fast 模式不导入这些模块。"""
 
-    from app.agentic.config import AgenticRAGConfig
     from app.agentic.provider import OpenAIAgenticReasoningProvider
-    from app.agentic.reranking import DirectAnswerReranker
-    from app.agentic.service import AgenticRAGService
     from app.agentic.store import AgenticSessionStore
+    from app.research import build_harness_agent_service
+    from app.workspaces import WorkspaceService
 
     runtime = retrieval_runtime_from_args(
         args,
         include_reranker=not args.disable_reranker,
     )
-    config = AgenticRAGConfig(
-        candidate_limit=args.candidate_limit,
-        rerank_top_k=args.rerank_top_k,
-        final_top_k=args.final_top_k,
-        evidence_mmr_lambda=args.evidence_mmr_lambda,
-        max_final_evidence_per_work=args.max_final_evidence_per_work,
-        min_final_directness_grade=args.min_final_directness_grade,
-        max_retrieval_rounds=args.max_retrieval_rounds,
-        max_structure_repairs=args.max_structure_repairs,
-        max_answer_repairs=args.max_answer_repairs,
-        max_total_latency_ms=args.max_total_latency_ms,
-        fail_closed=True,
-        allow_model_downloads=(
-            args.agentic_allow_model_downloads and not args.local_files_only
-        ),
-        rrf_k=args.rrf_k,
-        reranker_enabled=not args.disable_reranker,
-        semantic_validation_enabled=not args.disable_semantic_validation,
-        same_topic_threshold=args.same_topic_threshold,
-        new_topic_threshold=args.new_topic_threshold,
-        semantic_weight=args.semantic_weight,
-        entity_weight=args.entity_weight,
-        context_dependency_weight=args.context_dependency_weight,
-        evidence_overlap_weight=args.evidence_overlap_weight,
-        context_compaction_threshold=args.context_compaction_threshold,
-        model_context_window=args.model_context_window,
-        recent_events_after_compaction=args.recent_events_after_compaction,
-        session_db_path=args.session_db_path,
+    from app.knowledge_engine import build_legacy_unified_service
+
+    knowledge = build_legacy_unified_service(
+        PROJECT_ROOT,
+        runtime,
+        supports_advanced_retrieval=(getattr(args, "retrieval_mode", None) == "graphrag"),
     )
     store = AgenticSessionStore(
         PROJECT_ROOT,
         database_path=args.session_db_path,
     )
-    return AgenticRAGService(
-        runtime,
+    workspaces = WorkspaceService(PROJECT_ROOT)
+    return build_harness_agent_service(
+        PROJECT_ROOT,
+        knowledge,
+        workspaces,
         OpenAIAgenticReasoningProvider(
             answer_provider,
-            max_structure_repairs=config.max_structure_repairs,
+            max_structure_repairs=args.max_structure_repairs,
         ),
-        store,
-        DirectAnswerReranker(
-            runtime.reranker_provider,
-            enabled=not args.disable_reranker,
-        ),
-        config,
+        session_store=store,
     )
 
 

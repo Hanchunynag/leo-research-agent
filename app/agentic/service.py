@@ -1,11 +1,15 @@
-"""Session-aware Agentic Scientific RAG 的有界端到端编排。"""
+"""Legacy Session-aware Agentic Scientific RAG 编排。
+
+生产 Web/CLI 已切换到 ``app.research.runtime.HarnessAgentService``；本模块保留
+用于行为基线、迁移适配和独立回滚，不再作为默认 composition root。
+"""
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import asdict
 from time import perf_counter
-from typing import Any, Sequence
+from typing import Any, Protocol, Sequence
 
 from app.agentic.config import AgenticRAGConfig
 from app.agentic.coverage import (
@@ -54,7 +58,19 @@ from app.generation.models import (
 )
 from app.generation.validation import validate_answer_draft
 from app.indexing.tokenization import normalize_search_text, token_count
-from app.runtime.retrieval import RetrievalRuntime
+
+
+class AgentKnowledgeRuntime(Protocol):
+    """Agent 所需的后端无关知识能力；具体存储/runtime 由组装层隐藏。"""
+
+    embedding_provider: Any
+    supports_advanced_retrieval: bool
+
+    def retrieve(self, query: str, **kwargs: Any) -> dict[str, Any]: ...
+
+    def retrieve_multi(
+        self, queries: Sequence[str], *, limit: int, rrf_k: int
+    ) -> dict[str, Any]: ...
 
 
 def _configuration_fingerprint(config: AgenticRAGConfig) -> str:
@@ -139,13 +155,21 @@ class AgenticRAGService:
 
     def __init__(
         self,
-        retrieval_runtime: RetrievalRuntime,
+        retrieval_runtime: AgentKnowledgeRuntime,
         reasoning_provider: AgenticReasoningProvider,
         session_store: AgenticSessionStore,
         reranker: DirectAnswerReranker,
         config: AgenticRAGConfig,
     ) -> None:
         self.runtime = retrieval_runtime
+        from app.knowledge_engine.unified_service import legacy_advanced_capability
+
+        capability = getattr(retrieval_runtime, "supports_advanced_retrieval", None)
+        self._advanced_retrieval = (
+            bool(capability)
+            if capability is not None
+            else legacy_advanced_capability(retrieval_runtime)
+        )
         self.reasoning_provider = reasoning_provider
         self.store = session_store
         self.reranker = reranker
@@ -202,7 +226,7 @@ class AgenticRAGService:
             )
 
     def _retrieve_queries(self, queries: Sequence[str]) -> list[dict[str, Any]]:
-        if getattr(self.runtime, "is_graphrag", False):
+        if self._advanced_retrieval:
             result = self.runtime.retrieve_multi(
                 queries, limit=self.config.max_cross_query_candidates,
                 rrf_k=self.config.rrf_k,
@@ -769,7 +793,7 @@ class AgenticRAGService:
             )
         accepted_retrieval_queries = list(plan.retrieval_queries)
         query_validation_diagnostics: dict[str, Any] = {}
-        if getattr(self.runtime, "is_graphrag", False):
+        if self._advanced_retrieval:
             harness.begin_query_expansion()
             with harness.stage(AgenticStage.QUERY_EXPANDING) as expansion_trace:
                 expansion = self.query_expander.expand(route.standalone_query, plan)
@@ -816,7 +840,7 @@ class AgenticRAGService:
         last_reranked: list[dict[str, Any]] = []
         while harness.can_retrieve():
             round_number = harness.begin_retrieval_round()
-            if getattr(self.runtime, "is_graphrag", False):
+            if self._advanced_retrieval:
                 with harness.stage(AgenticStage.RETRIEVAL_DISPATCHING,
                                    attempt=round_number,
                                    details={"query_count": len(queries)}) as retrieval_trace:
@@ -892,7 +916,7 @@ class AgenticRAGService:
                 details={"evidence_count": len(evidence_by_id)},
             ) as coverage_trace:
                 coverage = self._coverage(plan, list(evidence_by_id.values()))
-                if (getattr(self.runtime, "is_graphrag", False) and
+                if (self._advanced_retrieval and
                         getattr(self.runtime, "last_diagnostics", {}).get(
                             "relationship_status") == "none"):
                     relation_reason = ("当前知识库分别包含相关实体的定义，但没有检索到"
@@ -929,7 +953,7 @@ class AgenticRAGService:
             if coverage.overall_sufficient:
                 break
             queries = coverage.followup_queries
-            if getattr(self.runtime, "is_graphrag", False):
+            if self._advanced_retrieval:
                 queries = queries[: self.config.max_focused_queries_per_round]
             if not queries:
                 break

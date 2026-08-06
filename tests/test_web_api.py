@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -344,6 +346,75 @@ def test_local_web_parse_builds_searchable_indexes(
 
     assert payload["knowledge"]["total_chunk_count"] == 3
     assert payload["dense"]["status"] == "built"
+    assert stages == ["writing", "building_knowledge", "building_dense"]
+
+
+def test_local_web_duplicate_pdf_reuses_canonical_without_changing_result_shape(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    from app.web import runtime as runtime_module
+    from tests.test_stage2_corpus_workspace import write_fixture
+
+    pdf = tmp_path / "duplicate.pdf"
+    pdf.write_bytes(b"%PDF-1.7 duplicate fixture")
+    write_fixture(tmp_path, "D_001")
+    canonical_path = tmp_path / "data" / "canonical" / "P_001" / "paper.json"
+    canonical = json.loads(canonical_path.read_text(encoding="utf-8"))
+    canonical["source"]["sha256"] = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    canonical["pipeline"] = {"mineru_output_directory": "data/parsed/P_001/mineru"}
+    canonical_path.write_text(json.dumps(canonical), encoding="utf-8")
+
+    def unexpected_parse(**kwargs: Any) -> Any:
+        raise AssertionError("duplicate content must not be parsed again")
+
+    monkeypatch.setattr(runtime_module, "parse_paper", unexpected_parse)
+    monkeypatch.setattr(
+        runtime_module,
+        "rebuild_catalog",
+        lambda _: SimpleNamespace(
+            records=[object()], summary=lambda: {"record_count": 1}
+        ),
+    )
+    monkeypatch.setattr(
+        "app.chunking.builder.build_knowledge_base",
+        lambda _: SimpleNamespace(
+            issues=[], to_dict=lambda: {"total_chunk_count": 1}
+        ),
+    )
+    monkeypatch.setattr(
+        "app.indexing.dense.build_dense_index",
+        lambda project_root, provider: SimpleNamespace(
+            to_dict=lambda: {"status": "reused", "chunk_count": 1}
+        ),
+    )
+    runtime = LocalRAGWebRuntime(
+        tmp_path,
+        WebRuntimeConfig(model_cache=tmp_path / "models"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_retrieval_runtime",
+        lambda: SimpleNamespace(embedding_provider=object()),
+    )
+    stages: list[str] = []
+
+    payload = runtime.parse_pdf(
+        pdf,
+        ParseOptions(),
+        lambda stage, message, progress, details=None: stages.append(stage),
+    )
+
+    assert set(payload) == {"paper", "catalog", "knowledge", "dense"}
+    assert set(payload["paper"]) == {
+        "paper_id",
+        "document_id",
+        "sha256",
+        "paper_json",
+        "mineru_directory",
+    }
+    assert payload["paper"]["document_id"] == "D_001"
+    assert payload["dense"]["status"] == "reused"
     assert stages == ["writing", "building_knowledge", "building_dense"]
 
 
