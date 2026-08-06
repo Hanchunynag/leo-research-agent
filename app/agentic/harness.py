@@ -1,4 +1,8 @@
-"""Agentic RAG 的集中运行策略、有限状态机、预算与阶段轨迹。"""
+"""Legacy Agentic RAG Harness。
+
+生产 Web/CLI 已使用 ``app.research.harness``；本模块仅供回归、适配和回滚，
+不再扩展新的顶层状态。
+"""
 
 from __future__ import annotations
 
