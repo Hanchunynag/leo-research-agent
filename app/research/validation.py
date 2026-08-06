@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Protocol, Sequence
 
 from app.indexing.tokenization import tokenize
 
@@ -21,6 +21,65 @@ class ClaimValidationReport:
     valid: bool
     issues: tuple[ClaimIssue, ...]
     supported_claim_ids: tuple[str, ...]
+    semantic_results: tuple["ClaimSemanticResult", ...] = ()
+    judge_call_count: int = 0
+    semantic_input_tokens: int = 0
+    semantic_output_tokens: int = 0
+
+
+SemanticLabel = Literal[
+    "supports", "partially_supports", "contradicts", "unrelated"
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimSemanticResult:
+    claim_id: str
+    label: SemanticLabel
+    confidence: float
+    layer: Literal["local", "judge"]
+    reason: str
+
+
+class LocalSemanticValidator(Protocol):
+    def validate(
+        self, claim: str, evidence: Sequence[str]
+    ) -> tuple[SemanticLabel, float, str]: ...
+
+
+class HighRiskSemanticJudge(Protocol):
+    def judge(
+        self, claim: str, evidence: Sequence[str], risk_types: Sequence[str]
+    ) -> Mapping[str, Any]: ...
+
+
+class HeuristicLocalSemanticValidator:
+    """离线轻量语义回退；生产可注入本地 NLI/Cross-Encoder。"""
+
+    _NEGATION = re.compile(r"不|未|无|不能|not|never|no\s", re.IGNORECASE)
+
+    def validate(
+        self, claim: str, evidence: Sequence[str]
+    ) -> tuple[SemanticLabel, float, str]:
+        claim_tokens = {value for value in tokenize(claim) if len(value) > 2}
+        evidence_text = " ".join(evidence)
+        evidence_tokens = {
+            value for value in tokenize(evidence_text) if len(value) > 2
+        }
+        if not claim_tokens or not evidence_tokens:
+            return "unrelated", 0.99, "Claim 或 Evidence 缺少可判定语义单元。"
+        overlap = len(claim_tokens & evidence_tokens)
+        ratio = overlap / max(1, min(len(claim_tokens), len(evidence_tokens)))
+        negation_mismatch = bool(self._NEGATION.search(claim)) != bool(
+            self._NEGATION.search(evidence_text)
+        )
+        if negation_mismatch and overlap >= 2:
+            return "contradicts", 0.85, "Claim 与 Evidence 的否定极性不一致。"
+        if overlap >= 2 and ratio >= 0.25:
+            return "supports", min(0.95, 0.75 + ratio / 4), "轻量语义锚点一致。"
+        if overlap >= 1:
+            return "partially_supports", 0.60, "仅部分语义锚点一致。"
+        return "unrelated", 0.90, "未找到可对齐的语义锚点。"
 
 
 class ClaimEvidenceValidator:
@@ -116,4 +175,225 @@ class ClaimEvidenceValidator:
             **dict(draft),
             "claims": claims,
             "recovery": "unsupported_claims_removed",
+        }
+
+
+class TieredClaimEvidenceValidator:
+    """确定性 → 本地语义 → 单次高风险 Judge 的保守验证链。"""
+
+    _CAUSAL = re.compile(
+        r"导致|引起|提高|改善|因果|cause|causes|lead(?:s)? to|improve(?:s|d)?|result(?:s)? in",
+        re.IGNORECASE,
+    )
+    _NOVELTY = re.compile(
+        r"首次|创新|研究空白|novel|first|research gap|state of the art",
+        re.IGNORECASE,
+    )
+
+    def __init__(
+        self,
+        *,
+        local_validator: LocalSemanticValidator | None = None,
+        high_risk_judge: HighRiskSemanticJudge | None = None,
+        low_confidence_threshold: float = 0.65,
+    ) -> None:
+        self.deterministic = ClaimEvidenceValidator()
+        self.local_validator = local_validator or HeuristicLocalSemanticValidator()
+        self.high_risk_judge = high_risk_judge
+        self.low_confidence_threshold = low_confidence_threshold
+
+    @staticmethod
+    def _selected_by_id(
+        evidence: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Mapping[str, Any]]:
+        return {
+            str(value.get("evidence_id")): value
+            for value in evidence
+            if (value.get("evidence_state") or value.get("state")) == "selected"
+        }
+
+    def _risks(
+        self,
+        claim: Mapping[str, Any],
+        cited: Sequence[Mapping[str, Any]],
+        conflicts: Sequence[Mapping[str, Any]],
+        confidence: float,
+    ) -> tuple[str, ...]:
+        text = str(claim.get("text") or "")
+        risks: list[str] = []
+        if self._CAUSAL.search(text):
+            risks.append("causal_claim")
+        if self._NOVELTY.search(text):
+            risks.append("novelty_or_research_gap")
+        grades = {str(value.get("evidence_grade") or "") for value in cited}
+        if "graph_inference" in grades:
+            risks.append("graph_inference")
+        if "analogy" in grades:
+            risks.append("analogy")
+        documents = {str(value.get("document_id") or "") for value in cited}
+        if len(documents - {""}) > 1:
+            risks.append("multi_paper_synthesis")
+        if conflicts:
+            risks.append("conflicting_evidence")
+        if confidence < self.low_confidence_threshold:
+            risks.append("low_local_confidence")
+        return tuple(dict.fromkeys(risks))
+
+    @staticmethod
+    def _judge_result(
+        claim_id: str, payload: Mapping[str, Any]
+    ) -> ClaimSemanticResult:
+        label = str(payload.get("label") or "")
+        allowed = {
+            "supports",
+            "partially_supports",
+            "contradicts",
+            "unrelated",
+        }
+        if label not in allowed:
+            raise ValueError("Semantic Judge label 无效。")
+        confidence = float(payload.get("confidence") or 0.0)
+        if not 0 <= confidence <= 1:
+            raise ValueError("Semantic Judge confidence 无效。")
+        return ClaimSemanticResult(
+            claim_id=claim_id,
+            label=label,  # type: ignore[arg-type]
+            confidence=confidence,
+            layer="judge",
+            reason=str(payload.get("reason") or "高风险结构化判定。"),
+        )
+
+    def validate(
+        self,
+        draft: Mapping[str, Any],
+        evidence: Sequence[Mapping[str, Any]],
+        *,
+        scope_constraints: Sequence[str] = (),
+        conflicts: Sequence[Mapping[str, Any]] = (),
+    ) -> ClaimValidationReport:
+        layer_one = self.deterministic.validate(
+            draft,
+            evidence,
+            scope_constraints=scope_constraints,
+            conflicts=conflicts,
+        )
+        if not layer_one.valid:
+            return layer_one
+        evidence_by_id = self._selected_by_id(evidence)
+        claims = [
+            value for value in draft.get("claims", []) if isinstance(value, Mapping)
+        ]
+        issues: list[ClaimIssue] = []
+        results: list[ClaimSemanticResult] = []
+        judge_used = False
+        semantic_input_tokens = 0
+        semantic_output_tokens = 0
+        supported: list[str] = []
+        for index, claim in enumerate(claims, 1):
+            claim_id = str(claim.get("claim_id") or f"C{index}")
+            text = str(claim.get("text") or "")
+            ids = claim.get("evidence_ids")
+            evidence_ids = [str(value) for value in ids] if isinstance(ids, list) else []
+            cited = [evidence_by_id[value] for value in evidence_ids]
+            snippets = [str(value.get("content") or "") for value in cited[:4]]
+            semantic_input_tokens += len(tokenize(text)) + sum(
+                len(tokenize(value)) for value in snippets
+            )
+            label, confidence, reason = self.local_validator.validate(text, snippets)
+            local = ClaimSemanticResult(
+                claim_id, label, confidence, "local", reason
+            )
+            results.append(local)
+            risks = self._risks(claim, cited, conflicts, confidence)
+            final = local
+            if risks:
+                if self.high_risk_judge is not None and not judge_used:
+                    payload = self.high_risk_judge.judge(text, snippets, risks)
+                    judge_used = True
+                    usage = payload.get("usage")
+                    if isinstance(usage, Mapping):
+                        semantic_input_tokens += int(usage.get("input_tokens") or 0)
+                        semantic_output_tokens += int(usage.get("output_tokens") or 0)
+                    final = self._judge_result(claim_id, payload)
+                    results.append(final)
+                elif label not in {"contradicts", "unrelated"}:
+                    issues.append(
+                        ClaimIssue(
+                            claim_id,
+                            "high_risk_semantic_judge_unavailable",
+                            "高风险 Claim 缺少可用的单次语义 Judge。",
+                        )
+                    )
+                    continue
+            if final.label == "supports":
+                supported.append(claim_id)
+            elif final.label == "partially_supports":
+                issues.append(
+                    ClaimIssue(
+                        claim_id,
+                        "semantic_partial_support",
+                        "Evidence 仅部分支持 Claim，必须降低表述力度。",
+                    )
+                )
+            elif final.label == "contradicts":
+                issues.append(
+                    ClaimIssue(
+                        claim_id,
+                        "semantic_contradiction",
+                        "Evidence 与 Claim 矛盾。",
+                    )
+                )
+            else:
+                issues.append(
+                    ClaimIssue(
+                        claim_id,
+                        "semantic_unrelated",
+                        "Evidence 与 Claim 在语义上无关。",
+                    )
+                )
+        return ClaimValidationReport(
+            valid=not issues,
+            issues=tuple(issues),
+            supported_claim_ids=tuple(supported),
+            semantic_results=tuple(results),
+            judge_call_count=int(judge_used),
+            semantic_input_tokens=semantic_input_tokens,
+            semantic_output_tokens=semantic_output_tokens,
+        )
+
+    def deterministic_repair(
+        self, draft: Mapping[str, Any], report: ClaimValidationReport
+    ) -> dict[str, Any]:
+        issue_by_claim = {value.claim_id: value.code for value in report.issues}
+        repaired: list[dict[str, Any]] = []
+        for value in draft.get("claims", []):
+            if not isinstance(value, Mapping):
+                continue
+            claim = dict(value)
+            code = issue_by_claim.get(str(claim.get("claim_id") or ""))
+            if code in {"semantic_contradiction", "semantic_unrelated"}:
+                continue
+            if code == "semantic_partial_support":
+                text = str(claim.get("text") or "")
+                claim["text"] = "现有证据提示，" + re.sub(
+                    r"证明|证实|demonstrates?|proves?", "提示", text, flags=re.IGNORECASE
+                )
+                claim["validation_status"] = "downgraded"
+            elif code == "high_risk_semantic_judge_unavailable":
+                claim["text"] = "待验证假设：" + str(claim.get("text") or "")
+                claim["validation_status"] = "hypothesis"
+            elif code is not None:
+                continue
+            repaired.append(claim)
+        if not repaired:
+            return {
+                "answerable": False,
+                "claims": [],
+                "refusal_reason": "语义验证后仍无足够证据形成确定性科研结论。",
+                "recovery": "semantic_claims_rejected",
+            }
+        return {
+            **dict(draft),
+            "claims": repaired,
+            "recovery": "semantic_claims_downgraded",
         }

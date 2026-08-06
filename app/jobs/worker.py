@@ -9,7 +9,7 @@ from threading import Event, Thread
 from typing import Any
 
 from app.generation.security import redact_sensitive_text
-from app.jobs.repository import JobRecord, PersistentJobRepository
+from app.jobs.repository import JobRecord, JobStatus, PersistentJobRepository
 
 
 class JobCancelled(RuntimeError):
@@ -111,7 +111,7 @@ class PersistentJobWorker:
         except Exception as error:
             summary = redact_sensitive_text(f"{type(error).__name__}: {error}")[:1000]
             current = self.repository.get(job.job_id)
-            status = (
+            status: JobStatus = (
                 "RETRY_PENDING"
                 if current.attempt < current.max_attempts
                 else "FAILED"

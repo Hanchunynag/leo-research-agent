@@ -33,7 +33,13 @@ from app.research.runtime import (
     unified_tool_handlers,
 )
 from app.research.tools import ToolGatewayRegistry, ToolSpec, build_default_gateway
-from app.research.validation import ClaimEvidenceValidator
+from app.research.validation import (
+    ClaimEvidenceValidator,
+    ClaimSemanticResult,
+    ClaimValidationReport,
+    HeuristicLocalSemanticValidator,
+    TieredClaimEvidenceValidator,
+)
 from app.research.workflows import (
     DeepResearchWorkflow,
     DirectQAWorkflow,
@@ -50,12 +56,15 @@ __all__ = [
     "CandidateKnowledgeRepository",
     "CanonicalDocumentParseProviderAdapter",
     "ClaimEvidenceValidator",
+    "ClaimSemanticResult",
+    "ClaimValidationReport",
     "DeepResearchWorkflow",
     "DimensionCoverageAnalyzer",
     "DimensionCoverageReport",
     "DirectQAWorkflow",
     "HarnessAgentService",
     "HarnessState",
+    "HeuristicLocalSemanticValidator",
     "PhaseContextPack",
     "QueryFrame",
     "QueryFrameBuilder",
@@ -70,6 +79,7 @@ __all__ = [
     "RunTraceStore",
     "ToolGatewayRegistry",
     "ToolSpec",
+    "TieredClaimEvidenceValidator",
     "WorkflowName",
     "WorkflowRequest",
     "build_default_gateway",

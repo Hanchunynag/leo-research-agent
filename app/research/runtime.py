@@ -17,7 +17,7 @@ from app.research.harness import (
 )
 from app.research.memory import ResearchStateStore
 from app.research.tools import ToolGatewayRegistry, ToolHandler, build_default_gateway
-from app.research.validation import ClaimEvidenceValidator
+from app.research.validation import ClaimEvidenceValidator, TieredClaimEvidenceValidator
 from app.research.workflows import (
     AnswerGenerator,
     DeepResearchWorkflow,
@@ -111,14 +111,14 @@ class ResearchRuntime:
         generator: AnswerGenerator,
         *,
         contexts: ResearchContextManager | None = None,
-        validator: ClaimEvidenceValidator | None = None,
+        validator: ClaimEvidenceValidator | TieredClaimEvidenceValidator | None = None,
         state_store: ResearchStateStore | None = None,
         trace_store: RunTraceStore | None = None,
     ) -> None:
         self.gateway = gateway
         self.generator = generator
         self.contexts = contexts or ResearchContextManager()
-        self.validator = validator or ClaimEvidenceValidator()
+        self.validator = validator or TieredClaimEvidenceValidator()
         self.state_store = state_store
         self.trace_store = trace_store
 
@@ -180,6 +180,9 @@ class ResearchRuntime:
                         "issue_codes": [value.code for value in validation.issues],
                         "coverage": dict(execution.coverage),
                         "conflict_count": len(execution.conflicts),
+                        "semantic_judge_calls": validation.judge_call_count,
+                        "semantic_input_tokens": validation.semantic_input_tokens,
+                        "semantic_output_tokens": validation.semantic_output_tokens,
                     }
                 )
             if not validation.valid:
@@ -224,6 +227,20 @@ class ResearchRuntime:
             "validation": {
                 "valid": bool(validation.valid) if validation is not None else False,
                 "issues": [asdict(value) for value in validation.issues] if validation is not None else [],
+                "semantic_results": [
+                    asdict(value) for value in validation.semantic_results
+                ]
+                if validation is not None
+                else [],
+                "semantic_judge_calls": validation.judge_call_count
+                if validation is not None
+                else 0,
+                "semantic_input_tokens": validation.semantic_input_tokens
+                if validation is not None
+                else 0,
+                "semantic_output_tokens": validation.semantic_output_tokens
+                if validation is not None
+                else 0,
             },
             "diagnostics": harness.diagnostics(),
             "workflow_details": dict(execution.details) if execution else {},
