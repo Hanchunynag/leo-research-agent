@@ -169,6 +169,40 @@ class EngineCutoverService:
             details={"reason": reason},
         )
 
+    def rollback_previous(
+        self, *, actor: str, reason: str
+    ) -> KnowledgeServingConfig:
+        """恢复最近一次配置变更前的完整 Engine/Generation 快照。"""
+
+        current = self.repository.load()
+        records = self.repository.audit_records()
+        if not records:
+            raise RuntimeError("没有可回滚的 Knowledge serving 配置。")
+        latest = records[-1]
+        raw_current = latest.get("to")
+        raw_previous = latest.get("from")
+        if not isinstance(raw_current, Mapping) or not isinstance(
+            raw_previous, Mapping
+        ):
+            raise ValueError("Knowledge serving 审计记录损坏。")
+        # revision/updated_at 是快照身份的一部分；避免并发修改后误回滚。
+        if dict(raw_current) != asdict(current):
+            raise RuntimeError("Serving 配置已变化，拒绝使用过期回滚记录。")
+        target = KnowledgeServingConfig(**dict(raw_previous))
+        if target.official_engine == "lightrag":
+            assert target.official_generation_id is not None
+            self._require_servable_generation(target.official_generation_id)
+        if target.shadow_engine == "lightrag":
+            assert target.shadow_generation_id is not None
+            self._require_servable_generation(target.shadow_generation_id)
+        return self.repository.save(
+            target,
+            operation="rollback_previous",
+            actor=actor,
+            previous=current,
+            details={"reason": reason, "reverted_operation": latest.get("operation")},
+        )
+
     def configure_shadow(
         self,
         engine: EngineName,
@@ -194,4 +228,3 @@ class EngineCutoverService:
             actor=actor,
             previous=current,
         )
-
