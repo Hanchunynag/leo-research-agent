@@ -1,0 +1,90 @@
+{
+  "schema_version": "1.0",
+  "captured_on": "2026-08-06",
+  "official_answer_engine": "legacy",
+  "shadow_engine": "lightrag",
+  "generation": {
+    "generation_id": "IG_419c4e228f0dd1a8",
+    "state": "active",
+    "workspace_id": "default",
+    "scope_version": 1,
+    "profile_id": "lightrag-1.5.6-bge-m3-deepseek-chat-json-v1",
+    "document_count": 7,
+    "chunk_count": 135,
+    "entity_count": 409,
+    "relation_count": 532
+  },
+  "indexing": {
+    "elapsed_seconds": 925.049,
+    "llm_calls": 153,
+    "prompt_tokens": 354832,
+    "completion_tokens": 84737,
+    "total_tokens": 439569,
+    "embedding_calls": 134,
+    "embedded_texts": 1238
+  },
+  "query_usage_cold": {
+    "query_count": 2,
+    "llm_calls": 2,
+    "prompt_tokens": 1334,
+    "completion_tokens": 99,
+    "total_tokens": 1433,
+    "embedding_calls": 2,
+    "embedded_texts": 6
+  },
+  "representative": {
+    "question_id": "Q001",
+    "relevant_chunk_id": "D_060e764f208c_cp02_c000012",
+    "official_recall_at_10": 1.0,
+    "official_ndcg_at_10": 1.0,
+    "shadow_recall_at_10": 1.0,
+    "shadow_ndcg_at_10": 0.63093,
+    "shadow_relevant_rank": 2,
+    "official_top_10": [
+      "D_060e764f208c_cp02_c000012",
+      "D_060e764f208c_cp02_c000004",
+      "D_060e764f208c_cp02_c000002",
+      "D_060e764f208c_cp02_c000011",
+      "D_060e764f208c_cp02_c000021",
+      "D_060e764f208c_cp02_c000003",
+      "D_060e764f208c_cp02_c000015",
+      "D_060e764f208c_cp02_c000001",
+      "D_2e250a42c5f9_cp02_c000001",
+      "D_d113a234a7c3_cp02_c000005"
+    ],
+    "shadow_top_10": [
+      "D_060e764f208c_cp02_c000004",
+      "D_060e764f208c_cp02_c000012",
+      "D_f66bd01d218d_cp02_c000022",
+      "D_060e764f208c_cp02_c000002",
+      "D_2e250a42c5f9_cp02_c000001",
+      "D_060e764f208c_cp02_c000021",
+      "D_f66bd01d218d_cp02_c000009",
+      "D_f66bd01d218d_cp02_c000022",
+      "D_060e764f208c_cp02_c000002",
+      "D_060e764f208c_cp02_c000017"
+    ]
+  },
+  "relationship": {
+    "question_id": "REL001",
+    "ground_truth_status": "pending_annotation",
+    "graph_candidate_count": 20,
+    "selected_relation_count": 4,
+    "graph_backfill_rate": 1.0,
+    "selected_graph_inference_count": 0,
+    "cross_workspace_leakage_count": 0
+  },
+  "acceptance": {
+    "graph_backfill_threshold": 0.95,
+    "representative_recall_preserved": true,
+    "graph_backfill_passed": true,
+    "cross_workspace_leakage_passed": true,
+    "passed": true,
+    "official_cutover_approved": false,
+    "cutover_reason": "Only one annotated query was evaluated and shadow nDCG@10 remains below legacy."
+  },
+  "artifacts": {
+    "migration_sha256": "bafbfc03d0ee077158ff826b5e9944c80ede1c0a60cf1c069d3f02fef7c1bc81",
+    "shadow_comparison_sha256": "95399223fd7952c499051ecf79725ae0118392396cfc2963e9f599731df81f88"
+  }
+}
