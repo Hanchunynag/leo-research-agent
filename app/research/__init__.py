@@ -11,7 +11,16 @@ from app.research.harness import (
     RunTraceStore,
 )
 from app.research.memory import ResearchStateStore
+from app.research.runtime import (
+    HarnessAgentService,
+    ResearchRuntime,
+    WorkflowRequest,
+    build_harness_agent_service,
+    build_research_runtime,
+    unified_tool_handlers,
+)
 from app.research.tools import ToolGatewayRegistry, ToolSpec, build_default_gateway
+from app.research.validation import ClaimEvidenceValidator
 from app.research.workflows import (
     DeepResearchWorkflow,
     DirectQAWorkflow,
@@ -23,8 +32,10 @@ from app.research.workflows import (
 __all__ = [
     "BudgetExceeded",
     "AgenticReasoningGeneratorAdapter",
+    "ClaimEvidenceValidator",
     "DeepResearchWorkflow",
     "DirectQAWorkflow",
+    "HarnessAgentService",
     "HarnessState",
     "PhaseContextPack",
     "RecoveryLevel",
@@ -33,10 +44,15 @@ __all__ = [
     "ResearchBudgetPolicy",
     "ResearchContextManager",
     "ResearchRunHarness",
+    "ResearchRuntime",
     "ResearchStateStore",
     "RunTraceStore",
     "ToolGatewayRegistry",
     "ToolSpec",
     "WorkflowName",
+    "WorkflowRequest",
     "build_default_gateway",
+    "build_harness_agent_service",
+    "build_research_runtime",
+    "unified_tool_handlers",
 ]
