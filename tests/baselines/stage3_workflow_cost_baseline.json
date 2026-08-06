@@ -1,0 +1,60 @@
+{
+  "schema_version": "1.0",
+  "captured_on": "2026-08-06",
+  "fixture": "tests/test_stage3_research_harness.py",
+  "legacy_agent": {
+    "uniform_llm_call_count": null,
+    "uniform_token_usage": null,
+    "reason": "Stage-one history did not aggregate routing, coverage, generation, validation and repair usage into one run budget."
+  },
+  "direct_qa": {
+    "policy": {
+      "max_steps": 10,
+      "max_llm_calls": 1,
+      "max_tool_calls": 2,
+      "max_retrieval_rounds": 1,
+      "max_external_searches": 0,
+      "max_repairs": 1,
+      "max_context_tokens": 4000,
+      "max_total_tokens": 10000
+    },
+    "fixture_usage": {
+      "steps": 8,
+      "llm_calls": 1,
+      "tool_calls": 2,
+      "retrieval_rounds": 1,
+      "external_searches": 0,
+      "repairs": 0,
+      "context_tokens": 90,
+      "total_tokens": 110
+    }
+  },
+  "relation_reasoning_with_gap": {
+    "policy": {
+      "max_steps": 12,
+      "max_llm_calls": 1,
+      "max_tool_calls": 3,
+      "max_retrieval_rounds": 2,
+      "max_external_searches": 0,
+      "max_repairs": 1,
+      "max_context_tokens": 5000,
+      "max_total_tokens": 12000
+    },
+    "fixture_usage": {
+      "steps": 10,
+      "llm_calls": 1,
+      "tool_calls": 3,
+      "retrieval_rounds": 2,
+      "external_searches": 0,
+      "repairs": 0,
+      "context_tokens": 96,
+      "total_tokens": 116
+    }
+  },
+  "caveats": {
+    "fixture_generator_tokens": 20,
+    "latency_comparison": null,
+    "money_cost": null,
+    "reason": "The fixture is deterministic and network-free; real provider latency, price and provider-side cached-token accounting require an online benchmark."
+  }
+}
