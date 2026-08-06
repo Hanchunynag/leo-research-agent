@@ -8,6 +8,8 @@ from app.research.harness import (
     ResearchRunHarness,
     RunTraceStore,
 )
+from app.research.memory import ResearchStateStore
+from app.research.tools import ToolGatewayRegistry, ToolSpec, build_default_gateway
 
 __all__ = [
     "BudgetExceeded",
@@ -15,5 +17,9 @@ __all__ = [
     "RecoveryLevel",
     "ResearchBudgetPolicy",
     "ResearchRunHarness",
+    "ResearchStateStore",
     "RunTraceStore",
+    "ToolGatewayRegistry",
+    "ToolSpec",
+    "build_default_gateway",
 ]
