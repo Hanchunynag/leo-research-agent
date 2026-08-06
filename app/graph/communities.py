@@ -26,8 +26,8 @@ def detect_communities(
 ) -> list[DetectedCommunity]:
     if not entity_ids:
         return []
-    import igraph as ig
-    import leidenalg
+    import igraph as ig  # type: ignore[import-untyped]
+    import leidenalg  # type: ignore[import-untyped]
 
     ordered = sorted(set(entity_ids))
     index = {entity_id: position for position, entity_id in enumerate(ordered)}

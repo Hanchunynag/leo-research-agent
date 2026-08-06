@@ -63,6 +63,8 @@ class IndexRegistryStore:
                  required["ontology_version"], required["extractor_model"],
                  required["extractor_prompt_version"], required["community_prompt_version"]),
             )
+            if cursor.lastrowid is None:
+                raise RuntimeError("SQLite 未返回新建 Epoch ID。")
             return int(cursor.lastrowid)
 
     def active_epoch(self) -> int | None:

@@ -51,9 +51,10 @@ def validate_extraction(
         if relation.evidence_quote not in chunk_content:
             issues.append(prefix + ": evidence_quote is not a contiguous source substring")
             continue
+        qualifiers: dict[str, object] = dict(relation.qualifiers)
         allowed, reason = validate_relation_types(
             subject.entity_type, relation.predicate, object_value.entity_type,
-            relation.qualifiers,
+            qualifiers,
         )
         if not allowed:
             issues.append(prefix + ": " + reason)

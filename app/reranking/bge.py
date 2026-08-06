@@ -61,7 +61,7 @@ class BGERerankerProvider:
             from sentence_transformers import CrossEncoder
             from torch.nn import Identity
 
-            self._model = CrossEncoder(
+            self._model = CrossEncoder(  # type: ignore[call-arg]
                 self.config.model_name,
                 device=self.config.device,
                 cache_folder=(

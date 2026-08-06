@@ -7,7 +7,7 @@ import json
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from app.index_registry.models import ChunkDiff
+from app.index_registry.models import ChunkDiff, DiffKind
 from app.indexing.dense import dense_chunk_text
 
 
@@ -75,7 +75,7 @@ def diff_chunks(
         graph_changed = value["graph_text_hash"] != old.get("graph_text_hash")
         content_changed = value["content_hash"] != old.get("content_hash")
         if dense_changed and graph_changed:
-            kind = "changed"
+            kind: DiffKind = "changed"
         elif dense_changed:
             kind = "dense_changed"
         elif graph_changed or content_changed:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, cast
 
 
 ABLATIONS = (
@@ -113,4 +113,4 @@ def run_ragas(samples: list[dict[str, Any]], *, llm: Any, embeddings: Any) -> di
     result = evaluate(dataset=dataset, metrics=[ContextPrecision(), ContextRecall(),
         Faithfulness(), AnswerRelevancy(), AnswerCorrectness()], llm=llm,
         embeddings=embeddings)
-    return result.to_pandas().to_dict(orient="records")
+    return cast(Any, result).to_pandas().to_dict(orient="records")

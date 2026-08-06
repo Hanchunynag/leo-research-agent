@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from app.agentic.models import QueryExpansionResult, QueryPlan, RetrievalQuery
 from app.generation.openai_compatible import parse_json_object
@@ -22,12 +22,24 @@ PURPOSE_WEIGHTS = {
     "community_probe": 0.8, "paraphrase": 0.7,
 }
 
+QueryComplexity = Literal["simple", "compound", "multi_hop", "global"]
+RetrievalMode = Literal["local", "relationship", "global", "drift", "exact"]
+RetrievalPurpose = Literal[
+    "original",
+    "paraphrase",
+    "terminology_expansion",
+    "subquestion",
+    "relationship_probe",
+    "focused_followup",
+    "community_probe",
+]
+
 
 class ExpansionProvider(Protocol):
     def chat_completion(self, messages: list[dict[str, str]], *, max_tokens: int | None = None) -> dict[str, Any]: ...
 
 
-def _mode(query: str, plan: QueryPlan) -> tuple[str, str]:
+def _mode(query: str, plan: QueryPlan) -> tuple[QueryComplexity, RetrievalMode]:
     normalized = query.casefold()
     if any(value in normalized for value in ("关系", "影响", "区别", "relation", "affect", "difference")):
         return "multi_hop" if len(plan.subquestions) > 1 else "compound", "relationship"
@@ -76,7 +88,7 @@ class AdaptiveQueryExpander:
             return fallback
 
     def _normalize(self, result: QueryExpansionResult, query: str, plan: QueryPlan,
-                   complexity: str, retrieval_mode: str) -> QueryExpansionResult:
+                   complexity: QueryComplexity, retrieval_mode: RetrievalMode) -> QueryExpansionResult:
         original = _original(query, plan)
         others = [value for value in result.queries
                   if value.query_id != "RQ0" and value.text.strip() != query]
@@ -94,10 +106,10 @@ class AdaptiveQueryExpander:
         return QueryExpansionResult(original_query=query, complexity=complexity,
             retrieval_mode=retrieval_mode, queries=[original, *unique[:self.max_variants - 1]])
 
-    def _deterministic(self, query: str, plan: QueryPlan, complexity: str,
-                       mode: str) -> QueryExpansionResult:
+    def _deterministic(self, query: str, plan: QueryPlan, complexity: QueryComplexity,
+                       mode: RetrievalMode) -> QueryExpansionResult:
         queries = [_original(query, plan)]
-        purpose = "community_probe" if mode == "global" else (
+        purpose: RetrievalPurpose = "community_probe" if mode == "global" else (
             "relationship_probe" if mode == "relationship" else "subquestion")
         budget = {"simple": 1, "compound": 3, "multi_hop": 4, "global": 4}[complexity]
         for subquestion in plan.subquestions:

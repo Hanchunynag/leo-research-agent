@@ -69,6 +69,9 @@ class GraphRAGRetrievalRuntime:
 
     def retrieve_multi(self, values: Sequence[str], *, limit: int = 40,
                        rrf_k: int = 60) -> dict[str, Any]:
+        active_epoch = self.active_epoch
+        if active_epoch is None:
+            raise RuntimeError("GraphRAG active epoch is unavailable")
         queries = self._queries(values)
         rankings: dict[str, dict[str, list[EvidenceCandidate]]] = {}
         route_counts: dict[str, int] = {}
@@ -90,7 +93,7 @@ class GraphRAGRetrievalRuntime:
             graph_path: list[EvidenceCandidate] = []
             if relationship_mode and len(linked) >= 2:
                 relation = self.graph.relationship_search(linked[0]["entity_id"],
-                    linked[1]["entity_id"], self.active_epoch, max_paths=20)
+                    linked[1]["entity_id"], active_epoch, max_paths=20)
                 candidates = list(relation["candidates"])
                 if relation["mode"] == "direct":
                     relationship_status = "direct"
@@ -101,7 +104,7 @@ class GraphRAGRetrievalRuntime:
                     graph_path.extend(candidates)
             elif not relationship_mode:
                 for entity in linked[:2]:
-                    graph_direct.extend(self.graph.local(entity["entity_id"], self.active_epoch, 10))
+                    graph_direct.extend(self.graph.local(entity["entity_id"], active_epoch, 10))
             routes["graph_direct"] = graph_direct
             routes["graph_path"] = graph_path
             direct_relations += len(graph_direct)

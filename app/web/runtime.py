@@ -171,16 +171,17 @@ class LocalRAGWebRuntime:
             self.project_root,
             contact_email=os.getenv("LEO_ACADEMIC_CONTACT_EMAIL"),
         )
-        self._bootstrap_composition = build_bootstrap_provider_composition(
+        composition = build_bootstrap_provider_composition(
             self.project_root,
             self._bootstrap_backend,
             worker_id="web-bootstrap-worker",
         )
+        self._bootstrap_composition = composition
 
         def work() -> None:
-            self._bootstrap_composition.worker.recover_after_restart()
+            composition.worker.recover_after_restart()
             while not self._bootstrap_stop.is_set():
-                result = self._bootstrap_composition.worker.run_once()
+                result = composition.worker.run_once()
                 if result is None:
                     self._bootstrap_stop.wait(0.25)
 
@@ -190,7 +191,7 @@ class LocalRAGWebRuntime:
             daemon=True,
         )
         self._bootstrap_thread.start()
-        return self._bootstrap_composition
+        return composition
 
     def _build_retrieval_runtime(self) -> Any:
         from app.embeddings.bge_m3 import BGEM3Config, BGEM3EmbeddingProvider

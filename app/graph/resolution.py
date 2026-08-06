@@ -98,8 +98,13 @@ class EntityResolver:
             if not self.adjudicator(name, str(selected["canonical_name"]), kind):
                 selected = None
         created = selected is None
-        entity_id = (str(uuid.uuid4()) if created else str(selected["entity_id"]))
-        canonical = name.strip() if created else str(selected["canonical_name"])
+        if created:
+            entity_id = str(uuid.uuid4())
+            canonical = name.strip()
+        else:
+            assert selected is not None
+            entity_id = str(selected["entity_id"])
+            canonical = str(selected["canonical_name"])
         all_aliases = {normalized, *(normalize_entity_name(value) for value in aliases or [])}
         with self.registry.transaction() as connection:
             for alias in sorted(value for value in all_aliases if value):

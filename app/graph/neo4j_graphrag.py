@@ -11,6 +11,7 @@ from typing import Any
 
 from neo4j_graphrag.retrievers import QdrantNeo4jRetriever
 from neo4j_graphrag.types import RetrieverResult
+from neo4j import Driver
 from qdrant_client import QdrantClient
 
 from app.graph.models import EvidenceCandidate
@@ -18,7 +19,7 @@ from app.indexing.qdrant_collections import VECTOR_NAME
 
 
 class Neo4jGraphRAGChunkRetriever:
-    def __init__(self, driver: object, qdrant: QdrantClient, collection_name: str,
+    def __init__(self, driver: Driver, qdrant: QdrantClient, collection_name: str,
                  database: str = "neo4j") -> None:
         self.retriever = QdrantNeo4jRetriever(
             driver=driver, client=qdrant, collection_name=collection_name,
