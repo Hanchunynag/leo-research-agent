@@ -298,6 +298,25 @@ class PersistentJobRepository:
             raise KeyError(f"Job 不存在：{job_id}")
         return self.get(job_id)
 
+    def request_cancel(self, job_id: str) -> JobRecord:
+        current = self.get(job_id)
+        if current.status in _TERMINAL:
+            return current
+        target: JobStatus = (
+            "CANCELLED"
+            if current.status in {"QUEUED", "RETRY_PENDING", "INTERRUPTED"}
+            else "CANCEL_REQUESTED"
+        )
+        return self.set_status(
+            job_id,
+            target,
+            error_type="CancelledByUser" if target == "CANCELLED" else None,
+            error_summary="Job cancellation requested.",
+        )
+
+    def cancellation_requested(self, job_id: str) -> bool:
+        return self.get(job_id).status in {"CANCEL_REQUESTED", "CANCELLED"}
+
     def mark_interrupted(self, *, heartbeat_before: str) -> tuple[JobRecord, ...]:
         """进程启动时把失联 RUNNING 任务显式标记为 INTERRUPTED。"""
 

@@ -12,6 +12,10 @@ from app.generation.security import redact_sensitive_text
 from app.jobs.repository import JobRecord, PersistentJobRepository
 
 
+class JobCancelled(RuntimeError):
+    """Handler 在安全检查点响应 cooperative cancellation。"""
+
+
 @dataclass(frozen=True, slots=True)
 class JobExecutionContext:
     repository: PersistentJobRepository
@@ -19,9 +23,17 @@ class JobExecutionContext:
     worker_id: str
 
     def checkpoint(self, value: Mapping[str, Any]) -> JobRecord:
+        self.raise_if_cancelled()
         return self.repository.heartbeat(
             self.job_id, worker_id=self.worker_id, checkpoint=value
         )
+
+    def cancellation_requested(self) -> bool:
+        return self.repository.cancellation_requested(self.job_id)
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancellation_requested():
+            raise JobCancelled("Job cancellation requested.")
 
 
 JobHandler = Callable[[JobRecord, JobExecutionContext], str | None]
@@ -89,6 +101,13 @@ class PersistentJobWorker:
                 job,
                 JobExecutionContext(self.repository, job.job_id, self.worker_id),
             )
+        except JobCancelled as error:
+            return self.repository.set_status(
+                job.job_id,
+                "CANCELLED",
+                error_type=type(error).__name__,
+                error_summary=str(error),
+            )
         except Exception as error:
             summary = redact_sensitive_text(f"{type(error).__name__}: {error}")[:1000]
             current = self.repository.get(job.job_id)
@@ -120,4 +139,3 @@ class PersistentJobWorker:
                 break
             results.append(result)
         return tuple(results)
-

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Callable, Literal, Mapping
@@ -146,6 +147,30 @@ class ToolGatewayRegistry:
                     raise
         assert last_error is not None
         raise last_error
+
+    async def ainvoke(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+        *,
+        context: Mapping[str, Any],
+        harness: ResearchRunHarness,
+    ) -> Mapping[str, Any]:
+        """短工具使用真正的异步截止时间；长工具 handler 只提交 Job。"""
+
+        spec = self._specs.get(name)
+        if spec is None:
+            raise KeyError(f"未注册 Tool：{name}")
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                self.invoke,
+                name,
+                arguments,
+                context=context,
+                harness=harness,
+            ),
+            timeout=spec.timeout_seconds,
+        )
 
 
 _ALL = frozenset({"direct_qa", "relation_reasoning", "deep_research", "research_bootstrap"})
