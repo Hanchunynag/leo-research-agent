@@ -7,10 +7,18 @@ from app.corpus.repository import (
     SectionRepository,
 )
 from app.corpus.service import CanonicalCorpusService, CanonicalLocator
+from app.corpus.versions import (
+    DocumentVersionReceipt,
+    DocumentVersionRepository,
+    ExtractionDecision,
+)
 
 __all__ = [
     "CanonicalCorpusService",
     "CanonicalLocator",
+    "DocumentVersionReceipt",
+    "DocumentVersionRepository",
+    "ExtractionDecision",
     "ChunkRepository",
     "CitationRepository",
     "DocumentRepository",

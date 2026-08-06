@@ -126,6 +126,7 @@ class KnowledgeIndexService:
                 activate=activate,
             )
         changed_ids = set(document_ids) | {value.document_id for value in documents}
+        ordered_changed_ids = tuple(sorted(changed_ids))
         raw_previous_mapping: Any = getattr(
             engine, "_load_mapping", lambda value: {}
         )(
@@ -167,10 +168,21 @@ class KnowledgeIndexService:
                 raise RuntimeError("KnowledgeEngine 不支持 generation 快照分叉。")
             fork(previous, generation)
             if operation == "delete":
-                metrics = engine.delete_documents(tuple(changed_ids), generation=generation)
+                metrics = engine.delete_documents(ordered_changed_ids, generation=generation)
             else:
                 metrics = engine.update_documents(documents, generation=generation, profile=profile)
-            metrics = {**metrics, "indexed_document_count": next_document_count, "incremental_operation": operation, "full_rebuild": False}
+            metrics = {
+                **metrics,
+                "indexed_document_count": next_document_count,
+                "incremental_operation": operation,
+                "changed_document_ids": list(ordered_changed_ids),
+                "processed_document_ids": [value.document_id for value in documents]
+                if operation != "delete"
+                else list(ordered_changed_ids),
+                "unrelated_history_reprocessed_count": 0,
+                "full_document_extraction_count": 0,
+                "full_rebuild": False,
+            }
             generation = generations.transition(generation.generation_id, "validating")
             valid, reason = self.validator(generation, metrics)
             if not valid:
