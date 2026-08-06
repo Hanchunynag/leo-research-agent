@@ -298,3 +298,51 @@ class PersistentJobRepository:
             raise KeyError(f"Job 不存在：{job_id}")
         return self.get(job_id)
 
+    def mark_interrupted(self, *, heartbeat_before: str) -> tuple[JobRecord, ...]:
+        """进程启动时把失联 RUNNING 任务显式标记为 INTERRUPTED。"""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT job_id FROM jobs
+                WHERE status='RUNNING'
+                  AND (heartbeat_at IS NULL OR heartbeat_at < ?)
+                ORDER BY created_at, job_id
+                """,
+                (heartbeat_before,),
+            ).fetchall()
+            ids = tuple(str(row["job_id"]) for row in rows)
+            if ids:
+                connection.executemany(
+                    """
+                    UPDATE jobs SET status='INTERRUPTED', worker_id=NULL,
+                        error_type='ProcessRestart',
+                        error_summary='Worker heartbeat lost after process restart.'
+                    WHERE job_id=? AND status='RUNNING'
+                    """,
+                    ((job_id,) for job_id in ids),
+                )
+        return tuple(self.get(job_id) for job_id in ids)
+
+    def recover_interrupted(self) -> tuple[JobRecord, ...]:
+        """按重试上限把 INTERRUPTED 转入 RETRY_PENDING 或 FAILED。"""
+
+        finished = _now()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT job_id, attempt, max_attempts FROM jobs WHERE status='INTERRUPTED'"
+            ).fetchall()
+            for row in rows:
+                retry = int(row["attempt"]) < int(row["max_attempts"])
+                connection.execute(
+                    """
+                    UPDATE jobs SET status=?, finished_at=?, worker_id=NULL
+                    WHERE job_id=? AND status='INTERRUPTED'
+                    """,
+                    (
+                        "RETRY_PENDING" if retry else "FAILED",
+                        None if retry else finished,
+                        row["job_id"],
+                    ),
+                )
+        return tuple(self.get(str(row["job_id"])) for row in rows)
