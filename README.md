@@ -201,6 +201,22 @@ MinerU 原始产物保留在 `data/parsed`，包括：
 - layout、span 和 origin PDF；
 - pipeline 日志。
 
+若 MinerU 已识别出 `table` block，但只输出表格图片、`html` 为空，统一流程会
+按需调用 `.venv-paddleocr/bin/python` 的 PaddleOCR 3.7.0 表格识别接口。恢复结果
+缓存于 `data/parsed/<paper_id>/paddleocr/table/`，并回填到同一个 Canonical
+table block；MinerU 原始 block 和表格图片始终保留。该钩子只修复已有的
+MinerU image-only table，不扫描页面寻找 MinerU 漏检的表格。PaddleOCR 不可用或
+恢复失败时，解析流程继续输出 `image_only` 表格。
+
+公式也采用同一个 fail-soft 钩子，但只处理两类情况：MinerU LaTeX 的硬错误
+（控制字符、环境或分隔符不匹配、明显截断等），以及高风险结构（矩阵/多行、
+复杂分式或积分、密集上下标、超长 LaTeX、特别宽的公式图片）。普通公式直接
+使用 MinerU 结果；命中规则且有原始公式图片时，才通过
+`.venv-paddleocr/bin/python` 调用 PaddleOCR-VL 的 `formula` prompt。结果缓存于
+`data/parsed/<paper_id>/paddleocr/formula/`，并在 Canonical equation block 中保留：
+`latex_mineru`、`latex_paddleocr_vl` 和最终使用的 `latex`。PaddleOCR-VL 失败时
+不会覆盖 MinerU LaTeX。可用 `--no-formula-recovery` 关闭该钩子。
+
 这些是底层解析资产，不是未来 RAG 的直接入口。
 
 ### 4. 标准化 MinerU 输出
@@ -268,12 +284,13 @@ data/canonical/<paper_id>/paper.json
 旧版本生成的 `blocks.json`、`formulas.json`、`formula_review.md` 和相关 report
 只是历史产物。新流程不会生成或读取它们。
 
-## 两个虚拟环境
+## 三个虚拟环境
 
 项目刻意隔离两个环境：
 
 - `.venv`：运行主脚本、Gradio、PyMuPDF、数据标准化和测试；
 - `.venv-mineru`：只安装并运行 MinerU。
+- `.venv-paddleocr`：只运行表格恢复和公式 PaddleOCR-VL worker。
 
 pipeline 不会回退到系统 PATH 中寻找 MinerU，防止误用主环境里的同名命令。
 默认位置是：

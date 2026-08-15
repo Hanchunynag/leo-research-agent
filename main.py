@@ -112,6 +112,21 @@ def add_mineru_options(command: argparse.ArgumentParser) -> None:
         action="store_true",
         help="关闭 MinerU 表格解析。",
     )
+    command.add_argument(
+        "--paddleocr-executable",
+        type=Path,
+        help="显式指定 PaddleOCR 专用 venv 中的 Python 可执行文件。",
+    )
+    command.add_argument(
+        "--no-table-recovery",
+        action="store_true",
+        help="关闭对 MinerU image-only table 的 PaddleOCR 恢复。",
+    )
+    command.add_argument(
+        "--no-formula-recovery",
+        action="store_true",
+        help="关闭对 MinerU 硬错误/高风险公式的 PaddleOCR-VL 恢复。",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -707,6 +722,9 @@ def config_from_args(args: argparse.Namespace) -> PaperParseConfig:
         language=args.language,
         formula_enabled=not args.no_formula,
         table_enabled=not args.no_table,
+        paddleocr_executable=args.paddleocr_executable,
+        table_recovery_enabled=not args.no_table_recovery,
+        formula_recovery_enabled=not args.no_formula_recovery,
         force_mineru=args.force_mineru,
     )
 

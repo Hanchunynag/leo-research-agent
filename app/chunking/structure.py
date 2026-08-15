@@ -14,7 +14,7 @@ from app.storage import write_json_atomic
 
 
 STRUCTURE_SCHEMA_VERSION = "1.0"
-STRUCTURE_POLICY_VERSION = "1.2"
+STRUCTURE_POLICY_VERSION = "1.3"
 SEARCHABLE_ZONES = {"abstract", "main_body", "appendix"}
 ASSET_TYPES = {"equation", "figure", "table", "algorithm"}
 TEXT_TYPES = {"paragraph", "list", "algorithm"}
@@ -135,7 +135,10 @@ def render_block_content(block: dict[str, Any]) -> str:
         latex = clean_text(block.get("latex") or block.get("latex_raw"))
         return "\n".join(part for part in ("[Equation]", latex, caption) if part)
     if block_type == "figure":
-        return "\n".join(part for part in ("[Figure]", caption or text) if part)
+        figure_text = caption or text
+        if not figure_text:
+            return ""
+        return "\n".join(("[Figure]", figure_text))
     if block_type == "table":
         table_text = render_table_text(
             str(block.get("table_html") or block.get("table_html_raw") or "")
@@ -327,6 +330,8 @@ def build_structure(document: dict[str, Any]) -> dict[str, Any]:
             exclusion_reason = "page_metadata"
         elif is_heading:
             exclusion_reason = "heading"
+        elif block_type == "figure" and not content:
+            exclusion_reason = "empty_figure"
         elif not content:
             exclusion_reason = "empty"
         elif retrieval_enabled is False:

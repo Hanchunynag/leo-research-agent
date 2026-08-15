@@ -32,6 +32,15 @@ from app.ingestion.ingest import IngestResult, ingest_paper
 from app.knowledge.identity import build_identity
 from app.normalization.mineru_adapter import build_canonical_document
 from app.parsing.precheck import PDFPrecheckResult, precheck_pdf
+from app.parsing.quality import validate_canonical_document
+from app.parsing.formula_recovery import (
+    DEFAULT_FORMULA_RECOVERY_TIMEOUT_SECONDS,
+    recover_high_risk_formulas,
+)
+from app.parsing.table_recovery import (
+    DEFAULT_TABLE_RECOVERY_TIMEOUT_SECONDS,
+    recover_image_only_tables,
+)
 from app.storage import write_json_atomic
 
 
@@ -65,6 +74,15 @@ class PaperParseConfig:
     language: str | None = None
     formula_enabled: bool = True
     table_enabled: bool = True
+    paddleocr_executable: Path | None = None
+    table_recovery_enabled: bool = True
+    table_recovery_timeout_seconds: int = (
+        DEFAULT_TABLE_RECOVERY_TIMEOUT_SECONDS
+    )
+    formula_recovery_enabled: bool = True
+    formula_recovery_timeout_seconds: int = (
+        DEFAULT_FORMULA_RECOVERY_TIMEOUT_SECONDS
+    )
     force_mineru: bool = False
 
     def normalized(self) -> "PaperParseConfig":
@@ -80,6 +98,15 @@ class PaperParseConfig:
             language=self.language,
             formula_enabled=self.formula_enabled,
             table_enabled=self.table_enabled,
+            paddleocr_executable=(
+                self.paddleocr_executable.expanduser().resolve()
+                if self.paddleocr_executable
+                else None
+            ),
+            table_recovery_enabled=self.table_recovery_enabled,
+            table_recovery_timeout_seconds=self.table_recovery_timeout_seconds,
+            formula_recovery_enabled=self.formula_recovery_enabled,
+            formula_recovery_timeout_seconds=self.formula_recovery_timeout_seconds,
             force_mineru=self.force_mineru,
         )
 
@@ -430,6 +457,22 @@ def parse_paper(
         middle_path=artifacts.middle_json,
     )
 
+    table_recovery_report = recover_image_only_tables(
+        document=document,
+        project_root=project_root,
+        paddleocr_executable=config.paddleocr_executable,
+        enabled=config.table_recovery_enabled,
+        timeout_seconds=config.table_recovery_timeout_seconds,
+    )
+    formula_recovery_report = recover_high_risk_formulas(
+        document=document,
+        project_root=project_root,
+        paddleocr_executable=config.paddleocr_executable,
+        enabled=config.formula_recovery_enabled,
+        timeout_seconds=config.formula_recovery_timeout_seconds,
+    )
+    quality_validation_report = validate_canonical_document(document)
+
     # 外部元数据核验属于本地 Agent 的后处理结果。相同 SHA 的 PDF 重新标准化时
     # 保留已经严格核验或显式选择的元数据，同时刷新 MinerU 提取的 parser_title。
     previous_source = previous_document.get("source")
@@ -538,6 +581,9 @@ def parse_paper(
             project_root,
         ),
         "adapter_report": adapter_report,
+        "table_recovery_report": table_recovery_report,
+        "formula_recovery_report": formula_recovery_report,
+        "quality_validation_report": quality_validation_report,
     }
     document["formulas"] = formulas
     document["tables"] = tables

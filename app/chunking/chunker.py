@@ -14,7 +14,7 @@ from app.storage import write_json_atomic
 
 
 CHUNK_SCHEMA_VERSION = "2.0"
-CHUNK_POLICY_VERSION = "2.1"
+CHUNK_POLICY_VERSION = "2.2"
 DEFAULT_MAX_TOKENS = 700
 DEFAULT_MIN_CHUNK_TOKENS = 80
 DEFAULT_OVERLAP_TOKENS = 80
@@ -264,7 +264,10 @@ def _overlap_context(
         return None
     selected: list[_Unit] = []
     remaining = overlap_tokens
+    eligible_types = {"paragraph", "list"}
     for unit in reversed(units):
+        if unit.block_type not in eligible_types:
+            continue
         if unit.token_count <= remaining:
             selected.append(unit)
             remaining -= unit.token_count

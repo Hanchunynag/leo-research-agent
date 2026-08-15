@@ -137,6 +137,8 @@ def test_pipeline_reuses_mineru_and_writes_one_paper_json(
     )
     assert paragraph["text"] == "The model is $x=1$ for this test."
     assert paper["pipeline"]["mineru_reused"] is True
+    assert paper["pipeline"]["formula_recovery_report"]["formula_count"] == 1
+    assert paper["pipeline"]["formula_recovery_report"]["fallback_count"] == 0
     assert paper["source"]["sha256"] == calculate_sha256(pdf)
 
     algorithm = next(

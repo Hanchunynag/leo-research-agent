@@ -9,10 +9,12 @@ import pytest
 import main as cli
 from app.chunking.builder import build_knowledge_base
 from app.chunking.chunker import build_chunks
+from app.chunking.chunker import _Unit, _overlap_context
 from app.chunking.structure import (
     build_structure,
     infer_heading_level,
     is_false_heading,
+    render_block_content,
 )
 from app.indexing.bm25 import build_bm25_index, write_bm25_index
 from app.retrieval.search import search_evidence
@@ -304,6 +306,70 @@ def test_overlap_is_bounded_and_never_crosses_section_boundary() -> None:
         chunk for chunk in chunks if chunk["section_path"] == ["II. RESULTS"]
     )
     assert result_chunk["overlap_context"] is None
+
+
+def test_overlap_skips_equation_and_asset_tails() -> None:
+    units = [
+        _Unit(
+            block_id="P_test_p001_b001",
+            page_number=1,
+            block_type="paragraph",
+            content="A complete paragraph provides useful context.",
+            token_count=7,
+            related_text_block_ids=[],
+        ),
+        _Unit(
+            block_id="P_test_p001_b002",
+            page_number=1,
+            block_type="equation",
+            content="matrix tail should not be copied",
+            token_count=7,
+            related_text_block_ids=[],
+        ),
+    ]
+
+    context = _overlap_context(units, overlap_tokens=10)
+
+    assert context is not None
+    assert context["block_ids"] == ["P_test_p001_b001"]
+    assert "matrix tail" not in context["content"]
+
+
+def test_captionless_figure_is_kept_but_not_searchable() -> None:
+    document = canonical_document(
+        blocks=[
+            block(0, "title", "LEO Evidence Paper", title_level_raw=1),
+            block(1, "title", "I. INTRODUCTION", title_level_raw=2),
+            block(
+                2,
+                "figure",
+                image_path="data/parsed/figure.jpg",
+                caption="",
+                text="",
+            ),
+            block(
+                3,
+                "figure",
+                image_path="data/parsed/figure-with-caption.jpg",
+                caption="Figure 1. Tracking geometry.",
+                text="",
+            ),
+        ]
+    )
+
+    assert render_block_content(document["blocks"][2]) == ""
+    assert render_block_content(document["blocks"][3]) == (
+        "[Figure]\nFigure 1. Tracking geometry."
+    )
+
+    structure = build_structure(document)
+    empty, captioned = structure["blocks"][2:]
+    assert empty["block_id"] == "P_test_p001_b002"
+    assert empty["image_path"] == "data/parsed/figure.jpg"
+    assert empty["content"] == ""
+    assert empty["searchable"] is False
+    assert empty["exclusion_reason"] == "empty_figure"
+    assert captioned["searchable"] is True
 
 
 def test_knowledge_build_reuses_unchanged_document(tmp_path: Path) -> None:
