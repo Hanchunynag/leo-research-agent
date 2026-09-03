@@ -285,6 +285,15 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--document-id")
         add_embedding_options(command)
     knowledge_subparsers.add_parser("status", help="显示 active/pending/failed epoch 与 Outbox。")
+    database_command = knowledge_subparsers.add_parser(
+        "database",
+        help="初始化或检查可选 MySQL 结构化知识库（不存向量）。",
+    )
+    database_command.add_argument(
+        "database_action",
+        choices=["init", "status"],
+        help="init 创建 Schema；status 显示连接与表状态。",
+    )
     retry_command = knowledge_subparsers.add_parser("retry-failed", help="将失败 Epoch 置为可重试。")
     retry_command.add_argument("--epoch", type=int)
     cleanup_command = knowledge_subparsers.add_parser("cleanup-epochs", help="清理旧失败 Epoch 的注册记录。")
@@ -1195,6 +1204,29 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.command == "knowledge":
         from app.index_registry.store import IndexRegistryStore
+
+        if args.knowledge_command == "database":
+            from app.persistence import build_knowledge_repository
+
+            try:
+                repository = build_knowledge_repository(PROJECT_ROOT)
+            except Exception as error:
+                raise SystemExit(f"Structured database 错误：{type(error).__name__}: {error}") from error
+            if repository is None:
+                print_json({"enabled": False, "message": "MySQL 未启用，继续使用 JSON/JSONL fallback。"})
+            else:
+                from sqlalchemy import inspect as sqlalchemy_inspect
+
+                print_json({
+                    "enabled": True,
+                    "action": args.database_action,
+                    "tables": sorted(sqlalchemy_inspect(repository.engine).get_table_names())
+                    if repository.engine is not None
+                    else [],
+                    "vectors_in_mysql": False,
+                })
+                repository.close()
+            return
 
         registry = IndexRegistryStore(PROJECT_ROOT)
         if args.knowledge_command == "status":
