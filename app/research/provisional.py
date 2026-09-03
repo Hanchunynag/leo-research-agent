@@ -86,9 +86,30 @@ def register_abstract_evidence(
         seen.add(value["evidence_id"])
         evidence.append(value)
         if enqueue_fulltext is not None:
-            jobs.append(enqueue_fulltext(dict(paper)))
+            job = enqueue_fulltext(dict(paper))
+            jobs.append(job)
+            if isinstance(job, Mapping) and job.get("job_id"):
+                value["fulltext_job_id"] = str(job["job_id"])
     path = provisional_evidence_path(project_root, session_id)
     write_jsonl_atomic(path, evidence)
+    try:
+        from app.persistence import build_knowledge_repository
+
+        repository = build_knowledge_repository(project_root)
+        if repository is not None:
+            repository.record_temporary_evidence(evidence, query_id=session_id)
+            for job in jobs:
+                if isinstance(job, Mapping) and job.get("job_id"):
+                    repository.record_job(job)
+            repository.close()
+    except Exception:
+        from app.persistence.mysql import MySQLConfig
+
+        if not MySQLConfig.from_environment(project_root).fallback_to_json:
+            raise
+        # Abstract evidence remains available through the existing JSONL
+        # projection when the optional database is offline.
+        pass
     return {
         "evidence": evidence,
         "evidence_count": len(evidence),

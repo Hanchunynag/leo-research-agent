@@ -248,6 +248,14 @@ class KnowledgeIndexService:
             if emit:
                 emit("building_dense", "正在通过 KnowledgeIndexService 更新迁移期 Dense 索引。", 0.98, None)
             dense = build_dense_index(root, embedding_provider)
+            # Keep the established parse response compatible for lightweight
+            # fixtures, while production providers build the new Paper layer
+            # in the same offline synchronization transaction.
+            paper_dense = None
+            if getattr(embedding_provider, "model_name", None):
+                from app.indexing.paper_dense import build_paper_dense_index
+
+                paper_dense = build_paper_dense_index(root, embedding_provider)
             from app.workspaces import WorkspaceService
 
             workspace = WorkspaceService(root).synchronize_default_documents()
@@ -267,6 +275,8 @@ class KnowledgeIndexService:
                 "workspace_id": workspace.workspace_id,
                 "scope_version": workspace.scope_version,
             }
+            if paper_dense is not None:
+                result["paper_dense"] = paper_dense.to_dict()
             record("COMPLETED", result=result)
             return result
         except BaseException as error:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -77,6 +77,7 @@ class KnowledgeBuildReport:
     issues: list[KnowledgeBuildIssue]
     documents: list[KnowledgeDocumentResult]
     paper_bm25_index: str | None = None
+    structured_store: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -242,6 +243,13 @@ def build_knowledge_base(
     chunks_output = chunks_jsonl_path(root)
     write_jsonl_atomic(chunks_output, all_chunks)
     bm25_output = write_bm25_index(root, build_bm25_index(all_chunks))
+    # MySQL is the structured fact source when enabled.  The JSON/JSONL
+    # artifacts above remain deliberately rebuildable compatibility outputs.
+    # Sync before building the paper projection so the next index build is
+    # already MySQL-first.
+    from app.persistence import sync_knowledge_to_mysql
+
+    structured_store = sync_knowledge_to_mysql(root, chunks=all_chunks)
     paper_bm25 = build_paper_bm25_index(root, force=force)
     report = KnowledgeBuildReport(
         built_at=utc_now_iso(),
@@ -280,6 +288,7 @@ def build_knowledge_base(
         issues=issues,
         documents=document_results,
         paper_bm25_index=project_relative(Path(paper_bm25.index_path), root),
+        structured_store=structured_store,
     )
     write_json_atomic(
         root / "data" / "knowledge" / "last_knowledge_build.json",

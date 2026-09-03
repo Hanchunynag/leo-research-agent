@@ -38,6 +38,9 @@ def _paper_matches_filters(paper: dict[str, Any], filters: dict[str, Any] | None
     allowed_ids = filters.get("paper_ids")
     if allowed_ids and str(paper.get("paper_id")) not in {str(value) for value in allowed_ids}:
         return False
+    document_ids = {str(value) for value in filters.get("document_ids") or [] if str(value)}
+    if document_ids and str(paper.get("document_id") or "") not in document_ids:
+        return False
     author = str(filters.get("author") or "").strip().casefold()
     if author and not any(author in str(value).casefold() for value in paper.get("authors") or []):
         return False
@@ -129,6 +132,9 @@ def _paper_filter(filters: dict[str, Any] | None) -> models.Filter | None:
     ids = [str(value) for value in filters.get("paper_ids") or [] if str(value)]
     if ids:
         must.append(models.FieldCondition(key="paper_id", match=models.MatchAny(any=ids)))
+    document_ids = [str(value) for value in filters.get("document_ids") or [] if str(value)]
+    if document_ids:
+        must.append(models.FieldCondition(key="document_id", match=models.MatchAny(any=document_ids)))
     year_from = filters.get("year_from")
     year_to = filters.get("year_to")
     if year_from is not None:
@@ -195,7 +201,8 @@ def _rrf(rankings: dict[str, Sequence[dict[str, Any]]], *, rrf_k: int, limit: in
             if not paper_id or paper_id in seen:
                 continue
             seen.add(paper_id)
-            rank = value.get("rank") if isinstance(value.get("rank"), int) else fallback
+            raw_rank = value.get("rank")
+            rank = raw_rank if isinstance(raw_rank, int) and not isinstance(raw_rank, bool) else fallback
             scores[paper_id] += 1.0 / (rrf_k + max(rank, 1))
             ranks[paper_id][source] = max(rank, 1)
             candidates.setdefault(paper_id, dict(value))

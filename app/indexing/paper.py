@@ -118,7 +118,11 @@ def _record_from_mapping(project_root: Path, value: dict[str, Any]) -> PaperReco
     )
 
 
-def load_paper_records(project_root: Path) -> list[dict[str, Any]]:
+def load_paper_records(
+    project_root: Path,
+    *,
+    prefer_database: bool = True,
+) -> list[dict[str, Any]]:
     """Load the paper projection, falling back to the existing catalog/chunks.
 
     The fallback keeps old corpora usable during migration.  It does not alter
@@ -126,6 +130,27 @@ def load_paper_records(project_root: Path) -> list[dict[str, Any]]:
     """
 
     root = project_root.expanduser().resolve()
+    # MySQL is authoritative when explicitly enabled.  A disabled or
+    # unavailable database falls back to the existing projections so old
+    # corpora and offline tests remain usable.
+    try:
+        from app.persistence import build_knowledge_repository
+
+        if prefer_database:
+            repository = build_knowledge_repository(root)
+            if repository is not None:
+                try:
+                    return repository.list_papers()
+                finally:
+                    repository.close()
+    except Exception:
+        # The configured repository owns fail-closed behavior for callers that
+        # explicitly disable fallback.  This compatibility loader only falls
+        # through when fallback is enabled or the database is not configured.
+        from app.persistence.mysql import MySQLConfig
+
+        if not MySQLConfig.from_environment(root).fallback_to_json:
+            raise
     candidates: list[dict[str, Any]] = []
     projection = paper_records_path(root)
     if projection.is_file():
@@ -172,8 +197,10 @@ def write_paper_records(project_root: Path, records: Iterable[dict[str, Any]]) -
 
 
 def paper_retrieval_text(paper: dict[str, Any]) -> str:
-    authors = paper.get("authors") if isinstance(paper.get("authors"), list) else []
-    keywords = paper.get("keywords") if isinstance(paper.get("keywords"), list) else []
+    raw_authors = paper.get("authors")
+    raw_keywords = paper.get("keywords")
+    authors: list[Any] = list(raw_authors) if isinstance(raw_authors, list) else []
+    keywords: list[Any] = list(raw_keywords) if isinstance(raw_keywords, list) else []
     return "\n".join(
         (
             f"Title: {paper.get('title') or ''}",
@@ -227,20 +254,22 @@ def build_paper_bm25_index(
     postings: dict[str, list[list[int]]] = {}
     documents: list[dict[str, Any]] = []
     total_length = 0
-    for index, paper in enumerate(values):
+    for paper_index, paper in enumerate(values):
         tokens = tokenize(paper_retrieval_text(paper))
         frequencies = Counter(tokens)
         total_length += len(tokens)
         documents.append({**paper, "length": len(tokens)})
         for term, frequency in frequencies.items():
-            postings.setdefault(term, []).append([index, frequency])
-    index = {
+            postings.setdefault(term, []).append([paper_index, frequency])
+    index_payload = {
         "paper_bm25_schema_version": PAPER_BM25_SCHEMA_VERSION,
         "papers_digest": digest,
+        "index_epoch": f"PA_{digest[:16]}",
+        "tokenizer_version": "app.indexing.tokenization.v1",
         "document_count": len(documents),
         "average_document_length": total_length / len(documents) if documents else 0.0,
         "documents": documents,
         "postings": postings,
     }
-    write_json_atomic(output, index)
+    write_json_atomic(output, index_payload)
     return PaperBM25BuildReport("built", str(output), len(values), len(documents), digest)
