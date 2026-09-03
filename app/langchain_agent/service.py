@@ -157,6 +157,12 @@ class LangChainHarnessAgentService:
                     "validation_llm_call": self._validation_llm_call,
                     "retrieval_queries": retrieval_queries,
                     "target_document_ids": self._target_document_ids(state, structured_task),
+                    "paper_filters": self._paper_filters(
+                        state,
+                        plan if isinstance(plan, Mapping) else {},
+                        structured_task,
+                    ),
+                    "planner_result": dict(plan) if isinstance(plan, Mapping) else {},
                     "timeline_metadata": list(state.get("publication_metadata") or []),
                     "agent_instructions": self._agent_instructions(
                         plan if isinstance(plan, Mapping) else {}
@@ -180,6 +186,28 @@ class LangChainHarnessAgentService:
                 if isinstance(value, Mapping) and str(value.get("document_id") or "").strip()
             )
         )
+
+    @staticmethod
+    def _paper_filters(
+        state: Mapping[str, Any],
+        plan: Mapping[str, Any],
+        structured_task: bool,
+    ) -> dict[str, Any]:
+        """Translate bounded planner constraints into Paper-level filters."""
+        filters: dict[str, Any] = {}
+        constraints = plan.get("time_constraints")
+        if isinstance(constraints, Mapping):
+            for key in ("year_from", "year_to"):
+                value = constraints.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    filters[key] = value
+        if structured_task:
+            document_ids = list(
+                LangChainHarnessAgentService._target_document_ids(state, True)
+            )
+            if document_ids:
+                filters["document_ids"] = document_ids
+        return filters
 
     @staticmethod
     def _planned_retrieval_queries(
@@ -354,6 +382,11 @@ class LangChainHarnessAgentService:
             "current_skill": state.get("current_skill"),
             "current_task": state.get("current_task"),
             "task_type": state.get("task_type"),
+            "research_intent": state.get("research_intent"),
+            "keywords": list(state.get("keywords") or []),
+            "time_constraints": dict(state.get("time_constraints") or {}),
+            "expected_evidence": list(state.get("expected_evidence") or []),
+            "need_retrieval": bool(state.get("need_retrieval", True)),
             "research_plan": dict(state.get("research_plan") or {}),
             "papers": list(state.get("papers") or []),
             "timeline": list(state.get("timeline") or []),

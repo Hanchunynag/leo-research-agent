@@ -196,9 +196,11 @@ class CanonicalDocumentParseProviderAdapter:
         project_root: Path,
         *,
         parser: ParseProvider = parse_paper,
+        indexer: Callable[[Path], Mapping[str, Any]] | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve()
         self.parser = parser
+        self.indexer = indexer
 
     def parse(self, path: str, mode: str) -> Mapping[str, Any]:
         source = Path(path).expanduser().resolve()
@@ -208,13 +210,16 @@ class CanonicalDocumentParseProviderAdapter:
         document_id = identity.get("document_id") if isinstance(identity, dict) else None
         if not document_id:
             raise ValueError("Canonical parse 未生成 document_id。")
-        return {
+        result_value: dict[str, Any] = {
             "document_id": str(document_id),
             "paper_id": result.paper_id,
             "content_hash": result.sha256,
             "paper_json": result.paper_json.relative_to(self.project_root).as_posix(),
             "mode": mode,
         }
+        if self.indexer is not None:
+            result_value["indexing"] = dict(self.indexer(self.project_root))
+        return result_value
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +235,7 @@ def build_bootstrap_provider_composition(
     *,
     parser: ParseProvider = parse_paper,
     worker_id: str = "bootstrap-worker",
+    indexer: Callable[[Path], Mapping[str, Any]] | None = None,
 ) -> BootstrapProviderComposition:
     root = project_root.expanduser().resolve()
     repository = PersistentJobRepository(root)
@@ -237,12 +243,36 @@ def build_bootstrap_provider_composition(
     literature = AcademicLiteratureProviderAdapter(
         backend, CandidateKnowledgeRepository(root)
     )
-    document_parser = CanonicalDocumentParseProviderAdapter(root, parser=parser)
-    submitter = LongTaskSubmitter(repository)
+    document_parser = CanonicalDocumentParseProviderAdapter(root, parser=parser, indexer=indexer)
+    structured_repository = None
+    try:
+        from app.persistence import build_knowledge_repository
+
+        structured_repository = build_knowledge_repository(root)
+    except Exception:
+        from app.persistence.mysql import MySQLConfig
+
+        if not MySQLConfig.from_environment(root).fallback_to_json:
+            raise
+    submitter = LongTaskSubmitter(repository, structured_repository)
 
     def download_job(record: JobRecord, context: Any) -> str:
         context.raise_if_cancelled()
         result = literature.download(str(record.payload["paper_id"]))
+        downloaded_path = str(result.get("path") or "") if isinstance(result, Mapping) else ""
+        if downloaded_path and indexer is not None:
+            # A discovered abstract is immediately useful for the current
+            # run, while the existing durable Job chain continues with full
+            # PDF parsing and indexing in the background.
+            parse_submitter = submitter.handler("document.parse")
+            parse_job = parse_submitter(
+                {"path": downloaded_path, "mode": "formal"},
+                {
+                    "workspace_id": record.workspace_id,
+                    "scope_version": record.scope_version,
+                },
+            )
+            result = {**dict(result), "parse_job": dict(parse_job)}
         return results.write(record.job_id, result)
 
     def parse_job(record: JobRecord, context: Any) -> str:

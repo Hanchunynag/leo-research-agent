@@ -39,6 +39,10 @@ class ResearchAgentState(TypedDict, total=False):
     translation: dict[str, Any]
     retrieval_evidence: list[dict[str, Any]]
     retrieved_evidence: list[dict[str, Any]]
+    evidence: list[dict[str, Any]]
+    citations: list[dict[str, Any]]
+    answer: str | None
+    need_more_search: bool
     evidence_gap: list[str]
     iteration: int
     max_iterations: int
@@ -58,6 +62,11 @@ class ResearchAgentState(TypedDict, total=False):
     publication_metadata: list[dict[str, Any]]
     task_type: ResearchTaskType
     research_plan: dict[str, Any]
+    research_intent: str
+    keywords: list[str]
+    time_constraints: dict[str, Any]
+    expected_evidence: list[str]
+    need_retrieval: bool
     papers: list[dict[str, Any]]
     timeline: list[dict[str, Any]]
     evidence_by_paper: dict[str, list[str]]
@@ -114,16 +123,11 @@ class LLMActionDecider:
             action = parse_json_object(str(content))
             if action.get("type") not in {"tool", "clarify", "final"}:
                 raise ValueError("action.type 无效")
-            if action.get("type") == "tool" and action.get("tool_name") not in {
-                "knowledge.retrieve",
-                "literature.search",
-                "workspace.list_documents",
-                "document.get_outline",
-                "document.read",
-                "language.translate",
-                "literature.resolve_publication_date",
-            }:
-                raise ValueError("tool_name 不在 Agent allowlist 中")
+            # The LLM controller is deliberately not a free-form tool caller.
+            # All preparation tools are fixed graph transitions; a controller
+            # may only request the bounded local retrieval gateway.
+            if action.get("type") == "tool" and action.get("tool_name") != "knowledge.retrieve":
+                raise ValueError("LLM controller 只能调用固定 knowledge.retrieve")
             if action.get("type") == "final" and state.get("observation") is None:
                 return fallback
             if action.get("type") == "clarify" and not state.get("pending_question"):
@@ -273,6 +277,11 @@ class LangGraphResearchRuntime:
         plan = build_research_plan(task_type, state.get("original_query", ""))
         return {
             "research_plan": plan,
+            "research_intent": str(plan.get("research_intent") or task_type),
+            "keywords": [str(value) for value in plan.get("keywords") or []],
+            "time_constraints": dict(plan.get("time_constraints") or {}),
+            "expected_evidence": [str(value) for value in plan.get("expected_evidence") or []],
+            "need_retrieval": bool(plan.get("semantic_retrieval", True)),
             "trace": self._record(state, "research_planner", plan=plan),
         }
 
@@ -526,6 +535,8 @@ class LangGraphResearchRuntime:
                 updates["timeline"] = sort_timeline(updates["publication_metadata"])
         if name == "knowledge.retrieve":
             values = list(observation.get("selected_evidence") or observation.get("results") or [])
+            updates["evidence"] = [dict(value) for value in values if isinstance(value, Mapping)]
+            updates["need_more_search"] = not bool(values)
             updates["evidence_by_paper"] = group_evidence_by_paper(
                 [value for value in values if isinstance(value, Mapping)]
             )
@@ -571,6 +582,8 @@ class LangGraphResearchRuntime:
         return {
             "result": dict(answer) if isinstance(answer, Mapping) else None,
             "final_answer": str(answer.get("answer") or "") if isinstance(answer, Mapping) else None,
+            "answer": str(answer.get("answer") or "") if isinstance(answer, Mapping) else None,
+            "citations": list(answer.get("citations") or []) if isinstance(answer, Mapping) else [],
             "trace": LangGraphResearchRuntime._static_trace(state, "final", status="succeeded"),
         }
 

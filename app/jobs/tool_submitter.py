@@ -23,8 +23,9 @@ LONG_RUNNING_JOB_TYPES = frozenset(
 
 
 class LongTaskSubmitter:
-    def __init__(self, repository: PersistentJobRepository) -> None:
+    def __init__(self, repository: PersistentJobRepository, structured_repository: Any | None = None) -> None:
         self.repository = repository
+        self.structured_repository = structured_repository
 
     @staticmethod
     def _key(
@@ -72,6 +73,18 @@ class LongTaskSubmitter:
                 payload=dict(arguments),
                 idempotency_key=self._key(job_type, arguments, context),
             )
+            if self.structured_repository is not None:
+                try:
+                    self.structured_repository.record_job({
+                        "job_id": record.job_id,
+                        "job_type": job_type,
+                        "paper_id": arguments.get("paper_id"),
+                        "document_id": arguments.get("document_id"),
+                        "status": record.status.casefold(),
+                        "payload": dict(arguments),
+                    })
+                except Exception:
+                    pass
             return {
                 "job_id": record.job_id,
                 "status": record.status.casefold(),
@@ -79,4 +92,3 @@ class LongTaskSubmitter:
             }
 
         return submit
-

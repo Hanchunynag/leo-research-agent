@@ -26,7 +26,22 @@ def load_json_object(path: Path) -> dict[str, Any]:
 
 
 def load_chunks(project_root: Path) -> list[dict[str, Any]]:
-    path = project_root.expanduser().resolve() / "data" / "knowledge" / "chunks.jsonl"
+    root = project_root.expanduser().resolve()
+    try:
+        from app.persistence import build_knowledge_repository
+
+        repository = build_knowledge_repository(root)
+        if repository is not None:
+            try:
+                return repository.list_chunks()
+            finally:
+                repository.close()
+    except Exception:
+        from app.persistence.mysql import MySQLConfig
+
+        if not MySQLConfig.from_environment(root).fallback_to_json:
+            raise
+    path = root / "data" / "knowledge" / "chunks.jsonl"
     if not path.is_file():
         raise FileNotFoundError(path)
     chunks: list[dict[str, Any]] = []

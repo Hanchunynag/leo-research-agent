@@ -171,10 +171,19 @@ class LocalRAGWebRuntime:
             self.project_root,
             contact_email=os.getenv("LEO_ACADEMIC_CONTACT_EMAIL"),
         )
+
+        def index_after_parse(root: Path) -> dict[str, Any]:
+            from app.knowledge_engine import KnowledgeIndexService
+
+            return KnowledgeIndexService(project_root=root).synchronize_after_parse(
+                self._retrieval_runtime().embedding_provider
+            )
+
         composition = build_bootstrap_provider_composition(
             self.project_root,
             self._bootstrap_backend,
             worker_id="web-bootstrap-worker",
+            indexer=index_after_parse,
         )
         self._bootstrap_composition = composition
 

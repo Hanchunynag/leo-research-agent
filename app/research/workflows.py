@@ -173,6 +173,7 @@ class BaseWorkflow:
             "workspace_id": request.workspace_id,
             "scope_version": request.scope_version,
             "top_k": request.top_k,
+            "paper_filters": dict(getattr(request, "paper_filters", {}) or {}),
         }
         target_document_ids = tuple(
             value.strip()
@@ -297,6 +298,11 @@ class DirectQAWorkflow(BaseWorkflow):
             {"sufficient": bool(evidence)},
             {
                 "primary_generation_calls": harness.usage.llm_calls,
+                "paper_candidates": list(retrieval.get("candidate_papers") or []),
+                "candidate_paper_ids": list(retrieval.get("candidate_paper_ids") or []),
+                "retrieved_chunk_ids": [
+                    value.get("chunk_id") for value in evidence if value.get("chunk_id")
+                ],
                 **({"generation_failure": generation_failure} if generation_failure else {}),
             },
         )
@@ -385,6 +391,11 @@ class RelationReasoningWorkflow(BaseWorkflow):
             {
                 "gap_retrievals": max(0, harness.usage.retrieval_rounds - 1),
                 "gap_retrieval_failed": gap_failed,
+                "paper_candidates": list(retrieval.get("candidate_papers") or []),
+                "candidate_paper_ids": list(retrieval.get("candidate_paper_ids") or []),
+                "retrieved_chunk_ids": [
+                    value.get("chunk_id") for value in evidence if value.get("chunk_id")
+                ],
                 "query_frame": query_frame.to_dict(),
                 **({"generation_failure": generation_failure} if generation_failure else {}),
             },
@@ -436,11 +447,26 @@ class DeepResearchWorkflow(BaseWorkflow):
                         if isinstance(raw_discovered, list)
                         else []
                     )
+                    def enqueue_fulltext(paper: Mapping[str, Any]) -> Mapping[str, Any] | None:
+                        paper_id = str(paper.get("paper_id") or paper.get("id") or "").strip()
+                        if not paper_id:
+                            return None
+                        try:
+                            return self.gateway.invoke(
+                                "literature.download",
+                                {"paper_id": paper_id},
+                                context=_tool_context(self.name, request),
+                                harness=harness,
+                            )
+                        except Exception as error:
+                            return {"status": "enqueue_failed", "error_type": type(error).__name__}
+
                     if request.project_root is not None:
                         provisional = register_abstract_evidence(
                             request.project_root,
                             request.session_id or harness.run_id,
                             discovered_papers,
+                            enqueue_fulltext=enqueue_fulltext,
                         )
                     else:
                         provisional_values = [
@@ -495,6 +521,12 @@ class DeepResearchWorkflow(BaseWorkflow):
                 "external_search_failed": external_search_failed,
                 "provisional_evidence_count": int(provisional.get("evidence_count") or 0),
                 "provisional_evidence_path": provisional.get("path"),
+                "fulltext_jobs": list(provisional.get("fulltext_jobs") or []),
+                "paper_candidates": list(retrieval.get("candidate_papers") or []),
+                "candidate_paper_ids": list(retrieval.get("candidate_paper_ids") or []),
+                "retrieved_chunk_ids": [
+                    value.get("chunk_id") for value in evidence if value.get("chunk_id")
+                ],
                 **({"generation_failure": generation_failure} if generation_failure else {}),
             },
         )

@@ -250,6 +250,9 @@ def build_dense_index(
         "chunk_count": len(chunks),
         "chunks_digest": digest,
         "point_id_policy": "uuid5(chunk_id)",
+        "index_epoch": f"CH_{digest[:16]}",
+        "tokenizer_version": "app.indexing.tokenization.v1",
+        "chunker_version": "app.chunking.chunker.v2.2",
     }
 
     swapped = False

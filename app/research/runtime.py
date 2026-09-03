@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -56,6 +56,8 @@ class WorkflowRequest:
     # remains unchanged; its selected evidence is filtered at the tool boundary
     # before it enters the generator context.
     target_document_ids: tuple[str, ...] = ()
+    paper_filters: Mapping[str, Any] = field(default_factory=dict)
+    planner_result: Mapping[str, Any] = field(default_factory=dict)
     # Planner-owned rendering constraints. They guide synthesis only and must
     # never alter the user's query or the retrieval query variants.
     agent_instructions: tuple[str, ...] = ()
@@ -136,6 +138,7 @@ class ResearchRuntime:
         state_store: ResearchStateStore | None = None,
         trace_store: RunTraceStore | None = None,
         project_root: Path | None = None,
+        structured_repository: Any | None = None,
     ) -> None:
         self.gateway = gateway
         self.generator = generator
@@ -144,6 +147,7 @@ class ResearchRuntime:
         self.state_store = state_store
         self.trace_store = trace_store
         self.project_root = project_root.expanduser().resolve() if project_root else None
+        self.structured_repository = structured_repository
 
     @staticmethod
     def route(request: WorkflowRequest) -> WorkflowName:
@@ -362,6 +366,66 @@ class ResearchRuntime:
         execution: WorkflowExecution,
         draft: Mapping[str, Any],
     ) -> None:
+        if self.structured_repository is not None:
+            try:
+                query_id = self.structured_repository.record_query({
+                    "id": harness.run_id,
+                    "session_id": request.session_id,
+                    "workspace_id": request.workspace_id,
+                    "scope_version": request.scope_version,
+                    "user_query": request.query,
+                    "planner_result": {
+                        **dict(request.planner_result),
+                        "workflow": workflow.value,
+                        "retrieval_queries": list(request.retrieval_queries),
+                        "target_document_ids": list(request.target_document_ids),
+                        "agent_instructions": list(request.agent_instructions),
+                    },
+                    "retrieved_papers": list(execution.details.get("paper_candidates") or []),
+                    "retrieved_chunks": [
+                        {
+                            "evidence_id": value.get("evidence_id"),
+                            "chunk_id": value.get("chunk_id"),
+                            "paper_id": value.get("paper_id"),
+                            "rank": value.get("rank"),
+                            "score": value.get("score"),
+                        }
+                        for value in execution.evidence
+                    ],
+                    "selected_evidence": [
+                        {
+                            "evidence_id": value.get("evidence_id"),
+                            "chunk_id": value.get("chunk_id"),
+                            "paper_id": value.get("paper_id"),
+                        }
+                        for value in execution.evidence
+                    ],
+                    "coverage_report": dict(execution.coverage),
+                    "final_answer": str(draft.get("answer") or "\n".join(
+                        str(value.get("text") or "")
+                        for value in draft.get("claims") or []
+                        if isinstance(value, Mapping)
+                    )),
+                    "status": "completed",
+                })
+                evidence_by_id = {str(value.get("evidence_id")): value for value in execution.evidence}
+                citations: list[dict[str, Any]] = []
+                for claim in draft.get("claims") or []:
+                    if not isinstance(claim, Mapping):
+                        continue
+                    for evidence_id in claim.get("evidence_ids") or []:
+                        evidence = evidence_by_id.get(str(evidence_id), {})
+                        citations.append({
+                            "claim_id": claim.get("claim_id"),
+                            "claim": claim.get("text"),
+                            "chunk_id": evidence.get("chunk_id"),
+                            "paper_id": evidence.get("paper_id"),
+                            "verified": True,
+                        })
+                self.structured_repository.record_citations(query_id, citations)
+            except Exception:
+                # Existing JSON/trace persistence remains the safe fallback.
+                pass
         if self.state_store is None:
             return
         if request.session_id:
@@ -452,6 +516,8 @@ class HarnessAgentService:
         validation_llm_call: bool = False,
         timeline_metadata: Sequence[Mapping[str, Any]] = (),
         target_document_ids: Sequence[str] = (),
+        paper_filters: Mapping[str, Any] | None = None,
+        planner_result: Mapping[str, Any] | None = None,
         agent_instructions: Sequence[str] = (),
         **_: Any,
     ) -> dict[str, Any]:
@@ -489,6 +555,8 @@ class HarnessAgentService:
                     for value in target_document_ids
                     if isinstance(value, str) and value.strip()
                 ),
+                paper_filters=dict(paper_filters or {}),
+                planner_result=dict(planner_result or {}),
                 agent_instructions=tuple(
                     value.strip()
                     for value in agent_instructions
@@ -773,12 +841,20 @@ def unified_tool_handlers(
             raise PermissionError("Tool 参数与 Run scope 不一致。")
         if workspace_id != str(getattr(knowledge, "workspace_id", workspace_id)):
             raise PermissionError("Unified Knowledge Service workspace 不匹配。")
-        value = knowledge.retrieve(
-            str(arguments["query"]),
-            limit=int(arguments.get("top_k") or 10),
-            workspace_id=workspace_id,
-            scope_version=scope_version,
-        )
+        retrieval_kwargs: dict[str, Any] = {
+            "limit": int(arguments.get("top_k") or 10),
+            "workspace_id": workspace_id,
+            "scope_version": scope_version,
+        }
+        # The production UnifiedKnowledgeService exposes official_runtime;
+        # lightweight legacy test doubles keep the original call contract.
+        # Paper filters still activate the explicit hierarchical path.
+        if hasattr(knowledge, "official_runtime") or arguments.get("paper_filters"):
+            retrieval_kwargs.update({
+                "mode": "hierarchical",
+                "paper_filters": dict(arguments.get("paper_filters") or {}),
+            })
+        value = knowledge.retrieve(str(arguments["query"]), **retrieval_kwargs)
         results = value.get("results") if isinstance(value, Mapping) else None
         selected = (
             [
@@ -799,7 +875,13 @@ def unified_tool_handlers(
                     for value in raw_conflicts
                     if isinstance(value, (list, tuple)) and len(value) == 2
                 ]
-        return {"results": selected, "diagnostics": diagnostics}
+        output: dict[str, Any] = {"results": selected, "diagnostics": diagnostics}
+        # Preserve the paper-level boundary and retrieval audit trail for the
+        # LangGraph state/query_history without exposing backend objects.
+        for key in ("candidate_papers", "candidate_paper_ids", "paper_retrieval", "chunk_retrieval", "retriever"):
+            if key in value:
+                output[key] = value[key]
+        return output
 
     def read_scope(arguments: Mapping[str, Any], _: Mapping[str, Any]) -> Mapping[str, Any]:
         scope = workspaces.require_scope(str(arguments["workspace_id"]), int(arguments["scope_version"]))
@@ -840,6 +922,17 @@ def build_research_runtime(
     validator: ClaimEvidenceValidator | TieredClaimEvidenceValidator | None = None,
 ) -> ResearchRuntime:
     gateway = build_default_gateway(unified_tool_handlers(knowledge, workspaces, extras=extra_tools))
+    structured_repository = None
+    try:
+        from app.persistence import build_knowledge_repository
+
+        structured_repository = build_knowledge_repository(project_root)
+    except Exception:
+        from app.persistence.mysql import MySQLConfig
+
+        if not MySQLConfig.from_environment(project_root).fallback_to_json:
+            raise
+        structured_repository = None
     return ResearchRuntime(
         gateway,
         generator,
@@ -847,6 +940,7 @@ def build_research_runtime(
         state_store=ResearchStateStore(project_root),
         trace_store=RunTraceStore(project_root),
         project_root=project_root,
+        structured_repository=structured_repository,
     )
 
 

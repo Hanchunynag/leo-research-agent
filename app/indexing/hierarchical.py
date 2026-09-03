@@ -8,6 +8,7 @@ from typing import Any
 from app.chunking.builder import build_knowledge_base
 from app.embeddings.base import EmbeddingProvider
 from app.indexing.dense import build_dense_index
+from app.indexing.paper import load_paper_records, papers_digest
 from app.indexing.paper_dense import build_paper_dense_index
 
 
@@ -36,9 +37,29 @@ def build_hierarchical_indexes(
     )
     chunk_dense = build_dense_index(project_root, embedding_provider, force=force)
     paper_dense = build_paper_dense_index(project_root, embedding_provider, force=force)
+    epoch_id = f"HE_{papers_digest(load_paper_records(project_root))[:16]}_{chunk_dense.chunks_digest[:16]}"
+    try:
+        from app.persistence import build_knowledge_repository
+
+        repository = build_knowledge_repository(project_root)
+        if repository is not None:
+            repository.record_index_epoch({
+                "epoch_id": epoch_id,
+                "index_kind": "hierarchical",
+                "source_fingerprint": f"{paper_dense.papers_digest}:{chunk_dense.chunks_digest}",
+                "embedding_model": chunk_dense.model_name,
+                "embedding_revision": chunk_dense.model_revision,
+                "tokenizer_version": "app.indexing.tokenization.v1",
+                "chunker_version": knowledge.chunk_policy_version,
+                "status": "active",
+            })
+            repository.close()
+    except Exception:
+        pass
     return {
         "knowledge": knowledge.to_dict(),
         "chunk_dense": chunk_dense.to_dict(),
         "paper_dense": paper_dense.to_dict(),
+        "index_epoch": epoch_id,
         "hierarchical": True,
     }
