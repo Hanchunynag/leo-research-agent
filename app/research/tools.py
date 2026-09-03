@@ -186,6 +186,7 @@ def default_tool_specs() -> tuple[ToolSpec, ...]:
         ToolSpec("workspace.update_scope", {"required": ["workspace_id", "scope_version", "document_ids"], "properties": {"workspace_id": {"type": "string"}, "scope_version": {"type": "integer"}, "document_ids": {"type": "array"}}}, object_schema, "workspace.write", 10.0, True, "bounded_write", _BOOTSTRAP),
         ToolSpec("literature.search", {"required": ["query"]}, object_schema, "literature.search", 30.0, True, "read", _DEEP_BOOTSTRAP, RetryPolicy(2)),
         ToolSpec("literature.get_metadata", {"required": ["paper_id"]}, object_schema, "literature.read", 15.0, True, "read", _DEEP_BOOTSTRAP, RetryPolicy(2)),
+        ToolSpec("literature.resolve_publication_date", {"required": ["title"], "properties": {"title": {"type": "string"}}}, object_schema, "literature.read", 30.0, True, "read", _ALL, RetryPolicy(2)),
         ToolSpec("literature.download", {"required": ["paper_id"]}, object_schema, "literature.download", 60.0, True, "external_write", _BOOTSTRAP, RetryPolicy(2)),
         ToolSpec("document.parse", {"required": ["path", "mode"]}, object_schema, "document.parse", 300.0, True, "bounded_write", _BOOTSTRAP),
         ToolSpec("job.get_status", {"required": ["job_id"]}, object_schema, "job.read", 5.0, True, "read", _ALL),

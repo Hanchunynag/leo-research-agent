@@ -15,10 +15,11 @@ from app.context.models import ContextBundle
 from app.embeddings.base import EmbeddingProvider
 from app.reranking.base import RerankerProvider
 from app.retrieval.hybrid import search_hybrid_evidence
+from app.retrieval.hierarchical import search_hierarchical_evidence
 from app.retrieval.reranked import search_reranked_evidence
 
 
-RetrievalMode = Literal["fast", "accurate"]
+RetrievalMode = Literal["fast", "accurate", "hierarchical"]
 
 
 class RetrievalRuntime:
@@ -29,10 +30,12 @@ class RetrievalRuntime:
         project_root: Path,
         embedding_provider: EmbeddingProvider,
         reranker_provider: RerankerProvider | None = None,
+        hierarchical_enabled: bool = True,
     ) -> None:
         self.project_root = project_root.expanduser().resolve()
         self.embedding_provider = embedding_provider
         self.reranker_provider = reranker_provider
+        self.hierarchical_enabled = hierarchical_enabled
         self._embedding_warmed = False
         self._reranker_warmed = False
 
@@ -85,7 +88,42 @@ class RetrievalRuntime:
         max_chunks_per_work: int = 2,
         candidate_limit: int = 20,
         rrf_k: int = 60,
+        paper_limit: int = 10,
+        paper_candidate_limit: int = 30,
+        chunk_candidate_limit: int = 40,
+        paper_filters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        hierarchical_ready = (
+            (self.project_root / "data" / "index" / "paper_bm25.json").is_file()
+            and (self.project_root / "data" / "index" / "paper_dense_manifest.json").is_file()
+            and (self.project_root / "data" / "index" / "qdrant_papers_dense").is_dir()
+        )
+        if mode == "hierarchical" or (self.hierarchical_enabled and hierarchical_ready):
+            # An explicit hierarchical call uses the configured reranker when
+            # available.  Automatic use from legacy ``fast`` remains cheap;
+            # callers can request ``accurate`` for the Cross Encoder stage.
+            reranker = (
+                self.reranker_provider
+                if mode in {"hierarchical", "accurate"}
+                else None
+            )
+            result = search_hierarchical_evidence(
+                project_root=self.project_root,
+                embedding_provider=self.embedding_provider,
+                query=query,
+                reranker_provider=reranker,
+                limit=limit,
+                paper_limit=paper_limit,
+                paper_candidate_limit=paper_candidate_limit,
+                chunk_candidate_limit=chunk_candidate_limit,
+                max_chunks_per_work=max_chunks_per_work,
+                rrf_k=rrf_k,
+                paper_filters=paper_filters,
+            )
+            self._embedding_warmed = True
+            if reranker is not None:
+                self._reranker_warmed = True
+            return result
         if mode == "fast":
             result = search_hybrid_evidence(
                 project_root=self.project_root,
@@ -101,7 +139,7 @@ class RetrievalRuntime:
             self._embedding_warmed = True
             return result
         if mode != "accurate":
-            raise ValueError("mode 必须是 fast 或 accurate。")
+            raise ValueError("mode 必须是 fast、accurate 或 hierarchical。")
         if self.reranker_provider is None:
             raise RuntimeError("accurate 模式需要 RerankerProvider。")
         result = search_reranked_evidence(

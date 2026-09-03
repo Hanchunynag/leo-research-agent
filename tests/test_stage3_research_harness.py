@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 from typing import Any, Mapping
 
+import httpx
 import pytest
 
 from app.research import (
@@ -202,6 +203,7 @@ def test_tool_registry_declares_all_governance_fields() -> None:
         "workspace.update_scope",
         "literature.search",
         "literature.get_metadata",
+        "literature.resolve_publication_date",
         "literature.download",
         "document.parse",
         "job.get_status",
@@ -372,6 +374,25 @@ def test_direct_qa_uses_one_generation_and_no_optional_reasoning_calls(tmp_path:
     assert all(value["evidence_state"] == "selected" for value in result["selected_evidence"])
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "这些论文的研究路线如何演进？",
+        "比较这些论文的发展路线",
+        "What is the evolution roadmap across these papers?",
+    ],
+)
+def test_evolution_queries_use_relation_reasoning_workflow(query: str) -> None:
+    request = WorkflowRequest(
+        query,
+        "default",
+        1,
+        workspace_summary={"document_count": 2},
+    )
+
+    assert ResearchRuntime.route(request) == WorkflowName.RELATION_REASONING
+
+
 def test_relation_reasoning_permits_only_one_gap_retrieval(tmp_path: Path) -> None:
     service, generator, calls = runtime(tmp_path, options={"relation_gap": True})
     result = service.run(
@@ -494,6 +515,60 @@ def test_backend_failure_recovers_to_safe_refusal_with_trace(tmp_path: Path) -> 
         value["level"] for value in result["diagnostics"]["recovery_actions"]
     ] == [1, 2]
     assert result["diagnostics"]["state"] == "refused"
+
+
+def test_generation_failure_preserves_selected_evidence_and_reason(tmp_path: Path) -> None:
+    class BrokenGenerator(Generator):
+        def generate(self, context: Any) -> Mapping[str, Any]:
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            response = httpx.Response(
+                400,
+                request=request,
+                json={"error": {"message": "invalid response format"}},
+            )
+            raise httpx.HTTPStatusError("bad request", request=request, response=response)
+
+    values, _ = handlers()
+    service = ResearchRuntime(
+        build_default_gateway(values),
+        BrokenGenerator(),
+        state_store=ResearchStateStore(tmp_path),
+        trace_store=RunTraceStore(tmp_path),
+    )
+
+    result = service.run(
+        WorkflowRequest(
+            "question",
+            "default",
+            1,
+            workspace_summary={"document_count": 2},
+        )
+    )
+
+    assert result["answerable"] is False
+    assert len(result["selected_evidence"]) == 2
+    assert result["coverage"]["sufficient"] is True
+    assert result["workflow_details"]["generation_failure"] == {
+        "stage": "answer",
+        "failure_kind": "HTTPStatusError",
+        "http_status": 400,
+        "response_body": '{"error":{"message":"invalid response format"}}',
+    }
+    assert result["diagnostics"]["termination_reason"] == "generation_failed:HTTPStatusError"
+
+    presented = HarnessAgentService(
+        service,
+        workspace_summary={"document_count": 2},
+    )._present(  # type: ignore[attr-defined]
+        result,
+        session_id=None,
+        topic_id=None,
+        session_created=False,
+        include_context=True,
+    )
+    assert presented["outcome"]["code"] == "generation_failed"
+    assert presented["selected_evidence"]
+    assert "不是证据不足" in presented["outcome"]["message"]
 
 
 def test_transient_tool_failure_uses_level_one_retry() -> None:

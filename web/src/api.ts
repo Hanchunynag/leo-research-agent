@@ -64,6 +64,7 @@ export type AgenticResult = {
     }>;
   };
   diagnostics: Record<string, any>;
+  workflow_details?: Record<string, any>;
   retrieval_rounds: Array<Record<string, any>>;
 };
 
@@ -103,6 +104,12 @@ export const api = {
         force_new_topic: forceNewTopic,
         include_context: true,
       }),
+    }),
+  resume: (threadId: string, userInput: string) =>
+    request<{ job_id: string }>("/api/answers/resume", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: threadId, user_input: userInput }),
     }),
   upload: (file: File) => {
     const data = new FormData();

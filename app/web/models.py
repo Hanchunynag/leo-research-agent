@@ -20,6 +20,11 @@ class AnswerRequest(WebModel):
     include_context: bool = True
 
 
+class ResumeRequest(WebModel):
+    thread_id: str = Field(min_length=1, max_length=128)
+    user_input: str = Field(min_length=1, max_length=8_000)
+
+
 class ParseOptions(WebModel):
     """PDF 上传后的 MinerU 解析选项。"""
 

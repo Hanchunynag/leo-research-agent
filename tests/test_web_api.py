@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
@@ -435,3 +436,28 @@ def test_web_public_status_never_exposes_api_key(
 
     assert secret not in serialized
     assert "api_key" not in serialized.casefold()
+
+
+def test_local_web_runtime_closes_async_bootstrap_backend_inside_running_loop(
+    tmp_path: Path,
+) -> None:
+    class Backend:
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    runtime = LocalRAGWebRuntime(
+        tmp_path,
+        WebRuntimeConfig(model_cache=tmp_path / "models"),
+    )
+    backend = Backend()
+    runtime._bootstrap_backend = backend
+
+    async def close_from_lifespan() -> None:
+        runtime.close()
+        await asyncio.sleep(0)
+
+    asyncio.run(close_from_lifespan())
+
+    assert backend.closed is True

@@ -43,9 +43,10 @@ evidence; a comparison or progression claim must cite the evidence for every com
 Return at most five concise atomic claims. Prior answerable=false events are failures or refusals,
 not output examples to imitate. Only evidence IDs present in the latest current_sources mapping
 may be cited; older evidence_added events remain history but are forbidden for the current answer.
-Output exactly:
-{"answerable":true,"claims":[{"claim_id":"C1","text":"atomic fact","category":"measurement","source_ids":["S1"],"evidence_ids":["E001"]}],"refusal_reason":null}
-or {"answerable":false,"claims":[],"refusal_reason":"specific evidence limitation"}."""
+If supplied conflicts affect the claims, explicitly acknowledge them and set
+conflicts_acknowledged=true; otherwise set it to false. Output exactly:
+{"answerable":true,"claims":[{"claim_id":"C1","text":"atomic fact","category":"measurement","source_ids":["S1"],"evidence_ids":["E001"]}],"refusal_reason":null,"conflicts_acknowledged":false}
+or {"answerable":false,"claims":[],"refusal_reason":"specific evidence limitation","conflicts_acknowledged":false}."""
 
 SEMANTIC_VALIDATION_SYSTEM_PROMPT = """You are a strict claim-citation entailment judge.
 Return only JSON. For every claim decide entailed, partially_entailed, not_entailed, or
@@ -428,13 +429,19 @@ class OpenAIAgenticReasoningProvider:
         self,
         messages: list[dict[str, str]],
     ) -> tuple[AgenticAnswerDraft, dict[str, Any]]:
-        """从 append-only Topic 消息生成结构化原子 Claim。"""
+        """从 append-only Topic 消息生成结构化原子 Claim。
+
+        The output is a compact, structured list of atomic claims.  Different
+        providers account for hidden reasoning tokens differently, so the
+        answer stage must respect the explicit configured budget rather than
+        silently forcing a lower (or higher) ceiling.
+        """
 
         return self._complete(
             "answer",
             messages,
             AgenticAnswerDraft,
-            max_tokens=max(self.provider.config.max_tokens, 8192),
+            max_tokens=self.provider.config.max_tokens,
         )
 
     def validate_semantic(

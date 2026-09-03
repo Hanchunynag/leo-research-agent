@@ -22,6 +22,21 @@ def _tokens(value: str) -> frozenset[str]:
     return frozenset(tokenize(value))
 
 
+def _negation_anchors(value: str) -> frozenset[str]:
+    """提取否定词后的命题锚点，避免把条件描述当成证据冲突。"""
+
+    anchors: set[str] = set()
+    normalized = value.casefold()
+    for match in re.finditer(
+        r"\b(?:not|cannot|can't|never|doesn't|isn't|aren't)\s+([a-z0-9]+)",
+        normalized,
+    ):
+        anchors.update(_tokens(match.group(1)))
+    for match in re.finditer(r"不([\u3400-\u4dbf\u4e00-\u9fff]{1,4}|[a-z0-9]+)", normalized):
+        anchors.update(_tokens(match.group(1)))
+    return frozenset(anchors)
+
+
 def _relevance(query: str, value: CandidateEvidence) -> float:
     query_tokens = _tokens(query)
     content_tokens = _tokens(value.content)
@@ -183,13 +198,17 @@ class EvidenceIntelligencePipeline:
         }
 
         # 10. 支持/反对冲突检测：保守标记，不自动删除任一侧。
-        positive = [value for value in verified if not re.search(r"\b(?:not|no|without|cannot)\b|不(?:是|能|支持|存在)", value.content, re.IGNORECASE)]
-        negative = [value for value in verified if value not in positive]
+        negative = [
+            (value, _negation_anchors(value.content))
+            for value in verified
+            if _negation_anchors(value.content)
+        ]
+        positive = [value for value in verified if not any(value is item for item, _ in negative)]
         conflicts = [
             (left.evidence_id, right.evidence_id)
             for left in positive
-            for right in negative
-            if len(_tokens(left.content) & _tokens(right.content)) >= 3
+            for right, anchors in negative
+            if anchors & _tokens(left.content)
         ]
 
         self.last_diagnostics = {

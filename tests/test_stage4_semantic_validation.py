@@ -85,6 +85,50 @@ def test_local_semantic_support_uses_only_claim_and_cited_evidence() -> None:
     assert report.semantic_results[0].label == "supports"
 
 
+def test_chinese_claim_can_be_checked_against_english_paper_evidence() -> None:
+    validator = TieredClaimEvidenceValidator()
+    report = validator.validate(
+        _draft("伪距观测量用于估计低轨卫星星历和时钟误差。", ["E1"]),
+        [
+            _evidence(
+                "E1",
+                "Pseudorange measurements are used to estimate LEO satellite ephemeris and clock errors.",
+            )
+        ],
+    )
+
+    assert report.valid is True
+    assert report.semantic_results[0].label == "supports"
+
+
+def test_multiple_direct_sources_do_not_make_a_fact_claim_high_risk() -> None:
+    validator = TieredClaimEvidenceValidator()
+    report = validator.validate(
+        {
+            "answerable": True,
+            "claims": [
+                {
+                    "claim_id": "C1",
+                    "text": "Pseudorange measurements estimate ephemeris and clock errors.",
+                    "category": "observation_type",
+                    "evidence_ids": ["E1", "E2"],
+                }
+            ],
+        },
+        [
+            _evidence("E1", "Pseudorange measurements estimate ephemeris and clock errors."),
+            _evidence(
+                "E2",
+                "Pseudorange measurements are used to estimate LEO satellite ephemeris and timing errors.",
+                document_id="D_2",
+            ),
+        ],
+    )
+
+    assert report.valid is True
+    assert report.judge_call_count == 0
+
+
 def test_local_contradiction_removes_claim_without_extra_generation() -> None:
     validator = TieredClaimEvidenceValidator(
         local_validator=LocalResult("contradicts")

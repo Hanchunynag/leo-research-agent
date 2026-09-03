@@ -27,6 +27,7 @@ def _validate_limit(value: int, field: str, maximum: int = 100) -> int:
 def _query_filter(
     work_id: str | None,
     document_id: str | None,
+    paper_ids: list[str] | tuple[str, ...] | None = None,
 ) -> models.Filter | None:
     must: list[models.FieldCondition] = []
     if work_id:
@@ -43,6 +44,14 @@ def _query_filter(
                 match=models.MatchValue(value=document_id),
             )
         )
+    allowed_paper_ids = [str(value) for value in (paper_ids or []) if str(value)]
+    if allowed_paper_ids:
+        must.append(
+            models.FieldCondition(
+                key="paper_id",
+                match=models.MatchAny(any=allowed_paper_ids),
+            )
+        )
     return models.Filter(must=cast(Any, must)) if must else None
 
 
@@ -54,6 +63,7 @@ def search_dense_evidence(
     work_id: str | None = None,
     document_id: str | None = None,
     max_chunks_per_work: int = 2,
+    paper_ids: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     cleaned_query = query.strip()
     if not cleaned_query:
@@ -96,7 +106,7 @@ def search_dense_evidence(
             collection_name=str(manifest.get("collection_name")),
             query=vector,
             using=VECTOR_NAME,
-            query_filter=_query_filter(work_id, document_id),
+            query_filter=_query_filter(work_id, document_id, paper_ids),
             limit=candidate_limit,
             with_payload=True,
             with_vectors=False,
@@ -149,6 +159,7 @@ def search_dense_evidence(
         "result_count": len(results),
         "work_id_filter": work_id,
         "document_id_filter": document_id,
+        "paper_id_filter": sorted({str(value) for value in (paper_ids or []) if str(value)}) or None,
         "max_chunks_per_work": per_work,
         "results": results,
     }

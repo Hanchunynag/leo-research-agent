@@ -55,12 +55,14 @@ def search_evidence(
     work_id: str | None = None,
     document_id: str | None = None,
     max_chunks_per_work: int = 2,
+    paper_ids: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     cleaned_query = query.strip()
     if not cleaned_query:
         raise ValueError("query 不能为空。")
     validated_limit = _validate_limit(limit, "limit")
     per_work = _validate_limit(max_chunks_per_work, "max_chunks_per_work", 20)
+    allowed_paper_ids = {str(value) for value in (paper_ids or []) if str(value)}
     root = project_root.expanduser().resolve()
     chunks = load_chunks(root)
     index = load_json_object(bm25_index_path(root))
@@ -101,6 +103,8 @@ def search_evidence(
             if work_id and document.get("work_id") != work_id:
                 continue
             if document_id and document.get("document_id") != document_id:
+                continue
+            if allowed_paper_ids and str(document.get("paper_id") or "") not in allowed_paper_ids:
                 continue
             length = int(document.get("length", 0))
             denominator = frequency + k1 * (1 - b + b * length / average_length)
@@ -163,6 +167,7 @@ def search_evidence(
         "result_count": len(results),
         "work_id_filter": work_id,
         "document_id_filter": document_id,
+        "paper_id_filter": sorted(allowed_paper_ids) if allowed_paper_ids else None,
         "max_chunks_per_work": per_work,
         "results": results,
     }

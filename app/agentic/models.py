@@ -142,6 +142,7 @@ class AgenticAnswerDraft(StrictModel):
     answerable: bool
     claims: list[AgenticClaim]
     refusal_reason: str | None = None
+    conflicts_acknowledged: bool = False
 
 
 class RoutingLLMDecision(StrictModel):

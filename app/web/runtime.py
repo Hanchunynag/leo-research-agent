@@ -234,7 +234,7 @@ class LocalRAGWebRuntime:
             OpenAICompatibleAnswerProvider,
             OpenAICompatibleConfig,
         )
-        from app.research import build_harness_agent_service
+        from app.langchain_agent import build_langchain_agent_service
         from app.workspaces import WorkspaceService
 
         llm = load_local_llm_settings(self.project_root)
@@ -265,7 +265,7 @@ class LocalRAGWebRuntime:
         )
         workspaces = WorkspaceService(self.project_root)
         bootstrap = self._ensure_bootstrap_providers()
-        return build_harness_agent_service(
+        return build_langchain_agent_service(
             self.project_root,
             knowledge,
             workspaces,
@@ -282,10 +282,17 @@ class LocalRAGWebRuntime:
         if self._bootstrap_thread is not None:
             self._bootstrap_thread.join(timeout=2.0)
         if self._bootstrap_backend is not None:
+            close = self._bootstrap_backend.close
             try:
-                asyncio.run(self._bootstrap_backend.close())
+                loop = asyncio.get_running_loop()
             except RuntimeError:
-                pass
+                # CLI and synchronous shutdown paths do not own an event loop.
+                asyncio.run(close())
+            else:
+                # FastAPI lifespan shutdown already runs inside an event loop.
+                # Scheduling the coroutine avoids both nested ``asyncio.run``
+                # and an un-awaited coroutine warning.
+                loop.create_task(close())
 
     def answer(self, request: AnswerRequest, emit: EmitProgress) -> dict[str, Any]:
         """串行执行问答，避免共享 Service 的运行诊断互相污染。"""
@@ -294,12 +301,17 @@ class LocalRAGWebRuntime:
             if self._service is None:
                 emit("loading_models", "正在加载 Embedding 和 Reranker。", 0.08)
                 self._service = self._build_service()
-            emit("research_harness", "正在执行受预算约束的工作流、检索和验证。", 0.20)
+            emit(
+                "langchain_rag",
+                "正在执行 LangChain 翻译、双语检索、生成和验证。",
+                0.20,
+            )
             result = self._service.answer(
                 request.query,
                 session_id=request.session_id,
                 force_new_topic=request.force_new_topic,
                 include_context=request.include_context,
+                progress_callback=emit,
             )
             harness = result.get("diagnostics", {}).get("harness", {})
             emit(
@@ -310,6 +322,23 @@ class LocalRAGWebRuntime:
                     "answerable": bool(result.get("answerable")),
                     "termination_reason": harness.get("termination_reason"),
                 },
+            )
+            return result
+
+    def resume(self, thread_id: str, user_input: str, emit: EmitProgress) -> dict[str, Any]:
+        """Continue a LangGraph clarification with the original thread checkpoint."""
+
+        with self._operation_lock:
+            if self._service is None:
+                raise ValueError("没有可恢复的 LangGraph 任务。")
+            emit("resuming", "正在恢复 LangGraph 研究任务。", 0.20)
+            result = self._service.resume(thread_id, user_input, progress_callback=emit)
+            harness = result.get("diagnostics", {}).get("harness", {})
+            emit(
+                "validated",
+                "恢复后的回答已完成证据和 Claim-Citation 验证。",
+                0.92,
+                {"answerable": bool(result.get("answerable")), "termination_reason": harness.get("termination_reason")},
             )
             return result
 
@@ -500,7 +529,7 @@ class LocalRAGWebRuntime:
         serving = knowledge_serving_status(self.project_root)
         return {
             "service": "leo-research-agent-web",
-            "rag_mode": "agentic",
+            "rag_mode": "langchain_bilingual_rag",
             "llm_configured": bool(llm.base_url and llm.model),
             "llm_model": llm.model,
             "embedding_model": self.config.embedding_model,

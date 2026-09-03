@@ -874,6 +874,51 @@ def test_agentic_provider_expands_budget_after_reasoning_only_truncation() -> No
     assert diagnostics["structure_repair_attempts"] == 1
 
 
+def test_agentic_answer_generation_has_a_compact_output_budget() -> None:
+    class Provider:
+        model_name = "fixture/answer-model"
+        config = SimpleNamespace(max_tokens=8192)
+
+        def __init__(self) -> None:
+            self.max_token_requests: list[int | None] = []
+
+        def chat_completion(
+            self,
+            messages: list[dict[str, str]],
+            *,
+            max_tokens: int | None = None,
+        ) -> dict[str, Any]:
+            self.max_token_requests.append(max_tokens)
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": AgenticAnswerDraft(
+                                answerable=True,
+                                claims=[
+                                    AgenticClaim(
+                                        claim_id="C1",
+                                        text="A concise supported claim.",
+                                        category="method",
+                                        source_ids=["S1"],
+                                        evidence_ids=["E1"],
+                                    )
+                                ],
+                            ).model_dump_json()
+                        }
+                    }
+                ]
+            }
+
+    inner = Provider()
+    provider = OpenAIAgenticReasoningProvider(inner)  # type: ignore[arg-type]
+
+    draft, _ = provider.generate_answer([{"role": "user", "content": "answer"}])
+
+    assert draft.answerable is True
+    assert inner.max_token_requests == [8192]
+
+
 def test_deepseek_api_key_alias_and_redaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

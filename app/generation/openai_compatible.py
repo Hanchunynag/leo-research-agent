@@ -110,12 +110,15 @@ def _parse_answer_draft(content: str) -> AnswerDraft:
     answerable = payload.get("answerable")
     claims_payload = payload.get("claims")
     refusal_reason = payload.get("refusal_reason")
+    conflicts_acknowledged = payload.get("conflicts_acknowledged", False)
     if not isinstance(answerable, bool):
         raise ValueError("answerable 必须是布尔值。")
     if not isinstance(claims_payload, list):
         raise ValueError("claims 必须是数组。")
     if refusal_reason is not None and not isinstance(refusal_reason, str):
         raise ValueError("refusal_reason 必须是字符串或 null。")
+    if not isinstance(conflicts_acknowledged, bool):
+        raise ValueError("conflicts_acknowledged 必须是布尔值。")
 
     claims: list[AnswerClaim] = []
     for value in claims_payload:
@@ -141,7 +144,12 @@ def _parse_answer_draft(content: str) -> AnswerDraft:
         claims.append(
             AnswerClaim(claim_id, text, source_ids, category, evidence_ids)
         )
-    return AnswerDraft(answerable, claims, refusal_reason)
+    return AnswerDraft(
+        answerable,
+        claims,
+        refusal_reason,
+        conflicts_acknowledged=conflicts_acknowledged,
+    )
 
 
 class OpenAICompatibleAnswerProvider:

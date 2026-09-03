@@ -364,6 +364,37 @@ def build_parser() -> argparse.ArgumentParser:
     hybrid_search_command.add_argument("--rrf-k", type=int, default=60)
     add_embedding_options(hybrid_search_command)
 
+    hierarchical_command = subparsers.add_parser(
+        "hierarchical",
+        help="两阶段 Paper-level → Chunk-level Hybrid RAG。",
+    )
+    hierarchical_subparsers = hierarchical_command.add_subparsers(
+        dest="hierarchical_command",
+        required=True,
+    )
+    hierarchical_build = hierarchical_subparsers.add_parser(
+        "build",
+        help="构建 Paper BM25/Dense 与 Chunk BM25/Dense 索引。",
+    )
+    hierarchical_build.add_argument("--force", action="store_true")
+    hierarchical_build.add_argument("--max-tokens", type=int, default=700)
+    hierarchical_build.add_argument("--min-chunk-tokens", type=int, default=80)
+    hierarchical_build.add_argument("--overlap-tokens", type=int, default=80)
+    add_embedding_options(hierarchical_build)
+    hierarchical_search = hierarchical_subparsers.add_parser(
+        "search",
+        help="先召回论文，再在候选论文内召回并精排 Chunk。",
+    )
+    hierarchical_search.add_argument("query")
+    hierarchical_search.add_argument("--limit", type=int, default=10)
+    hierarchical_search.add_argument("--paper-limit", type=int, default=10)
+    hierarchical_search.add_argument("--paper-candidate-limit", type=int, default=30)
+    hierarchical_search.add_argument("--chunk-candidate-limit", type=int, default=40)
+    hierarchical_search.add_argument("--max-chunks-per-work", type=int, default=2)
+    hierarchical_search.add_argument("--rrf-k", type=int, default=60)
+    add_embedding_options(hierarchical_search)
+    add_reranker_options(hierarchical_search)
+
     rerank_command = subparsers.add_parser(
         "rerank",
         help="使用 BGE Cross-Encoder 精排 RRF Top-20。",
@@ -401,7 +432,7 @@ def build_parser() -> argparse.ArgumentParser:
     context_build_command.add_argument("query")
     context_build_command.add_argument(
         "--mode",
-        choices=["fast", "accurate"],
+        choices=["fast", "accurate", "hierarchical"],
         default="fast",
     )
     context_build_command.add_argument("--retrieval-limit", type=int, default=10)
@@ -422,7 +453,7 @@ def build_parser() -> argparse.ArgumentParser:
     answer_command.add_argument("query")
     answer_command.add_argument(
         "--mode",
-        choices=["fast", "accurate"],
+        choices=["fast", "accurate", "hierarchical"],
         default="fast",
     )
     answer_command.add_argument(
@@ -894,7 +925,7 @@ def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) ->
 
     from app.agentic.provider import OpenAIAgenticReasoningProvider
     from app.agentic.store import AgenticSessionStore
-    from app.research import build_harness_agent_service
+    from app.langchain_agent import build_langchain_agent_service
     from app.workspaces import WorkspaceService
 
     runtime = retrieval_runtime_from_args(
@@ -921,7 +952,7 @@ def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) ->
     bootstrap = build_bootstrap_provider_composition(
         PROJECT_ROOT, backend, worker_id="cli-bootstrap-worker"
     )
-    service = build_harness_agent_service(
+    service = build_langchain_agent_service(
         PROJECT_ROOT,
         knowledge,
         workspaces,
@@ -1278,6 +1309,39 @@ def main(argv: Sequence[str] | None = None) -> None:
                 document_id=args.document_id,
                 max_chunks_per_work=args.max_chunks_per_work,
                 candidate_limit=args.candidate_limit,
+                rrf_k=args.rrf_k,
+            )
+        )
+        return
+
+    if args.command == "hierarchical":
+        if args.hierarchical_command == "build":
+            from app.indexing.hierarchical import build_hierarchical_indexes
+
+            print_json(
+                build_hierarchical_indexes(
+                    PROJECT_ROOT,
+                    dense_provider_from_args(args),
+                    force=args.force,
+                    maximum_tokens=args.max_tokens,
+                    minimum_chunk_tokens=args.min_chunk_tokens,
+                    overlap_tokens=args.overlap_tokens,
+                )
+            )
+            return
+        from app.retrieval.hierarchical import search_hierarchical_evidence
+
+        print_json(
+            search_hierarchical_evidence(
+                PROJECT_ROOT,
+                dense_provider_from_args(args),
+                args.query,
+                reranker_provider=reranker_provider_from_args(args),
+                limit=args.limit,
+                paper_limit=args.paper_limit,
+                paper_candidate_limit=args.paper_candidate_limit,
+                chunk_candidate_limit=args.chunk_candidate_limit,
+                max_chunks_per_work=args.max_chunks_per_work,
                 rrf_k=args.rrf_k,
             )
         )

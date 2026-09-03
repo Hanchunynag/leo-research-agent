@@ -31,6 +31,7 @@ function App() {
   const [papers, setPapers] = useState<PaperRecord[]>([]);
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [pendingThreadId, setPendingThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [query, setQuery] = useState("");
   const [busy, setBusy] = useState(false);
@@ -78,11 +79,18 @@ function App() {
     setBusy(true);
     setResult(null);
     try {
-      const created = await api.answer(cleaned, sessionId);
+      const created = pendingThreadId
+        ? await api.resume(pendingThreadId, cleaned)
+        : await api.answer(cleaned, sessionId);
       const snapshot = await watchJob(created.job_id, setProgress);
       const answer = snapshot.result as AgenticResult;
       setResult(answer);
       setSessionId(answer.session.session_id);
+      if (answer.outcome?.code === "clarification_required") {
+        setPendingThreadId(answer.diagnostics?.langgraph?.thread_id || null);
+      } else {
+        setPendingThreadId(null);
+      }
       setMessages((items) => [
         ...items,
         {
@@ -125,6 +133,7 @@ function App() {
 
   const openSession = async (id: string) => {
     setSessionId(id);
+    setPendingThreadId(null);
     setResult(null);
     setSelectedSource(null);
     try {
@@ -137,6 +146,7 @@ function App() {
 
   const newSession = () => {
     setSessionId(null);
+    setPendingThreadId(null);
     setMessages([]);
     setResult(null);
     setRegistryEvidence([]);
@@ -314,7 +324,27 @@ function App() {
 function Diagnostics({ result, system }: { result: AgenticResult | null; system: Record<string, any> }) {
   const harness = result?.diagnostics?.harness;
   const selection = result?.diagnostics?.evidence_selection;
-  const trace = harness?.trace || [];
+  // Harness traces have used both the legacy `stage` field and the current
+  // LangGraph `name`/`kind` fields.  Diagnostics must remain renderable when
+  // an older or partially populated result is opened.
+  const trace = Array.isArray(harness?.trace) ? harness.trace : [];
+  const coverage = Array.isArray(result?.coverage?.coverage) ? result.coverage.coverage : [];
+  const translationUsage = result?.workflow_details?.bilingual_query?.llm_execution?.usage;
+  const providerUsage = Array.isArray(harness?.provider_usage) ? harness.provider_usage : [];
+  const agentUsage = Array.isArray(result?.diagnostics?.langgraph?.llm_usage)
+    ? result?.diagnostics?.langgraph?.llm_usage
+    : [];
+  const tokenCalls = [
+    ...(translationUsage && Object.keys(translationUsage).length
+      ? [{ stage: "translation", ...translationUsage }]
+      : []),
+    ...providerUsage,
+    ...agentUsage.map((item: Record<string, any>) => ({ stage: "agent_decision", ...item })),
+  ];
+  const totalTokens = tokenCalls.reduce(
+    (sum: number, item: Record<string, any>) => sum + Number(item.total_tokens || 0),
+    0,
+  );
   return (
     <div className="diagnostics-panel">
       <section className="config-grid">
@@ -334,11 +364,22 @@ function Diagnostics({ result, system }: { result: AgenticResult | null; system:
           </section>
           <section className="diagnostic-block">
             <span className="eyebrow">COVERAGE</span>
-            {result.coverage.coverage.map((item) => (
+            {coverage.map((item) => (
               <div className="coverage-row" key={item.subquestion_id}>
                 <b>{item.subquestion_id}</b><span className={item.status}>{item.status}</span>
               </div>
             ))}
+            {!coverage.length && <div className="empty-inspection">当前工作流没有可展开的分维度覆盖项。</div>}
+          </section>
+          <section className="diagnostic-block">
+            <span className="eyebrow">LLM TOKEN USAGE</span>
+            {tokenCalls.length ? tokenCalls.map((item: Record<string, any>, index: number) => (
+              <div className="metric-row" key={`${item.stage || "llm"}-${index}`}>
+                <span>{item.stage || "llm"}</span>
+                <b>{item.total_tokens ?? "—"} tokens</b>
+              </div>
+            )) : <div className="metric-row"><span>Provider 未返回 usage</span><b>—</b></div>}
+            <div className="metric-row token-total"><span>Total LLM</span><b>{totalTokens || "—"} tokens</b></div>
           </section>
           {selection && (
             <section className="diagnostic-block">
@@ -354,7 +395,10 @@ function Diagnostics({ result, system }: { result: AgenticResult | null; system:
             {trace.map((item: Record<string, any>) => (
               <div className="trace-row" key={item.ordinal}>
                 <i />
-                <div><b>{item.stage.replaceAll("_", " ")}</b><span>{item.elapsed_ms} ms</span></div>
+                <div>
+                  <b>{String(item.stage || item.name || item.kind || "step").replaceAll("_", " ")}</b>
+                  <span>{item.elapsed_ms ?? "—"} ms</span>
+                </div>
               </div>
             ))}
           </section>

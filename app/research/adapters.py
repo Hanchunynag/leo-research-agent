@@ -28,10 +28,15 @@ class AgenticReasoningGeneratorAdapter:
             {
                 "role": "system",
                 "content": (
-                    "Use only selected_evidence. Return structured atomic claims. "
-                    "Every claim must cite source_ids and evidence_ids. Do not state graph "
-                    "inference or analogy as a directly proven fact. If evidence is insufficient, refuse."
-                ),
+                "Use only selected_evidence. Return structured atomic claims. "
+                "Every claim must cite source_ids and evidence_ids. Do not state graph "
+                "inference or analogy as a directly proven fact. If evidence is insufficient, refuse."
+                " If supplied conflicts affect a claim, acknowledge them explicitly and set "
+                "conflicts_acknowledged to true. Return exactly one JSON object and no markdown. "
+                "The output_language field is authoritative: write every claim and refusal_reason "
+                "in that language. If output_language is zh, output Simplified Chinese even when "
+                "the evidence or retrieval query is English."
+            ),
             },
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ]

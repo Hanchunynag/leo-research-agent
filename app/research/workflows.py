@@ -8,8 +8,18 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from app.research.context import PhaseContextPack, ResearchContextManager
 from app.research.coverage import DimensionCoverageAnalyzer, QueryFrameBuilder
-from app.research.harness import HarnessState, RecoveryLevel, ResearchRunHarness
+from app.research.harness import (
+    BudgetExceeded,
+    HarnessState,
+    RecoveryLevel,
+    ResearchRunHarness,
+)
 from app.research.tools import ToolGatewayRegistry
+from app.research.provisional import (
+    abstract_evidence_from_paper,
+    register_abstract_evidence,
+)
+from app.generation.security import redact_sensitive_text
 
 
 class WorkflowName(StrEnum):
@@ -61,6 +71,47 @@ def _conflicts(value: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
     return tuple(dict(item) for item in raw if isinstance(item, Mapping)) if isinstance(raw, list) else ()
 
 
+def _generation_failure(error: Exception, *, stage: str = "answer") -> dict[str, Any]:
+    """将回答模型异常转换为可展示、且不泄露密钥的诊断。"""
+
+    details: dict[str, Any] = {
+        "stage": stage,
+        "failure_kind": type(error).__name__,
+    }
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int):
+        details["http_status"] = status_code
+    if response is not None:
+        try:
+            body = str(response.text or "")
+        except Exception:
+            body = ""
+        if body:
+            details["response_body"] = redact_sensitive_text(body)[:500]
+    diagnostic_builder = getattr(error, "to_diagnostics", None)
+    if callable(diagnostic_builder):
+        try:
+            diagnostics = diagnostic_builder()
+        except Exception:
+            diagnostics = None
+        if isinstance(diagnostics, Mapping):
+            # Structured provider diagnostics intentionally exclude prompts and
+            # model content, so they are safe to surface to the Job inspector.
+            details["provider_diagnostics"] = dict(diagnostics)
+    return details
+
+
+def _generation_failure_message(details: Mapping[str, Any]) -> str:
+    kind = str(details.get("failure_kind") or "unknown")
+    status = details.get("http_status")
+    location = f"HTTP {status}, " if isinstance(status, int) else ""
+    return (
+        f"回答模型请求失败（{location}{kind}）。"
+        "检索证据已保留，这不是证据不足。"
+    )
+
+
 class BaseWorkflow:
     name: WorkflowName
 
@@ -98,25 +149,57 @@ class BaseWorkflow:
         harness.transition(HarnessState.EXECUTING)
 
     def _scope(self, request: Any, harness: ResearchRunHarness) -> Mapping[str, Any]:
-        return self.gateway.invoke(
+        result = self.gateway.invoke(
             "workspace.read_scope",
             {"workspace_id": request.workspace_id, "scope_version": request.scope_version},
             context=_tool_context(self.name, request),
             harness=harness,
         )
+        self._notify(request, "scope_ready", "Scope 已确认，准备检索。", 0.34)
+        return result
 
     def _retrieve(self, request: Any, harness: ResearchRunHarness, query: str) -> Mapping[str, Any]:
-        return self.gateway.invoke(
+        translated = tuple(
+            value.strip()
+            for value in getattr(request, "retrieval_queries", ())
+            if isinstance(value, str) and value.strip()
+        )
+        # 对原问题使用翻译 Tool 生成的中英文等价查询；对于关系/缺口等
+        # workflow 内部查询，也保留它们，避免丢失明确的任务约束。
+        query_variants = tuple(dict.fromkeys((query, *translated)))
+        arguments: dict[str, Any] = {
+            "query": query,
+            "query_variants": list(query_variants),
+            "workspace_id": request.workspace_id,
+            "scope_version": request.scope_version,
+            "top_k": request.top_k,
+        }
+        target_document_ids = tuple(
+            value.strip()
+            for value in getattr(request, "target_document_ids", ())
+            if isinstance(value, str) and value.strip()
+        )
+        if target_document_ids:
+            arguments["target_document_ids"] = list(target_document_ids)
+        result = self.gateway.invoke(
             "knowledge.retrieve",
-            {
-                "query": query,
-                "workspace_id": request.workspace_id,
-                "scope_version": request.scope_version,
-                "top_k": request.top_k,
-            },
+            arguments,
             context=_tool_context(self.name, request),
             harness=harness,
         )
+        self._notify(request, "retrieved", "双语 RAG 召回完成，正在整理 Selected Evidence。", 0.56)
+        return result
+
+    @staticmethod
+    def _notify(request: Any, stage: str, message: str, progress: float) -> None:
+        callback = getattr(request, "progress_callback", None)
+        if not callable(callback):
+            return
+        try:
+            callback(stage, message, progress)
+        except Exception:
+            # 进度 UI 故障不得影响科研问答主链。
+            return
 
     def _generate(
         self,
@@ -126,22 +209,46 @@ class BaseWorkflow:
         evidence: Sequence[Mapping[str, Any]],
         conflicts: Sequence[Mapping[str, Any]],
     ) -> Mapping[str, Any]:
+        timeline_constraints = tuple(
+            "论文发表时间元数据（仅用于时间排序，不能替代正文证据）："
+            f"{value.get('query_title') or value.get('matched_title') or 'unknown'} — "
+            f"{value.get('publication_year') or 'unknown'}"
+            for value in getattr(request, "timeline_metadata", ())
+            if isinstance(value, Mapping)
+        )
+        agent_constraints = tuple(
+            str(value).strip()
+            for value in getattr(request, "agent_instructions", ())
+            if str(value).strip()
+        )
         context = self.contexts.generator_pack(
             query=request.query,
             workspace_id=request.workspace_id,
             scope_version=request.scope_version,
-            scope_constraints=tuple(str(value) for value in scope.get("constraints", [])),
+            scope_constraints=(
+                tuple(str(value) for value in scope.get("constraints", []))
+                + timeline_constraints
+                + agent_constraints
+            ),
             evidence=evidence,
             conflicts=conflicts,
             output_format={
                 "answerable": "boolean",
-                "claims": "[{claim_id,text,evidence_ids}]",
+                "claims": "[{claim_id,text,category,source_ids,evidence_ids}]",
                 "refusal_reason": "string|null",
+                "conflicts_acknowledged": "boolean",
+                **(
+                    {"output_language": request.output_language}
+                    if getattr(request, "output_language", None)
+                    else {}
+                ),
             },
             harness=harness,
         )
+        self._notify(request, "generation_start", "正在调用回答模型生成带引用草稿。", 0.64)
         harness.consume("llm_calls")
         draft = self.generator.generate(context)
+        self._notify(request, "generated", "回答草稿生成完成，正在执行证据校验。", 0.80)
         usage = draft.get("usage") if isinstance(draft, Mapping) else None
         if isinstance(usage, Mapping):
             harness.consume("total_tokens", int(usage.get("total_tokens") or 0))
@@ -162,6 +269,7 @@ class DirectQAWorkflow(BaseWorkflow):
             trace["selected_count"] = len(evidence)
             conflicts = _conflicts(retrieval)
         draft: Mapping[str, Any]
+        generation_failure: dict[str, Any] | None = None
         if not evidence:
             draft = {
                 "answerable": False,
@@ -169,15 +277,28 @@ class DirectQAWorkflow(BaseWorkflow):
                 "refusal_reason": "当前 Scope 中没有 Selected Evidence。",
             }
         else:
-            with harness.step("GENERATE"):
-                draft = self._generate(request, harness, scope, evidence, conflicts)
+            try:
+                with harness.step("GENERATE"):
+                    draft = self._generate(request, harness, scope, evidence, conflicts)
+            except BudgetExceeded:
+                raise
+            except Exception as error:
+                generation_failure = _generation_failure(error)
+                draft = {
+                    "answerable": False,
+                    "claims": [],
+                    "refusal_reason": _generation_failure_message(generation_failure),
+                }
         return WorkflowExecution(
             draft,
             evidence,
             scope,
             conflicts,
             {"sufficient": bool(evidence)},
-            {"primary_generation_calls": harness.usage.llm_calls},
+            {
+                "primary_generation_calls": harness.usage.llm_calls,
+                **({"generation_failure": generation_failure} if generation_failure else {}),
+            },
         )
 
 
@@ -239,11 +360,22 @@ class RelationReasoningWorkflow(BaseWorkflow):
                 }
             )
         draft: Mapping[str, Any]
+        generation_failure: dict[str, Any] | None = None
         if not evidence:
             draft = {"answerable": False, "claims": [], "refusal_reason": "关系证据不足。"}
         else:
-            with harness.step("GENERATE"):
-                draft = self._generate(request, harness, scope, evidence, conflicts)
+            try:
+                with harness.step("GENERATE"):
+                    draft = self._generate(request, harness, scope, evidence, conflicts)
+            except BudgetExceeded:
+                raise
+            except Exception as error:
+                generation_failure = _generation_failure(error)
+                draft = {
+                    "answerable": False,
+                    "claims": [],
+                    "refusal_reason": _generation_failure_message(generation_failure),
+                }
         return WorkflowExecution(
             draft,
             tuple(evidence),
@@ -254,6 +386,7 @@ class RelationReasoningWorkflow(BaseWorkflow):
                 "gap_retrievals": max(0, harness.usage.retrieval_rounds - 1),
                 "gap_retrieval_failed": gap_failed,
                 "query_frame": query_frame.to_dict(),
+                **({"generation_failure": generation_failure} if generation_failure else {}),
             },
         )
 
@@ -276,6 +409,7 @@ class DeepResearchWorkflow(BaseWorkflow):
                 known = {str(value.get("evidence_id")) for value in evidence}
                 evidence.extend(value for value in _selected(retrieval) if str(value.get("evidence_id")) not in known)
         discovery: Mapping[str, Any] = {}
+        provisional: dict[str, Any] = {"evidence": [], "evidence_count": 0, "fulltext_jobs": []}
         external_search_failed = False
         if len(evidence) < 3 and harness.policy.max_external_searches:
             with harness.step("EXTERNAL_LITERATURE_DISCOVERY"):
@@ -295,13 +429,59 @@ class DeepResearchWorkflow(BaseWorkflow):
                         "reduce_to_local_verified_evidence",
                         "continuing",
                     )
+                else:
+                    raw_discovered = discovery.get("results")
+                    discovered_papers = (
+                        [value for value in raw_discovered if isinstance(value, Mapping)][:5]
+                        if isinstance(raw_discovered, list)
+                        else []
+                    )
+                    if request.project_root is not None:
+                        provisional = register_abstract_evidence(
+                            request.project_root,
+                            request.session_id or harness.run_id,
+                            discovered_papers,
+                        )
+                    else:
+                        provisional_values = [
+                            value
+                            for ordinal, paper in enumerate(discovered_papers, 1)
+                            if (value := abstract_evidence_from_paper(
+                                paper,
+                                session_id=request.session_id or harness.run_id,
+                                ordinal=ordinal,
+                            )) is not None
+                        ]
+                        provisional = {
+                            "evidence": provisional_values,
+                            "evidence_count": len(provisional_values),
+                            "fulltext_jobs": [],
+                        }
+                    evidence.extend(
+                        value
+                        for value in provisional.get("evidence", [])
+                        if isinstance(value, Mapping)
+                        and str(value.get("evidence_id"))
+                        not in {str(item.get("evidence_id")) for item in evidence}
+                    )
         conflicts = _conflicts(retrieval)
         draft: Mapping[str, Any]
+        generation_failure: dict[str, Any] | None = None
         if not evidence:
             draft = {"answerable": False, "claims": [], "refusal_reason": "本地证据不足；外部发现结果尚未验证。"}
         else:
-            with harness.step("GENERATE"):
-                draft = self._generate(request, harness, scope, evidence, conflicts)
+            try:
+                with harness.step("GENERATE"):
+                    draft = self._generate(request, harness, scope, evidence, conflicts)
+            except BudgetExceeded:
+                raise
+            except Exception as error:
+                generation_failure = _generation_failure(error)
+                draft = {
+                    "answerable": False,
+                    "claims": [],
+                    "refusal_reason": _generation_failure_message(generation_failure),
+                }
         return WorkflowExecution(
             draft,
             tuple(evidence),
@@ -313,6 +493,9 @@ class DeepResearchWorkflow(BaseWorkflow):
                 if isinstance(discovery.get("results"), list)
                 else 0,
                 "external_search_failed": external_search_failed,
+                "provisional_evidence_count": int(provisional.get("evidence_count") or 0),
+                "provisional_evidence_path": provisional.get("path"),
+                **({"generation_failure": generation_failure} if generation_failure else {}),
             },
         )
 
@@ -477,16 +660,43 @@ class ResearchBootstrapWorkflow(BaseWorkflow):
         with harness.step("RESUME_ORIGINAL_QUESTION"):
             retrieval = self._retrieve(resumed_request, harness, request.query)
             evidence = _selected(retrieval)
-            draft = (
-                self._generate(resumed_request, harness, scope, evidence, _conflicts(retrieval))
-                if evidence
-                else {"answerable": False, "claims": [], "refusal_reason": "候选文献已处理，但原问题仍缺少 Selected Evidence。"}
-            )
+            generation_failure: dict[str, Any] | None = None
+            if evidence:
+                try:
+                    draft = self._generate(
+                        resumed_request,
+                        harness,
+                        scope,
+                        evidence,
+                        _conflicts(retrieval),
+                    )
+                except BudgetExceeded:
+                    raise
+                except Exception as error:
+                    generation_failure = _generation_failure(error)
+                    draft = {
+                        "answerable": False,
+                        "claims": [],
+                        "refusal_reason": _generation_failure_message(generation_failure),
+                    }
+            else:
+                draft = {
+                    "answerable": False,
+                    "claims": [],
+                    "refusal_reason": "候选文献已处理，但原问题仍缺少 Selected Evidence。",
+                }
         return WorkflowExecution(
             draft,
             evidence,
             scope,
             _conflicts(retrieval),
             {"sufficient": bool(evidence)},
-            {"scope_proposal": proposal, "ingested_document_ids": ingested, "resumed_original_question": True, "resumed_scope_version": resumed_request.scope_version, "lightweight_count": len(lightweight)},
+            {
+                "scope_proposal": proposal,
+                "ingested_document_ids": ingested,
+                "resumed_original_question": True,
+                "resumed_scope_version": resumed_request.scope_version,
+                "lightweight_count": len(lightweight),
+                **({"generation_failure": generation_failure} if generation_failure else {}),
+            },
         )

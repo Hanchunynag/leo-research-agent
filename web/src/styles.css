@@ -192,6 +192,7 @@ h1, h2, h3, p { margin-top: 0; }
 .coverage-row span.partial { background: #f6e7d8; color: var(--orange); }
 .coverage-row span.missing { background: #f1dddd; color: #9b3c3c; }
 .metric-row span { color: var(--muted); }
+.token-total { margin-top: 6px; padding-top: 10px; border-top: 1px solid var(--ink); }
 .trace-block { padding-bottom: 6px; }
 .trace-row { display: grid; grid-template-columns: 10px 1fr; gap: 8px; padding-top: 10px; }
 .trace-row i { width: 6px; height: 6px; margin-top: 4px; border-radius: 50%; background: var(--green); }

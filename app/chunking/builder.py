@@ -26,6 +26,7 @@ from app.chunking.structure import (
     write_structure,
 )
 from app.indexing.bm25 import build_bm25_index, write_bm25_index
+from app.indexing.paper import build_paper_bm25_index
 from app.storage import write_json_atomic, write_jsonl_atomic
 
 
@@ -75,6 +76,7 @@ class KnowledgeBuildReport:
     bm25_index: str
     issues: list[KnowledgeBuildIssue]
     documents: list[KnowledgeDocumentResult]
+    paper_bm25_index: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -240,6 +242,7 @@ def build_knowledge_base(
     chunks_output = chunks_jsonl_path(root)
     write_jsonl_atomic(chunks_output, all_chunks)
     bm25_output = write_bm25_index(root, build_bm25_index(all_chunks))
+    paper_bm25 = build_paper_bm25_index(root, force=force)
     report = KnowledgeBuildReport(
         built_at=utc_now_iso(),
         structure_policy_version=STRUCTURE_POLICY_VERSION,
@@ -276,6 +279,7 @@ def build_knowledge_base(
         bm25_index=project_relative(bm25_output, root),
         issues=issues,
         documents=document_results,
+        paper_bm25_index=project_relative(Path(paper_bm25.index_path), root),
     )
     write_json_atomic(
         root / "data" / "knowledge" / "last_knowledge_build.json",

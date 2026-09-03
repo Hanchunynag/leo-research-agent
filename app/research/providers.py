@@ -129,6 +129,35 @@ class AcademicLiteratureProviderAdapter:
         value = self.candidates.get(str(arguments["paper_id"]))
         return {**value, "lightweight": True}
 
+    def resolve_publication_date(
+        self, arguments: Mapping[str, Any], context: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Resolve one title to publication metadata for timeline ordering."""
+
+        title = str(arguments["title"]).strip()
+        if not title:
+            raise ValueError("论文标题不能为空。")
+        resolver = getattr(self.backend, "resolve", None)
+        if not callable(resolver):
+            raise RuntimeError("当前 Academic backend 不支持按标题解析论文元数据。")
+        result = _sync(resolver(title, limit=5))
+        papers = getattr(result, "papers", None)
+        failures = getattr(result, "failures", None)
+        values = [paper.to_dict() for paper in papers[:5]] if isinstance(papers, list) else []
+        best = values[0] if values else {}
+        return {
+            "query_title": title,
+            "matched_title": str(best.get("title") or ""),
+            "publication_year": best.get("publication_year"),
+            "doi": best.get("doi"),
+            "sources": list(best.get("sources") or []),
+            "match_score": best.get("match_score"),
+            "candidates": values,
+            "provider_failures": [
+                value.to_dict() for value in failures
+            ] if isinstance(failures, list) else [],
+        }
+
     def download(self, paper_id: str) -> Mapping[str, Any]:
         paper = self.candidates.get(paper_id)
         external = paper.get("external_ids")
@@ -244,6 +273,7 @@ def build_bootstrap_provider_composition(
         gateway_handlers={
             "literature.search": literature.search,
             "literature.get_metadata": literature.get_metadata,
+            "literature.resolve_publication_date": literature.resolve_publication_date,
             "literature.download": submitter.handler("literature.download"),
             "document.parse": submitter.handler("document.parse"),
             "job.get_status": status,

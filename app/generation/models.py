@@ -29,12 +29,14 @@ class AnswerDraft:
     claims: list[AnswerClaim]
     refusal_reason: str | None = None
     provider_metadata: dict[str, Any] = field(default_factory=dict)
+    conflicts_acknowledged: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "answerable": self.answerable,
             "claims": [claim.to_dict() for claim in self.claims],
             "refusal_reason": self.refusal_reason,
+            "conflicts_acknowledged": self.conflicts_acknowledged,
         }
 
 

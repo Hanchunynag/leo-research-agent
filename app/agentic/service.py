@@ -94,6 +94,7 @@ def _agentic_to_answer_draft(draft: AgenticAnswerDraft) -> AnswerDraft:
             for claim in draft.claims
         ],
         refusal_reason=draft.refusal_reason,
+        conflicts_acknowledged=draft.conflicts_acknowledged,
     )
 
 

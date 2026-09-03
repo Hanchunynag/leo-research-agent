@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from app.research.context import ResearchContextManager
 from app.research.harness import (
@@ -42,6 +42,23 @@ class WorkflowRequest:
     limited_autonomy: bool = False
     workspace_summary: Mapping[str, Any] | None = None
     recent_conversation: tuple[Mapping[str, str], ...] = ()
+    # 生产入口在 LangChain 翻译 Tool 或 Research Planner 中生成。原问题
+    # 始终保留给生成阶段；该字段只能增加检索变体，不能覆盖原始提问。
+    retrieval_queries: tuple[str, ...] = ()
+    progress_callback: Any | None = None
+    translation_llm_call: bool = False
+    output_language: str | None = None
+    agent_llm_call: bool = False
+    agent_llm_calls: int = 0
+    validation_llm_call: bool = False
+    timeline_metadata: tuple[Mapping[str, Any], ...] = ()
+    # Agent-resolved paper scope for structured tasks.  The retrieval engine
+    # remains unchanged; its selected evidence is filtered at the tool boundary
+    # before it enters the generator context.
+    target_document_ids: tuple[str, ...] = ()
+    # Planner-owned rendering constraints. They guide synthesis only and must
+    # never alter the user's query or the retrieval query variants.
+    agent_instructions: tuple[str, ...] = ()
     permissions: frozenset[str] = frozenset(
         {
             "knowledge.read",
@@ -54,6 +71,7 @@ class WorkflowRequest:
             "job.read",
         }
     )
+    project_root: Path | None = None
 
     def __post_init__(self) -> None:
         if not self.query.strip() or not self.workspace_id.strip() or self.scope_version < 1:
@@ -63,23 +81,26 @@ class WorkflowRequest:
 _POLICIES = {
     WorkflowName.DIRECT_QA: ResearchBudgetPolicy(
         max_steps=10,
-        max_llm_calls=1,
+        max_llm_calls=2,
         max_tool_calls=2,
         max_retrieval_rounds=1,
         max_external_searches=0,
         max_repairs=1,
-        max_context_tokens=4_000,
-        max_total_tokens=10_000,
+        max_context_tokens=8_000,
+        max_total_tokens=32_000,
     ),
     WorkflowName.RELATION_REASONING: ResearchBudgetPolicy(
         max_steps=12,
-        max_llm_calls=1,
+        max_llm_calls=2,
         max_tool_calls=3,
         max_retrieval_rounds=2,
         max_external_searches=0,
         max_repairs=1,
-        max_context_tokens=5_000,
-        max_total_tokens=12_000,
+        # Cross-paper synthesis commonly selects evidence from all papers in
+        # the workspace; the previous 5k/24k limits rejected otherwise valid
+        # runs after the workflow was correctly routed here.
+        max_context_tokens=8_000,
+        max_total_tokens=32_000,
     ),
     WorkflowName.DEEP_RESEARCH: ResearchBudgetPolicy(
         max_steps=18,
@@ -93,13 +114,13 @@ _POLICIES = {
     ),
     WorkflowName.RESEARCH_BOOTSTRAP: ResearchBudgetPolicy(
         max_steps=22,
-        max_llm_calls=1,
+        max_llm_calls=2,
         max_tool_calls=12,
         max_retrieval_rounds=1,
         max_external_searches=1,
         max_repairs=1,
         max_context_tokens=6_000,
-        max_total_tokens=16_000,
+        max_total_tokens=24_000,
     ),
 }
 
@@ -114,6 +135,7 @@ class ResearchRuntime:
         validator: ClaimEvidenceValidator | TieredClaimEvidenceValidator | None = None,
         state_store: ResearchStateStore | None = None,
         trace_store: RunTraceStore | None = None,
+        project_root: Path | None = None,
     ) -> None:
         self.gateway = gateway
         self.generator = generator
@@ -121,6 +143,7 @@ class ResearchRuntime:
         self.validator = validator or TieredClaimEvidenceValidator()
         self.state_store = state_store
         self.trace_store = trace_store
+        self.project_root = project_root.expanduser().resolve() if project_root else None
 
     @staticmethod
     def route(request: WorkflowRequest) -> WorkflowName:
@@ -132,14 +155,48 @@ class ResearchRuntime:
             for key in ("evidence_insufficient", "out_of_scope", "missing_dimensions")
         ):
             return WorkflowName.RESEARCH_BOOTSTRAP
-        relation_markers = ("relationship", "relation", "how are", "关系", "关联", "机制")
+        relation_markers = (
+            "relationship",
+            "relation",
+            "how are",
+            "关系",
+            "关联",
+            "机制",
+            # Cross-paper evolution questions need the relation workflow so
+            # QueryFrame/Coverage can require evidence for each stage instead
+            # of treating the request as ordinary direct QA.
+            "演进",
+            "演化",
+            "研究路线",
+            "发展路线",
+            "技术路线",
+            "时间线",
+            "evolution",
+            "progression",
+            "roadmap",
+            "timeline",
+        )
         if any(value in request.query.casefold() for value in relation_markers):
             return WorkflowName.RELATION_REASONING
         return WorkflowName.DIRECT_QA
 
     def run(self, request: WorkflowRequest) -> dict[str, Any]:
+        if request.project_root is None and self.project_root is not None:
+            request = replace(request, project_root=self.project_root)
         workflow_name = self.route(request)
-        harness = ResearchRunHarness(workflow_name.value, _POLICIES[workflow_name])
+        policy = _POLICIES[workflow_name]
+        agent_calls = int(request.agent_llm_calls or (1 if request.agent_llm_call else 0))
+        validation_calls = 1 if request.validation_llm_call else 0
+        if agent_calls or validation_calls:
+            policy = replace(
+                policy,
+                max_llm_calls=policy.max_llm_calls + agent_calls + validation_calls,
+            )
+        harness = ResearchRunHarness(workflow_name.value, policy)
+        if request.translation_llm_call:
+            harness.consume("llm_calls")
+        if agent_calls:
+            harness.consume("llm_calls", agent_calls)
         execution: WorkflowExecution | None = None
         validation: Any | None = None
         final_draft: dict[str, Any] = {
@@ -166,6 +223,7 @@ class ResearchRuntime:
             harness.transition(HarnessState.EXECUTING)
             execution = workflow.execute(request, harness)
             final_draft = dict(execution.draft)
+            generation_failure = execution.details.get("generation_failure")
             harness.transition(HarnessState.EVALUATING)
             with harness.step("CLAIM_VALIDATE") as trace:
                 validation = self.validator.validate(
@@ -185,6 +243,15 @@ class ResearchRuntime:
                         "semantic_output_tokens": validation.semantic_output_tokens,
                     }
                 )
+                judge_usage = getattr(self.validator, "last_judge_usage", {})
+                judge_called = bool(getattr(self.validator, "last_judge_called", False))
+                if judge_called:
+                    harness.consume("llm_calls")
+                    total = int(judge_usage.get("total_tokens") or 0) if isinstance(judge_usage, Mapping) else 0
+                    if total:
+                        harness.consume("total_tokens", total)
+                    if isinstance(judge_usage, Mapping) and judge_usage:
+                        harness.record_provider_usage("semantic_validation", dict(judge_usage))
             if not validation.valid:
                 harness.transition(HarnessState.RECOVERING)
                 harness.consume("repairs")
@@ -197,13 +264,32 @@ class ResearchRuntime:
                 harness.transition(HarnessState.COMMITTING)
             else:
                 harness.transition(HarnessState.COMMITTING)
+            if (
+                not isinstance(generation_failure, Mapping)
+                and validation is not None
+                and not validation.valid
+            ):
+                final_draft = {
+                    "answerable": False,
+                    "claims": [],
+                    "refusal_reason": "回答未通过 Claim-Evidence 验证，未生成确定性科研结论。",
+                }
             with harness.step("COMMIT_SAFE_STATE"):
                 self._commit(request, harness, workflow_name, execution, final_draft)
             answerable = bool(final_draft.get("answerable"))
-            harness.finish(
-                HarnessState.COMPLETED if answerable else HarnessState.REFUSED,
-                "completed" if answerable else "insufficient_verified_evidence",
-            )
+            if isinstance(generation_failure, Mapping):
+                failure_kind = str(generation_failure.get("failure_kind") or "unknown")
+                harness.finish(
+                    HarnessState.REFUSED,
+                    f"generation_failed:{failure_kind}",
+                )
+            elif validation is not None and not validation.valid:
+                harness.finish(HarnessState.REFUSED, "validation_failed")
+            else:
+                harness.finish(
+                    HarnessState.COMPLETED if answerable else HarnessState.REFUSED,
+                    "completed" if answerable else "insufficient_verified_evidence",
+                )
         except BudgetExceeded as error:
             final_draft = self._safe_termination(harness, str(error), RecoveryLevel.SAFE_TERMINATION)
         except Exception as error:
@@ -357,6 +443,16 @@ class HarnessAgentService:
         workspace_summary: Mapping[str, Any] | None = None,
         force_new_topic: bool = False,
         include_context: bool = False,
+        retrieval_queries: tuple[str, ...] = (),
+        progress_callback: Any | None = None,
+        translation_llm_call: bool = False,
+        output_language: str = "en",
+        agent_llm_call: bool = False,
+        agent_llm_calls: int = 0,
+        validation_llm_call: bool = False,
+        timeline_metadata: Sequence[Mapping[str, Any]] = (),
+        target_document_ids: Sequence[str] = (),
+        agent_instructions: Sequence[str] = (),
         **_: Any,
     ) -> dict[str, Any]:
         sid, topic_id, session_created, recent = self._prepare_session(
@@ -376,6 +472,28 @@ class HarnessAgentService:
                 bootstrap_confirmed=bootstrap_confirmed,
                 workspace_summary=workspace_summary or self.workspace_summary,
                 recent_conversation=recent,
+                retrieval_queries=tuple(
+                    value.strip()
+                    for value in retrieval_queries
+                    if isinstance(value, str) and value.strip()
+                ),
+                progress_callback=progress_callback,
+                translation_llm_call=translation_llm_call,
+                output_language=output_language,
+                agent_llm_call=agent_llm_call,
+                agent_llm_calls=agent_llm_calls,
+                validation_llm_call=validation_llm_call,
+                timeline_metadata=tuple(dict(value) for value in timeline_metadata if isinstance(value, Mapping)),
+                target_document_ids=tuple(
+                    value.strip()
+                    for value in target_document_ids
+                    if isinstance(value, str) and value.strip()
+                ),
+                agent_instructions=tuple(
+                    value.strip()
+                    for value in agent_instructions
+                    if isinstance(value, str) and value.strip()
+                ),
             )
         )
         result = self._present(
@@ -482,13 +600,70 @@ class HarnessAgentService:
         answerable = bool(raw.get("answerable"))
         validation = dict(raw.get("validation") or {})
         validation["citations"] = citations
-        outcome = {
-            "code": "answered" if answerable else "insufficient_evidence",
-            "stage": "completed" if answerable else "evaluation",
-            "message": "回答已通过 Research Harness 验证。" if answerable else str(raw.get("refusal_reason") or "证据不足。"),
-            "retryable": False,
-        }
+        workflow_details = dict(raw.get("workflow_details") or {})
+        generation_failure = workflow_details.get("generation_failure")
         harness = dict(raw.get("diagnostics") or {})
+        harness_termination = str(harness.get("termination_reason") or "")
+        is_generation_failure = isinstance(generation_failure, Mapping) or (
+            harness_termination.startswith("generation_failed:")
+            or harness_termination
+            in {
+                "safe_termination:HTTPStatusError",
+                "safe_termination:StructuredOutputError",
+            }
+        )
+        if answerable:
+            outcome = {
+                "code": "answered",
+                "stage": "completed",
+                "message": "回答已通过 Research Harness 验证。",
+                "retryable": False,
+            }
+        elif is_generation_failure:
+            failure_kind = (
+                str(generation_failure.get("failure_kind") or "unknown")
+                if isinstance(generation_failure, Mapping)
+                else harness_termination.removeprefix("safe_termination:")
+            )
+            status = (
+                generation_failure.get("http_status")
+                if isinstance(generation_failure, Mapping)
+                else None
+            )
+            status_text = f"HTTP {status}, " if isinstance(status, int) else ""
+            outcome = {
+                "code": "generation_failed",
+                "stage": "generation",
+                "message": str(
+                    raw.get("refusal_reason")
+                    or f"回答模型请求失败（{status_text}{failure_kind}）。"
+                ),
+                "retryable": True,
+                "details": dict(generation_failure)
+                if isinstance(generation_failure, Mapping)
+                else {"failure_kind": failure_kind},
+            }
+        elif harness_termination.startswith("budget_exhausted:"):
+            outcome = {
+                "code": "budget_exhausted",
+                "stage": "harness",
+                "message": str(raw.get("refusal_reason") or "预算耗尽。"),
+                "retryable": True,
+            }
+        elif not (raw.get("selected_evidence") or []):
+            outcome = {
+                "code": "insufficient_evidence",
+                "stage": "retrieval",
+                "message": str(raw.get("refusal_reason") or "证据不足。"),
+                "retryable": False,
+            }
+        else:
+            outcome = {
+                "code": "validation_failed",
+                "stage": "evaluation",
+                "message": str(raw.get("refusal_reason") or "回答未通过验证。"),
+                "retryable": True,
+            }
         result: dict[str, Any] = {
             "schema_version": "1.0",
             "query": str(raw.get("query") or ""),
@@ -516,7 +691,7 @@ class HarnessAgentService:
             ],
             "selected_evidence": selected,
             "workflow": raw.get("workflow"),
-            "workflow_details": dict(raw.get("workflow_details") or {}),
+            "workflow_details": workflow_details,
             "conflicts": list(raw.get("conflicts") or []),
             "diagnostics": {
                 "retrieval_mode": "research_harness",
@@ -662,13 +837,16 @@ def build_research_runtime(
     generator: AnswerGenerator,
     *,
     extra_tools: Mapping[str, ToolHandler] | None = None,
+    validator: ClaimEvidenceValidator | TieredClaimEvidenceValidator | None = None,
 ) -> ResearchRuntime:
     gateway = build_default_gateway(unified_tool_handlers(knowledge, workspaces, extras=extra_tools))
     return ResearchRuntime(
         gateway,
         generator,
+        validator=validator,
         state_store=ResearchStateStore(project_root),
         trace_store=RunTraceStore(project_root),
+        project_root=project_root,
     )
 
 

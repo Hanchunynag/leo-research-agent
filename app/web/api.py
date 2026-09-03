@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.ingestion.ingest import sanitize_pdf_filename
 from app.web.jobs import JobManager
-from app.web.models import AnswerRequest, JobCreated, JobSnapshot, ParseOptions
+from app.web.models import AnswerRequest, JobCreated, JobSnapshot, ParseOptions, ResumeRequest
 from app.web.runtime import EmitProgress, LocalRAGWebRuntime
 
 
@@ -184,6 +184,16 @@ def create_app(
         return job_manager.submit(
             "answer",
             lambda emit: web_runtime.answer(request, emit),
+        )
+
+    @app.post("/api/answers/resume", response_model=JobCreated, status_code=202)
+    def resume_answer(request: ResumeRequest) -> JobCreated:
+        resume = getattr(web_runtime, "resume", None)
+        if not callable(resume):
+            raise HTTPException(status_code=501, detail="当前 Runtime 不支持 LangGraph Resume。")
+        return job_manager.submit(
+            "answer",
+            lambda emit: resume(request.thread_id, request.user_input, emit),
         )
 
     @app.get("/api/jobs/{job_id}", response_model=JobSnapshot)

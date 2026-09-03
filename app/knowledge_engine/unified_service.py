@@ -194,12 +194,32 @@ class UnifiedKnowledgeService:
         self._shadow(request, candidates, official_ms)
         return {**result, "results": governed, "result_count": len(governed)}
 
-    def retrieve_multi(self, queries: Sequence[str], *, limit: int = 40, rrf_k: int = 60) -> dict[str, Any]:
+    def retrieve_multi(
+        self,
+        queries: Sequence[str],
+        *,
+        limit: int = 40,
+        rrf_k: int = 60,
+        workspace_id: str | None = None,
+        scope_version: int | None = None,
+    ) -> dict[str, Any]:
+        normalized_queries = tuple(
+            dict.fromkeys(
+                value.strip() for value in queries if isinstance(value, str) and value.strip()
+            )
+        )
+        if not normalized_queries:
+            return {"retriever": f"unified_{self.official_engine_name}", "results": [], "result_count": 0}
         if self.official_engine_name == "legacy" and hasattr(self.official_runtime, "retrieve_multi"):
-            query = next(iter(queries), "")
-            request = self._request(query, limit)
+            query = normalized_queries[0]
+            request = self._request(
+                query,
+                limit,
+                workspace_id=workspace_id,
+                scope_version=scope_version,
+            )
             started = perf_counter()
-            result = self.official_runtime.retrieve_multi(queries, limit=limit, rrf_k=rrf_k)
+            result = self.official_runtime.retrieve_multi(normalized_queries, limit=limit, rrf_k=rrf_k)
             raw = result.get("results") if isinstance(result, dict) else None
             values = [value for value in raw if isinstance(value, dict)] if isinstance(raw, list) else []
             governed, candidates = self._govern(request, values)
@@ -214,8 +234,16 @@ class UnifiedKnowledgeService:
             self._shadow(request, candidates, official_ms)
             return {**result, "results": governed, "result_count": len(governed)}
         merged: list[dict[str, Any]] = []
-        for query in queries:
-            merged.extend(self.retrieve(query, limit=limit, rrf_k=rrf_k).get("results", []))
+        for query in normalized_queries:
+            merged.extend(
+                self.retrieve(
+                    query,
+                    limit=limit,
+                    rrf_k=rrf_k,
+                    workspace_id=workspace_id,
+                    scope_version=scope_version,
+                ).get("results", [])
+            )
         unique = {str(value.get("evidence_id") or value.get("chunk_id")): value for value in merged}
         return {"retriever": f"unified_{self.official_engine_name}", "results": list(unique.values())[:limit], "result_count": min(len(unique), limit), "diagnostics": self.last_diagnostics}
 

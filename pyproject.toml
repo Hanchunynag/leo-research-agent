@@ -25,8 +25,11 @@ dependencies = [
     "python-igraph==0.11.9",
     "leidenalg==0.10.2",
     "lightrag-hku==1.5.6",
+    "langchain==0.3.30",
+    "langchain-core==0.3.86",
     "typer>=0.27.0",
     "uvicorn>=0.35,<1",
+    "langgraph>=0.2,<0.4",
 ]
 
 [dependency-groups]
@@ -44,8 +47,7 @@ markers = [
 ]
 
 [tool.uv]
-# RAGAS 0.3.x still imports the pre-1.0 LangChain compatibility modules.
-# These are transitive-only constraints; application code never imports LangChain/LangGraph.
+# RAGAS 0.3.x and the production agent both use the pre-1.0 LangChain APIs.
 constraint-dependencies = [
     "langchain<1",
     "langchain-core<1",
