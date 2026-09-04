@@ -189,6 +189,39 @@ def _safe_evidence(evidence: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _validate_model_payload(
+    model_type: type[ModelT], payload: dict[str, Any]
+) -> tuple[ModelT, list[str]]:
+    """Validate a provider object while tolerating harmless top-level additions.
+
+    OpenAI-compatible providers occasionally echo control/rendering fields such as
+    ``output_language`` even though those fields are not part of the answer
+    contract.  Keep the contract strict for nested objects and malformed known
+    fields; only discard unknown keys at the response root.
+    """
+
+    try:
+        return model_type.model_validate(payload), []
+    except ValidationError as error:
+        extra_fields = sorted(
+            {
+                str(issue.get("loc", ())[0])
+                for issue in error.errors(
+                    include_url=False,
+                    include_input=False,
+                )
+                if issue.get("type") == "extra_forbidden"
+                and len(issue.get("loc", ())) == 1
+            }
+        )
+        if not extra_fields:
+            raise
+        sanitized = {
+            key: value for key, value in payload.items() if key not in extra_fields
+        }
+        return model_type.model_validate(sanitized), extra_fields
+
+
 class OpenAIAgenticReasoningProvider:
     """使用现有 OpenAI-compatible 客户端执行全部受限结构化阶段。"""
 
@@ -237,8 +270,16 @@ class OpenAIAgenticReasoningProvider:
                 content = payload["choices"][0]["message"]["content"]
                 if not isinstance(content, str):
                     raise ValueError("message.content 不是字符串。")
-                result = model_type.model_validate(parse_json_object(content))
-                diagnostics = self._metadata(payload, messages, attempt)
+                result, ignored_extra_fields = _validate_model_payload(
+                    model_type,
+                    parse_json_object(content),
+                )
+                diagnostics = self._metadata(
+                    payload,
+                    messages,
+                    attempt,
+                    ignored_extra_fields=ignored_extra_fields,
+                )
                 self.last_stage_diagnostics[stage] = diagnostics
                 return result, diagnostics
             except (KeyError, IndexError, TypeError, ValueError, ValidationError) as error:
@@ -332,6 +373,8 @@ class OpenAIAgenticReasoningProvider:
         payload: dict[str, Any],
         messages: list[dict[str, str]],
         repair_attempt: int,
+        *,
+        ignored_extra_fields: Sequence[str] = (),
     ) -> dict[str, Any]:
         usage = payload.get("usage")
         safe_usage = (
@@ -357,6 +400,7 @@ class OpenAIAgenticReasoningProvider:
             "prompt_hash": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
             "message_count": len(messages),
             "structure_repair_attempts": repair_attempt,
+            "ignored_top_level_fields": list(ignored_extra_fields),
         }
 
     @staticmethod

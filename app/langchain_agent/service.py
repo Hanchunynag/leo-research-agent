@@ -14,6 +14,7 @@ from app.research.runtime import (
     build_research_runtime,
     unified_tool_handlers,
 )
+from app.research.validation import ClaimEvidenceValidator
 
 from app.langchain_agent.skills import (
     AnswerGenerationSkill,
@@ -447,6 +448,7 @@ def build_langchain_agent_service(
     *,
     session_store: Any | None = None,
     extra_tools: Mapping[str, Any] | None = None,
+    semantic_validation_enabled: bool = True,
 ) -> LangChainHarnessAgentService:
     """唯一生产组装点：Agent 检索必经 LangChain 双 Tool 编排。"""
 
@@ -490,11 +492,15 @@ def build_langchain_agent_service(
     # tiered validator one bounded semantic Judge call when the production
     # ChatModel is available; fixture providers keep the offline path.
     semantic_judge = None
-    if callable(getattr(provider, "chat_completion", None)) and hasattr(provider, "config"):
+    if semantic_validation_enabled and callable(getattr(provider, "chat_completion", None)) and hasattr(provider, "config"):
         from app.langchain_agent.skills import ChatCompletionHighRiskJudge
 
         semantic_judge = ChatCompletionHighRiskJudge(provider)
-    validation_skill = ClaimValidationSkill(high_risk_judge=semantic_judge)
+    validation_skill = (
+        ClaimValidationSkill(high_risk_judge=semantic_judge)
+        if semantic_validation_enabled
+        else ClaimValidationSkill(validator=ClaimEvidenceValidator())
+    )
     runtime = build_research_runtime(
         project_root,
         knowledge,

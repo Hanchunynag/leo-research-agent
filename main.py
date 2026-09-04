@@ -1022,6 +1022,7 @@ def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) ->
         ),
         session_store=store,
         extra_tools=bootstrap.gateway_handlers,
+        semantic_validation_enabled=not args.disable_semantic_validation,
     )
     service.bootstrap_backend = backend
     service.bootstrap_composition = bootstrap

@@ -919,6 +919,40 @@ def test_agentic_answer_generation_has_a_compact_output_budget() -> None:
     assert inner.max_token_requests == [8192]
 
 
+def test_agentic_provider_ignores_provider_echoed_top_level_rendering_field() -> None:
+    class Provider:
+        model_name = "fixture/answer-model"
+        config = SimpleNamespace(max_tokens=8192)
+
+        def chat_completion(
+            self,
+            messages: list[dict[str, str]],
+            *,
+            max_tokens: int | None = None,
+        ) -> dict[str, Any]:
+            payload = AgenticAnswerDraft(
+                answerable=True,
+                claims=[
+                    AgenticClaim(
+                        claim_id="C1",
+                        text="A concise supported claim.",
+                        category="method",
+                        source_ids=["S1"],
+                        evidence_ids=["E1"],
+                    )
+                ],
+            ).model_dump(mode="json")
+            payload["output_language"] = "zh"
+            return {"choices": [{"message": {"content": json.dumps(payload)}}]}
+
+    provider = OpenAIAgenticReasoningProvider(Provider())  # type: ignore[arg-type]
+
+    draft, diagnostics = provider.generate_answer([{"role": "user", "content": "answer"}])
+
+    assert draft.answerable is True
+    assert diagnostics["ignored_top_level_fields"] == ["output_language"]
+
+
 def test_deepseek_api_key_alias_and_redaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

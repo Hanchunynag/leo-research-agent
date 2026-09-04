@@ -249,7 +249,7 @@ class ClaimValidationSkill:
 
     def __init__(
         self,
-        validator: TieredClaimEvidenceValidator | None = None,
+        validator: Any | None = None,
         *,
         high_risk_judge: Any | None = None,
     ) -> None:
