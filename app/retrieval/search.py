@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app.indexing.bm25 import (
+    BM25_SCHEMA_VERSION,
     bm25_index_path,
     chunks_digest,
     searchable_chunk_text,
@@ -81,6 +82,10 @@ def search_evidence(
     root = project_root.expanduser().resolve()
     chunks = load_chunks(root)
     index = load_json_object(bm25_index_path(root))
+    if index.get("bm25_schema_version") != BM25_SCHEMA_VERSION:
+        raise RuntimeError(
+            "BM25 索引 schema 版本不兼容，请重新构建 knowledge。"
+        )
     if index.get("chunks_digest") != chunks_digest(chunks):
         raise RuntimeError("BM25 索引与 chunks.jsonl 不一致，请重新构建 knowledge。")
     documents = index.get("documents")

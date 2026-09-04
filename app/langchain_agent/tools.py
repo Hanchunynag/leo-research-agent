@@ -10,6 +10,20 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
 
+class PaperFilterInput(BaseModel):
+    """有限的 Paper Knowledge Layer 过滤条件。
+
+    过滤字段是显式白名单，避免把任意数据库/Qdrant filter 暴露给 Agent。
+    """
+
+    year_from: int | None = Field(default=None, ge=1000, le=9999)
+    year_to: int | None = Field(default=None, ge=1000, le=9999)
+    paper_ids: list[str] = Field(default_factory=list)
+    document_ids: list[str] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
+    author: str | None = None
+
+
 class BilingualRetrievalInput(BaseModel):
     queries: list[str] = Field(min_length=1, description="已翻译并去重的中英文等价查询")
     workspace_id: str = Field(min_length=1)
@@ -18,6 +32,10 @@ class BilingualRetrievalInput(BaseModel):
     target_document_ids: list[str] = Field(
         default_factory=list,
         description="Planner-resolved document IDs; empty means the full workspace scope",
+    )
+    paper_filters: PaperFilterInput | None = Field(
+        default=None,
+        description="Bounded Paper-level filters; only planner-approved fields are accepted",
     )
 
 
@@ -52,6 +70,45 @@ def _clean_queries(values: list[str]) -> tuple[str, ...]:
     )
 
 
+def _bounded_paper_filters(
+    value: PaperFilterInput | Mapping[str, Any] | None,
+    *,
+    target_document_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Normalize planner filters and map target documents to Paper filters."""
+
+    if value is None:
+        payload: dict[str, Any] = {}
+    elif isinstance(value, PaperFilterInput):
+        payload = value.model_dump(exclude_none=True)
+    elif isinstance(value, Mapping):
+        allowed = set(PaperFilterInput.model_fields)
+        unknown = set(value) - allowed
+        if unknown:
+            raise ValueError(f"不支持的 Paper filter 字段：{sorted(str(item) for item in unknown)}")
+        try:
+            payload = PaperFilterInput.model_validate(dict(value)).model_dump(exclude_none=True)
+        except Exception as error:
+            raise ValueError("Paper filters 的字段值无效。") from error
+    else:
+        raise TypeError("paper_filters 必须是受限对象。")
+    documents = {
+        str(item).strip()
+        for item in [*(payload.get("document_ids") or []), *(target_document_ids or [])]
+        if str(item).strip()
+    }
+    if documents:
+        payload["document_ids"] = sorted(documents)
+    for key in ("paper_ids", "document_ids", "keywords"):
+        values = payload.get(key)
+        if values is not None:
+            payload[key] = [str(item).strip() for item in values if str(item).strip()]
+    if payload.get("year_from") is not None and payload.get("year_to") is not None:
+        if int(payload["year_from"]) > int(payload["year_to"]):
+            raise ValueError("Paper filter 的 year_from 不能晚于 year_to。")
+    return {key: value for key, value in payload.items() if value not in (None, [], "")}
+
+
 class BilingualRetrievalTool:
     """只向下游暴露 Selected Evidence 的检索 Tool。"""
 
@@ -65,6 +122,7 @@ class BilingualRetrievalTool:
         scope_version: int,
         top_k: int = 10,
         target_document_ids: list[str] | None = None,
+        paper_filters: PaperFilterInput | Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         variants = _clean_queries(queries)
         if not variants:
@@ -72,12 +130,20 @@ class BilingualRetrievalTool:
         expected_workspace = str(getattr(self.knowledge, "workspace_id", workspace_id))
         if workspace_id != expected_workspace:
             raise PermissionError("Unified Knowledge Service workspace 不匹配。")
-        result = self.knowledge.retrieve_multi(
-            variants,
-            limit=top_k,
-            workspace_id=workspace_id,
-            scope_version=scope_version,
+        bounded_filters = _bounded_paper_filters(
+            paper_filters, target_document_ids=target_document_ids
         )
+        retrieval_kwargs: dict[str, Any] = {
+            "limit": top_k,
+            "workspace_id": workspace_id,
+            "scope_version": scope_version,
+        }
+        # Preserve the old lightweight test/runtime contract when no filter is
+        # requested; real hierarchical retrieval receives filters before both
+        # Paper branches and before the Chunk candidate restriction.
+        if bounded_filters:
+            retrieval_kwargs["paper_filters"] = bounded_filters
+        result = self.knowledge.retrieve_multi(variants, **retrieval_kwargs)
         raw = result.get("results") if isinstance(result, Mapping) else None
         allowed_documents = {
             value.strip()
@@ -105,6 +171,8 @@ class BilingualRetrievalTool:
             for index, item in enumerate(selected, 1)
         ]
         diagnostics = dict(getattr(self.knowledge, "last_diagnostics", {}))
+        if isinstance(result, Mapping) and isinstance(result.get("diagnostics"), Mapping):
+            diagnostics.update(dict(result["diagnostics"]))
         intelligence = diagnostics.get("evidence_intelligence")
         if isinstance(intelligence, Mapping) and isinstance(intelligence.get("conflicts"), list):
             # 证据候选阶段的冲突不能泄漏到回答阶段；只有冲突双方都实际
@@ -126,7 +194,21 @@ class BilingualRetrievalTool:
             "query_count": len(variants),
             "selected_count": len(numbered),
         }
-        return {"results": numbered, "diagnostics": diagnostics}
+        output: dict[str, Any] = {"results": numbered, "diagnostics": diagnostics}
+        if isinstance(result, Mapping):
+            for key in (
+                "candidate_papers",
+                "candidate_paper_ids",
+                "paper_retrieval",
+                "chunk_retrieval",
+                "retriever",
+                "no_hit_reason",
+                "provisional_evidence",
+                "fulltext_jobs",
+            ):
+                if key in result:
+                    output[key] = result[key]
+        return output
 
 
 def build_bilingual_retrieval_tool(
@@ -168,6 +250,11 @@ def build_bilingual_gateway_handler(tool: StructuredTool):
                 **(
                     {"target_document_ids": list(arguments["target_document_ids"])}
                     if isinstance(arguments.get("target_document_ids"), list)
+                    else {}
+                ),
+                **(
+                    {"paper_filters": arguments["paper_filters"]}
+                    if isinstance(arguments.get("paper_filters"), Mapping)
                     else {}
                 ),
             }

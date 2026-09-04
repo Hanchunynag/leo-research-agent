@@ -181,7 +181,10 @@ _BOOTSTRAP = frozenset({"research_bootstrap"})
 def default_tool_specs() -> tuple[ToolSpec, ...]:
     object_schema = {"type": "object"}
     return (
-        ToolSpec("knowledge.retrieve", {"required": ["query", "workspace_id", "scope_version"], "properties": {"query": {"type": "string"}, "workspace_id": {"type": "string"}, "scope_version": {"type": "integer"}}}, object_schema, "knowledge.read", 30.0, True, "read", _ALL, RetryPolicy(2)),
+        # Local BGE-M3 + Cross Encoder model loading can exceed 30 seconds on
+        # CPU/MPS cold start.  The timeout covers one idempotent retrieval
+        # attempt; subsequent requests reuse the providers in the process.
+        ToolSpec("knowledge.retrieve", {"required": ["query", "workspace_id", "scope_version"], "properties": {"query": {"type": "string"}, "workspace_id": {"type": "string"}, "scope_version": {"type": "integer"}}}, object_schema, "knowledge.read", 120.0, True, "read", _ALL, RetryPolicy(2)),
         ToolSpec("workspace.read_scope", {"required": ["workspace_id", "scope_version"]}, object_schema, "workspace.read", 5.0, True, "read", _ALL),
         ToolSpec("workspace.update_scope", {"required": ["workspace_id", "scope_version", "document_ids"], "properties": {"workspace_id": {"type": "string"}, "scope_version": {"type": "integer"}, "document_ids": {"type": "array"}}}, object_schema, "workspace.write", 10.0, True, "bounded_write", _BOOTSTRAP),
         ToolSpec("literature.search", {"required": ["query"]}, object_schema, "literature.search", 30.0, True, "read", _DEEP_BOOTSTRAP, RetryPolicy(2)),

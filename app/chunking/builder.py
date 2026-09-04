@@ -242,7 +242,6 @@ def build_knowledge_base(
     all_chunks.sort(key=lambda chunk: str(chunk.get("chunk_id")))
     chunks_output = chunks_jsonl_path(root)
     write_jsonl_atomic(chunks_output, all_chunks)
-    bm25_output = write_bm25_index(root, build_bm25_index(all_chunks))
     # MySQL is the structured fact source when enabled.  The JSON/JSONL
     # artifacts above remain deliberately rebuildable compatibility outputs.
     # Sync before building the paper projection so the next index build is
@@ -250,6 +249,15 @@ def build_knowledge_base(
     from app.persistence import sync_knowledge_to_mysql
 
     structured_store = sync_knowledge_to_mysql(root, chunks=all_chunks)
+    bm25_chunks = all_chunks
+    if structured_store.get("enabled"):
+        # Queries use the structured repository when MySQL is enabled.  Build
+        # BM25 from that same post-sync projection so ordering, null handling,
+        # and metadata fields cannot produce a false digest mismatch.
+        from app.retrieval.search import load_chunks
+
+        bm25_chunks = load_chunks(root)
+    bm25_output = write_bm25_index(root, build_bm25_index(bm25_chunks))
     paper_bm25 = build_paper_bm25_index(root, force=force)
     report = KnowledgeBuildReport(
         built_at=utc_now_iso(),

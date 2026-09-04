@@ -9,7 +9,7 @@ from __future__ import annotations
 import secrets
 from time import perf_counter
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from app.contracts import CandidateEvidence, EvidenceRequest
 from app.contracts.adapters import LegacyEvidenceMapper
@@ -202,6 +202,7 @@ class UnifiedKnowledgeService:
         rrf_k: int = 60,
         workspace_id: str | None = None,
         scope_version: int | None = None,
+        paper_filters: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_queries = tuple(
             dict.fromkeys(
@@ -210,7 +211,12 @@ class UnifiedKnowledgeService:
         )
         if not normalized_queries:
             return {"retriever": f"unified_{self.official_engine_name}", "results": [], "result_count": 0}
-        if self.official_engine_name == "legacy" and hasattr(self.official_runtime, "retrieve_multi"):
+        normalized_filters = dict(paper_filters or {})
+        if (
+            self.official_engine_name == "legacy"
+            and hasattr(self.official_runtime, "retrieve_multi")
+            and not normalized_filters
+        ):
             query = normalized_queries[0]
             request = self._request(
                 query,
@@ -234,18 +240,73 @@ class UnifiedKnowledgeService:
             self._shadow(request, candidates, official_ms)
             return {**result, "results": governed, "result_count": len(governed)}
         merged: list[dict[str, Any]] = []
-        for query in normalized_queries:
-            merged.extend(
-                self.retrieve(
-                    query,
-                    limit=limit,
-                    rrf_k=rrf_k,
-                    workspace_id=workspace_id,
-                    scope_version=scope_version,
-                ).get("results", [])
+        per_query: list[dict[str, Any]] = []
+        paper_candidates: dict[str, dict[str, Any]] = {}
+        candidate_paper_ids: list[str] = []
+        paper_retrieval: list[dict[str, Any]] = []
+        chunk_retrieval: list[dict[str, Any]] = []
+        no_hit_reasons: list[str] = []
+        for query_index, query in enumerate(normalized_queries):
+            # Run the primary query through the configured Cross Encoder.  The
+            # additional bilingual/title probes are bounded recall probes and
+            # use the existing fast RRF path; re-ranking every probe would
+            # multiply cold-start and CPU cost without improving final evidence
+            # governance, which reranks the merged primary candidate pool.
+            query_result = self.retrieve(
+                query,
+                mode="hierarchical" if query_index == 0 else "fast",
+                limit=limit,
+                rrf_k=rrf_k,
+                paper_filters=normalized_filters,
+                workspace_id=workspace_id,
+                scope_version=scope_version,
             )
-        unique = {str(value.get("evidence_id") or value.get("chunk_id")): value for value in merged}
-        return {"retriever": f"unified_{self.official_engine_name}", "results": list(unique.values())[:limit], "result_count": min(len(unique), limit), "diagnostics": self.last_diagnostics}
+            per_query.append(query_result)
+            merged.extend(query_result.get("results", []))
+            for paper in query_result.get("candidate_papers", []):
+                if isinstance(paper, dict) and paper.get("paper_id"):
+                    paper_candidates.setdefault(str(paper["paper_id"]), dict(paper))
+            for paper_id in query_result.get("candidate_paper_ids", []):
+                if str(paper_id) and str(paper_id) not in candidate_paper_ids:
+                    candidate_paper_ids.append(str(paper_id))
+            if isinstance(query_result.get("paper_retrieval"), dict):
+                paper_retrieval.append(dict(query_result["paper_retrieval"]))
+            if isinstance(query_result.get("chunk_retrieval"), dict):
+                chunk_retrieval.append(dict(query_result["chunk_retrieval"]))
+            reason = query_result.get("no_hit_reason")
+            if isinstance(reason, str) and reason:
+                no_hit_reasons.append(reason)
+        unique: dict[str, dict[str, Any]] = {}
+        for value in merged:
+            key = str(value.get("evidence_id") or value.get("chunk_id") or "")
+            if key:
+                # Keep the primary (Cross-Encoder-ranked) representation when
+                # a later bilingual/title probe returns the same evidence.
+                unique.setdefault(key, value)
+        result: dict[str, Any] = {
+            "retriever": "hierarchical",
+            "results": list(unique.values())[:limit],
+            "result_count": min(len(unique), limit),
+            "candidate_papers": list(paper_candidates.values()),
+            "candidate_paper_ids": candidate_paper_ids,
+            "paper_retrieval": paper_retrieval[0] if len(paper_retrieval) == 1 else {
+                "queries": paper_retrieval,
+                "query_count": len(paper_retrieval),
+            },
+            "chunk_retrieval": {
+                "queries": chunk_retrieval,
+                "query_count": len(chunk_retrieval),
+                "allowed_paper_ids": candidate_paper_ids,
+                "rrf_k": rrf_k,
+            },
+            "no_hit_reason": (
+                no_hit_reasons[0]
+                if not merged and no_hit_reasons and len(set(no_hit_reasons)) == 1
+                else ("multiple_query_no_hit" if not merged and no_hit_reasons else None)
+            ),
+            "diagnostics": self.last_diagnostics,
+        }
+        return result
 
     def close(self) -> None:
         close = getattr(self.official_runtime, "close", None)

@@ -60,11 +60,19 @@ class BGERerankerProvider:
         if self._model is None:
             from sentence_transformers import CrossEncoder
             from torch.nn import Identity
+            from app.model_cache import resolve_local_model_path
 
+            model_name = self.config.model_name
+            if self.config.local_files_only:
+                model_name = resolve_local_model_path(
+                    model_name,
+                    self.config.cache_folder,
+                    required_files=("config.json", "tokenizer_config.json"),
+                )
             self._model = CrossEncoder(  # type: ignore[call-arg]
-                self.config.model_name,
+                model_name,
                 device=self.config.device,
-                cache_folder=(
+                cache_dir=(
                     str(self.config.cache_folder)
                     if self.config.cache_folder is not None
                     else None
@@ -72,7 +80,7 @@ class BGERerankerProvider:
                 revision=self.config.revision,
                 local_files_only=self.config.local_files_only,
                 max_length=self.config.max_length,
-                activation_fn=Identity(),
+                default_activation_function=Identity(),
             )
         return self._model
 

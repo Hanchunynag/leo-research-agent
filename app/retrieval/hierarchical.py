@@ -8,12 +8,81 @@ from time import perf_counter
 from typing import Any
 
 from app.embeddings.base import EmbeddingProvider
+from app.indexing.paper import paper_retrieval_text
 from app.reranking.base import RerankerProvider
 from app.retrieval.dense import search_dense_evidence
 from app.retrieval.hybrid import reciprocal_rank_fusion
 from app.retrieval.paper import search_papers_hybrid
 from app.retrieval.reranked import reranker_document_text
 from app.retrieval.search import search_evidence
+from app.indexing.tokenization import tokenize
+
+
+PAPER_DENSE_MIN_RELEVANCE = 0.50
+_GENERIC_RETRIEVAL_TERMS = frozenset(
+    {
+        "a", "an", "and", "are", "for", "from", "how", "in", "is", "of",
+        "on", "or", "the", "to", "what", "which", "with", "using", "based",
+        "method", "methods", "approach", "approaches", "experiment", "experiments",
+        "experimental", "result", "results", "paper", "papers", "study", "research",
+        "error", "errors", "correction", "correcting", "measurement", "measurements",
+    }
+)
+
+
+def _meaningful_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in tokenize(value)
+        if token not in _GENERIC_RETRIEVAL_TERMS
+        and (len(token) > 1 or any("\u4e00" <= char <= "\u9fff" for char in token))
+    }
+
+
+def _paper_relevance_gate(
+    query: str,
+    paper_stage: dict[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    """Reject obvious dense-only false positives before Chunk retrieval.
+
+    Dense nearest-neighbour search is intentionally broad and returns a point
+    even for an unrelated query.  We only gate the conservative case where
+    BM25 has no meaningful (non-generic) metadata overlap and the best Paper
+    dense score is below the calibrated threshold.  A meaningful lexical hit
+    or a stronger dense match is still allowed through.
+    """
+
+    branch = paper_stage.get("branch_results")
+    branch = branch if isinstance(branch, dict) else {}
+    bm25 = branch.get("bm25") if isinstance(branch.get("bm25"), list) else []
+    dense = branch.get("dense") if isinstance(branch.get("dense"), list) else []
+    best_dense = max(
+        (float(value.get("score")) for value in dense if isinstance(value, dict) and isinstance(value.get("score"), (int, float))),
+        default=0.0,
+    )
+    query_terms = _meaningful_tokens(query)
+    metadata_terms: set[str] = set()
+    for value in dense:
+        if not isinstance(value, dict):
+            continue
+        metadata_terms.update(_meaningful_tokens(paper_retrieval_text(value)))
+    overlap = sorted(query_terms & metadata_terms)
+    diagnostics = {
+        "applied": not bool(overlap),
+        "bm25_count": len(bm25),
+        "dense_count": len(dense),
+        "best_dense_score": round(best_dense, 6),
+        "minimum_dense_score": PAPER_DENSE_MIN_RELEVANCE,
+        "meaningful_query_terms": sorted(query_terms),
+        "metadata_overlap": overlap,
+    }
+    if not overlap and dense and best_dense < PAPER_DENSE_MIN_RELEVANCE:
+        diagnostics["rejected"] = True
+        diagnostics["reason"] = "no_lexical_overlap_and_dense_below_threshold"
+        return False, diagnostics
+    diagnostics["rejected"] = False
+    diagnostics["reason"] = "lexical_hit_or_dense_above_threshold"
+    return True, diagnostics
 
 
 def _positive(value: int, name: str, maximum: int = 100) -> int:
@@ -102,6 +171,25 @@ def search_hierarchical_evidence(
         filters=paper_filters,
     )
     candidate_papers = [value for value in paper_stage.get("results", []) if isinstance(value, dict)]
+    paper_relevant, gate_diagnostics = _paper_relevance_gate(cleaned, paper_stage)
+    paper_stage["relevance_gate"] = gate_diagnostics
+    if not paper_relevant:
+        return {
+            "query": cleaned,
+            "retriever": "hierarchical_no_hit",
+            "result_count": 0,
+            "candidate_papers": [],
+            "candidate_paper_ids": [],
+            "paper_retrieval": paper_stage,
+            "chunk_retrieval": {
+                "bm25_count": 0,
+                "dense_count": 0,
+                "rrf_count": 0,
+                "allowed_paper_ids": [],
+            },
+            "no_hit_reason": gate_diagnostics["reason"],
+            "coverage": {"paper_count": 0, "evidence_count": 0},
+        }
     candidate_paper_ids = [
         str(value.get("paper_id"))
         for value in candidate_papers
@@ -115,6 +203,14 @@ def search_hierarchical_evidence(
             "candidate_papers": [],
             "candidate_paper_ids": [],
             "results": [],
+            "paper_retrieval": paper_stage,
+            "chunk_retrieval": {
+                "bm25_count": 0,
+                "dense_count": 0,
+                "rrf_count": 0,
+                "allowed_paper_ids": [],
+            },
+            "no_hit_reason": "paper_filter_no_match_or_empty_paper_index",
             "coverage": {"paper_count": 0, "evidence_count": 0},
         }
 

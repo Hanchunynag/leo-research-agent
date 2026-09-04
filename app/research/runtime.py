@@ -846,13 +846,23 @@ def unified_tool_handlers(
             "workspace_id": workspace_id,
             "scope_version": scope_version,
         }
+        paper_filters = dict(arguments.get("paper_filters") or {})
+        target_documents = [
+            str(value).strip()
+            for value in arguments.get("target_document_ids") or []
+            if str(value).strip()
+        ]
+        if target_documents:
+            paper_filters["document_ids"] = sorted(
+                {*(str(value) for value in paper_filters.get("document_ids") or []), *target_documents}
+            )
         # The production UnifiedKnowledgeService exposes official_runtime;
         # lightweight legacy test doubles keep the original call contract.
         # Paper filters still activate the explicit hierarchical path.
-        if hasattr(knowledge, "official_runtime") or arguments.get("paper_filters"):
+        if hasattr(knowledge, "official_runtime") or paper_filters:
             retrieval_kwargs.update({
                 "mode": "hierarchical",
-                "paper_filters": dict(arguments.get("paper_filters") or {}),
+                "paper_filters": paper_filters,
             })
         value = knowledge.retrieve(str(arguments["query"]), **retrieval_kwargs)
         results = value.get("results") if isinstance(value, Mapping) else None
@@ -878,7 +888,7 @@ def unified_tool_handlers(
         output: dict[str, Any] = {"results": selected, "diagnostics": diagnostics}
         # Preserve the paper-level boundary and retrieval audit trail for the
         # LangGraph state/query_history without exposing backend objects.
-        for key in ("candidate_papers", "candidate_paper_ids", "paper_retrieval", "chunk_retrieval", "retriever"):
+        for key in ("candidate_papers", "candidate_paper_ids", "paper_retrieval", "chunk_retrieval", "retriever", "no_hit_reason"):
             if key in value:
                 output[key] = value[key]
         return output

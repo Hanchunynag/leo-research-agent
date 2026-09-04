@@ -56,7 +56,15 @@ class BGEM3EmbeddingProvider:
     def _load_model(self) -> Any:
         if self._model is None:
             from sentence_transformers import SentenceTransformer
+            from app.model_cache import resolve_local_model_path
 
+            model_name = self.config.model_name
+            if self.config.local_files_only:
+                model_name = resolve_local_model_path(
+                    model_name,
+                    self.config.cache_folder,
+                    required_files=("config.json", "modules.json"),
+                )
             kwargs: dict[str, Any] = {
                 "device": self.config.device,
                 "local_files_only": self.config.local_files_only,
@@ -65,7 +73,7 @@ class BGEM3EmbeddingProvider:
                 kwargs["cache_folder"] = str(self.config.cache_folder)
             if self.config.revision:
                 kwargs["revision"] = self.config.revision
-            self._model = SentenceTransformer(self.config.model_name, **kwargs)
+            self._model = SentenceTransformer(model_name, **kwargs)
         return self._model
 
     def _encode(self, texts: list[str]) -> list[list[float]]:

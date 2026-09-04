@@ -11,7 +11,13 @@ from typing import Any, Sequence, cast
 from qdrant_client import QdrantClient, models
 
 from app.embeddings.base import EmbeddingProvider
-from app.indexing.paper import paper_bm25_index_path, paper_retrieval_text, load_paper_records, papers_digest
+from app.indexing.paper import (
+    PAPER_BM25_SCHEMA_VERSION,
+    paper_bm25_index_path,
+    paper_retrieval_text,
+    load_paper_records,
+    papers_digest,
+)
 from app.indexing.paper_dense import (
     PAPER_VECTOR_NAME,
     load_paper_dense_manifest,
@@ -31,9 +37,13 @@ def _paper_matches_filters(paper: dict[str, Any], filters: dict[str, Any] | None
     year = paper.get("year")
     year_from = filters.get("year_from")
     year_to = filters.get("year_to")
-    if year_from is not None and isinstance(year, int) and year < int(year_from):
+    if (year_from is not None or year_to is not None) and (
+        not isinstance(year, int) or isinstance(year, bool)
+    ):
         return False
-    if year_to is not None and isinstance(year, int) and year > int(year_to):
+    if year_from is not None and year < int(year_from):
+        return False
+    if year_to is not None and year > int(year_to):
         return False
     allowed_ids = filters.get("paper_ids")
     if allowed_ids and str(paper.get("paper_id")) not in {str(value) for value in allowed_ids}:
@@ -82,6 +92,10 @@ def search_paper_bm25(
     if not path.is_file():
         raise FileNotFoundError(path)
     index = json.loads(path.read_text(encoding="utf-8"))
+    if index.get("paper_bm25_schema_version") != PAPER_BM25_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Paper BM25 索引 schema 版本不兼容，请重新构建 hierarchical index。"
+        )
     documents = index.get("documents")
     postings = index.get("postings")
     if not isinstance(documents, list) or not isinstance(postings, dict):

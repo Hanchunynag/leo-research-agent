@@ -300,6 +300,9 @@ class DirectQAWorkflow(BaseWorkflow):
                 "primary_generation_calls": harness.usage.llm_calls,
                 "paper_candidates": list(retrieval.get("candidate_papers") or []),
                 "candidate_paper_ids": list(retrieval.get("candidate_paper_ids") or []),
+                "no_hit_reason": retrieval.get("no_hit_reason"),
+                "paper_retrieval": retrieval.get("paper_retrieval"),
+                "chunk_retrieval": retrieval.get("chunk_retrieval"),
                 "retrieved_chunk_ids": [
                     value.get("chunk_id") for value in evidence if value.get("chunk_id")
                 ],
@@ -393,6 +396,9 @@ class RelationReasoningWorkflow(BaseWorkflow):
                 "gap_retrieval_failed": gap_failed,
                 "paper_candidates": list(retrieval.get("candidate_papers") or []),
                 "candidate_paper_ids": list(retrieval.get("candidate_paper_ids") or []),
+                "no_hit_reason": retrieval.get("no_hit_reason"),
+                "paper_retrieval": retrieval.get("paper_retrieval"),
+                "chunk_retrieval": retrieval.get("chunk_retrieval"),
                 "retrieved_chunk_ids": [
                     value.get("chunk_id") for value in evidence if value.get("chunk_id")
                 ],
@@ -524,6 +530,9 @@ class DeepResearchWorkflow(BaseWorkflow):
                 "fulltext_jobs": list(provisional.get("fulltext_jobs") or []),
                 "paper_candidates": list(retrieval.get("candidate_papers") or []),
                 "candidate_paper_ids": list(retrieval.get("candidate_paper_ids") or []),
+                "no_hit_reason": retrieval.get("no_hit_reason"),
+                "paper_retrieval": retrieval.get("paper_retrieval"),
+                "chunk_retrieval": retrieval.get("chunk_retrieval"),
                 "retrieved_chunk_ids": [
                     value.get("chunk_id") for value in evidence if value.get("chunk_id")
                 ],

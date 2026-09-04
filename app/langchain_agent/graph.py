@@ -97,6 +97,13 @@ class LLMActionDecider:
             fallback = {"type": "final"}
         else:
             fallback = {"type": "tool", "tool_name": "knowledge.retrieve", "arguments": {}}
+        # A knowledge observation already contains the Harness-generated,
+        # validated answer (including safe-termination/refusal results).  Do
+        # not ask the controller to reinterpret it as another tool call.
+        if state.get("observation") is not None and not (
+            state.get("pending_question") and not state.get("clarification_response")
+        ):
+            return {"type": "final"}
         try:
             response = self.provider.chat_completion(
                 [
@@ -420,6 +427,10 @@ class LangGraphResearchRuntime:
             action = {"type": "final"}
         elif state.get("pending_question") and not state.get("clarification_response"):
             action = {"type": "clarify", "question": state["pending_question"]}
+        elif state.get("observation") is not None and str(state.get("last_tool") or "") == "knowledge.retrieve":
+            # knowledge.retrieve owns the complete Research Harness execution;
+            # its observation is terminal even when the Harness safely refused.
+            action = {"type": "final"}
         elif structured_task and state.get("observation") is None:
             # These plans have already deterministically selected their paper
             # scope and metadata.  Go straight to the canonical RAG tool,

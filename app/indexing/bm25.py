@@ -12,18 +12,24 @@ from app.indexing.tokenization import tokenize
 from app.storage import write_json_atomic
 
 
-BM25_SCHEMA_VERSION = "2.0"
+BM25_SCHEMA_VERSION = "2.1"
 
 
 def chunks_digest(chunks: list[dict[str, Any]]) -> str:
+    def normalized_overlap(value: Any) -> Any:
+        return value if isinstance(value, dict) and value else None
+
     payload = [
         {
             "chunk_id": chunk.get("chunk_id"),
+            "paper_id": chunk.get("paper_id"),
+            "work_id": chunk.get("work_id"),
+            "document_id": chunk.get("document_id"),
             "title": chunk.get("title"),
             "section_path": chunk.get("section_path"),
             "content": chunk.get("content"),
             "parent_contexts": chunk.get("parent_contexts"),
-            "overlap_context": chunk.get("overlap_context"),
+            "overlap_context": normalized_overlap(chunk.get("overlap_context")),
         }
         for chunk in chunks
     ]
@@ -80,6 +86,7 @@ def build_bm25_index(chunks: list[dict[str, Any]]) -> dict[str, Any]:
         documents.append(
             {
                 "chunk_id": chunk.get("chunk_id"),
+                "paper_id": chunk.get("paper_id"),
                 "work_id": chunk.get("work_id"),
                 "document_id": chunk.get("document_id"),
                 "content_zone": chunk.get("content_zone"),

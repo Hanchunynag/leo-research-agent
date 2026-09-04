@@ -18,7 +18,7 @@ from app.indexing.tokenization import tokenize
 from app.storage import write_json_atomic, write_jsonl_atomic
 
 
-PAPER_BM25_SCHEMA_VERSION = "1.0"
+PAPER_BM25_SCHEMA_VERSION = "1.1"
 
 
 @dataclass(frozen=True)
@@ -212,11 +212,37 @@ def paper_retrieval_text(paper: dict[str, Any]) -> str:
     )
 
 
+_PAPER_DIGEST_FIELDS = (
+    "paper_id",
+    "title",
+    "abstract",
+    "authors",
+    "year",
+    "keywords",
+    "doi",
+    "work_id",
+    "document_id",
+)
+
+
+def _paper_digest_projection(paper: dict[str, Any]) -> dict[str, Any]:
+    """Return the storage-independent Paper identity used by every index.
+
+    MySQL exposes operational columns (timestamps, metadata JSON, index epoch,
+    paths, etc.) that are intentionally not part of the retrieval document.  A
+    digest over the complete row therefore made a valid BM25 index look stale
+    after syncing the same paper into MySQL.  Keep this projection explicit so
+    JSON fallback and MySQL produce the same fingerprint.
+    """
+
+    return {key: paper.get(key) for key in _PAPER_DIGEST_FIELDS}
+
+
 def papers_digest(papers: list[dict[str, Any]]) -> str:
-    payload = [
-        {key: value for key, value in paper.items() if key not in {"status"}}
-        for paper in papers
-    ]
+    payload = sorted(
+        (_paper_digest_projection(paper) for paper in papers if isinstance(paper, dict)),
+        key=lambda value: str(value.get("paper_id") or ""),
+    )
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
