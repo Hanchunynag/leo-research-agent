@@ -900,6 +900,45 @@ nDCG@10、按问题类型聚合的指标以及每道题的排名。当前 21 道
 达到该上限。CPU 下 20 对精排平均 14.01 秒、P95 17.18 秒，吞吐 1.428 pair/s。
 质量提升成立，但当前配置不适合交互式在线查询。
 
+### Hierarchical RAG、Agent 与生成评测
+
+当前评测按三层拆开，避免用一个 LLM 分数掩盖检索或编排问题：
+
+1. Retrieval：Paper-level Recall/Precision/MRR/nDCG、Chunk Evidence Recall、
+   Paper survival/cascade recall、Scope leakage、RRF 与 Cross-Encoder 延迟。
+2. Generation：离线确定性检查 citation scope precision、citation precision/recall、
+   context recall proxy、引用页码完整性和 answerable accuracy。
+3. Agent：Planner task accuracy、Paper/Evidence recall、固定工具合法性与覆盖率、
+   trajectory/budget compliance、生成失败时 Evidence 保留和引用完整性。
+
+运行分层检索评测：
+
+```bash
+uv run python main.py evaluate hierarchical --disable-reranker
+uv run python main.py evaluate hierarchical --local-files-only
+```
+
+评测 Agent 时，把每次 `answer` 的完整 JSON 按 JSONL 保存，再运行：
+
+```bash
+uv run python main.py evaluate agent \
+  --predictions data/evaluation/agent_predictions.jsonl
+```
+
+生成评测输入每行至少包含 `selected_evidence`、`claims`、`citations`；有人工金标准
+时再增加 `reference_evidence_ids` 和 `expected_answerable`：
+
+```bash
+uv run python main.py evaluate generation \
+  --predictions data/evaluation/generation_predictions.jsonl
+```
+
+生成质量使用主流 RAGAS 0.3 的五项 Judge 指标：`context_precision`、
+`context_recall`、`faithfulness`、`answer_relevancy` 和 `answer_correctness`。
+它们通过 `app.evaluation.generation.run_ragas()` 可选启用，必须提供 Judge LLM、
+Embedding 和带 reference 的评测集；默认 CI 不调用外部模型，防止网络/模型波动污染
+检索与 Agent 回归结果。Agent 轨迹评测不允许自由工具名，工具必须属于固定 Gateway。
+
 ### FastAPI + React 科研工作台
 
 可视化层不会启动 CLI 子进程，而是直接复用 `parse_paper()`、

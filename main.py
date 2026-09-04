@@ -730,6 +730,57 @@ def build_parser() -> argparse.ArgumentParser:
     retrieval_evaluate_command.add_argument("--rrf-k", type=int, default=60)
     add_embedding_options(retrieval_evaluate_command)
     add_reranker_options(retrieval_evaluate_command)
+    hierarchical_evaluate_command = evaluate_subparsers.add_parser(
+        "hierarchical",
+        help="评测 Paper→Evidence 两层检索的级联召回、Scope 与精排。",
+    )
+    hierarchical_evaluate_command.add_argument(
+        "--questions",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "evaluation" / "retrieval_questions.jsonl",
+    )
+    hierarchical_evaluate_command.add_argument(
+        "--output",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "evaluation" / "hierarchical_baseline.json",
+    )
+    hierarchical_evaluate_command.add_argument("--k-values", default="1,5,10")
+    hierarchical_evaluate_command.add_argument("--limit", type=int, default=10)
+    hierarchical_evaluate_command.add_argument("--paper-limit", type=int, default=10)
+    hierarchical_evaluate_command.add_argument("--paper-candidate-limit", type=int, default=30)
+    hierarchical_evaluate_command.add_argument("--chunk-candidate-limit", type=int, default=40)
+    hierarchical_evaluate_command.add_argument("--max-chunks-per-work", type=int, default=2)
+    hierarchical_evaluate_command.add_argument("--rrf-k", type=int, default=60)
+    hierarchical_evaluate_command.add_argument(
+        "--disable-reranker", action="store_true", help="只评测 Paper/Chunk RRF，不执行 Cross Encoder。"
+    )
+    add_embedding_options(hierarchical_evaluate_command)
+    add_reranker_options(hierarchical_evaluate_command)
+    agent_evaluate_command = evaluate_subparsers.add_parser(
+        "agent",
+        help="评测 LangGraph Planner、固定工具轨迹、预算和证据保留。",
+    )
+    agent_evaluate_command.add_argument(
+        "--questions",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "evaluation" / "agent_questions.jsonl",
+    )
+    agent_evaluate_command.add_argument("--predictions", type=Path, required=True)
+    agent_evaluate_command.add_argument(
+        "--output",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "evaluation" / "agent_report.json",
+    )
+    generation_evaluate_command = evaluate_subparsers.add_parser(
+        "generation",
+        help="评测引用边界、证据覆盖与 answerable；RAGAS Judge 通过 Python API 启用。",
+    )
+    generation_evaluate_command.add_argument("--predictions", type=Path, required=True)
+    generation_evaluate_command.add_argument(
+        "--output",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "evaluation" / "generation_report.json",
+    )
     graphrag_evaluate_command = evaluate_subparsers.add_parser(
         "graphrag", help="评测 GraphRAG 实体、关系、路径、拒答、社区、Drift 与跨查询召回。"
     )
@@ -1541,6 +1592,35 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.evaluate_command == "graphrag":
             from app.evaluation.graphrag import evaluate_files
             print_json(evaluate_files(args.questions, args.predictions, args.output))
+            return
+        if args.evaluate_command == "agent":
+            from app.evaluation.agent import evaluate_agent_files
+            print_json(evaluate_agent_files(args.questions, args.predictions, args.output))
+            return
+        if args.evaluate_command == "generation":
+            from app.evaluation.generation import evaluate_generation_files
+            print_json(evaluate_generation_files(args.predictions, args.output))
+            return
+        if args.evaluate_command == "hierarchical":
+            from app.evaluation.hierarchical import evaluate_hierarchical
+            reranker = None
+            if not args.disable_reranker:
+                reranker = reranker_provider_from_args(args)
+            report = evaluate_hierarchical(
+                project_root=PROJECT_ROOT,
+                questions_path=args.questions,
+                embedding_provider=dense_provider_from_args(args),
+                reranker_provider=reranker,
+                output_path=args.output,
+                k_values=parse_k_values(args.k_values),
+                limit=args.limit,
+                paper_limit=args.paper_limit,
+                paper_candidate_limit=args.paper_candidate_limit,
+                chunk_candidate_limit=args.chunk_candidate_limit,
+                max_chunks_per_work=args.max_chunks_per_work,
+                rrf_k=args.rrf_k,
+            )
+            print_json(report)
             return
         from app.evaluation.retrieval import (
             evaluate_bm25,
