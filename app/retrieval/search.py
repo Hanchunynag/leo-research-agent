@@ -34,7 +34,27 @@ def load_chunks(project_root: Path) -> list[dict[str, Any]]:
         repository = build_knowledge_repository(root)
         if repository is not None:
             try:
-                return repository.list_chunks()
+                chunks = repository.list_chunks()
+                # MySQL keeps paper metadata in `papers` and intentionally
+                # stores only the paper_id on each chunk.  The JSON projection
+                # contains the denormalized citation fields, so restore the
+                # same read contract when MySQL is the active source.  This
+                # keeps BM25 results citation-complete and consistent with
+                # Qdrant payloads without changing the normalized schema.
+                papers = {
+                    str(value.get("paper_id")): value
+                    for value in repository.list_papers()
+                    if isinstance(value, dict) and value.get("paper_id")
+                }
+                citation_fields = ("title", "authors", "year", "doi", "keywords")
+                for chunk in chunks:
+                    paper = papers.get(str(chunk.get("paper_id") or ""))
+                    if not paper:
+                        continue
+                    for field in citation_fields:
+                        if chunk.get(field) in (None, "", []):
+                            chunk[field] = paper.get(field)
+                return chunks
             finally:
                 repository.close()
     except Exception:

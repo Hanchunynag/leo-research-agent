@@ -88,7 +88,16 @@ def test_mysql_is_first_source_for_index_projections(tmp_path: Path, monkeypatch
     repository = _repository(tmp_path)
     repository.initialize()
     repository.upsert_paper(
-        {"paper_id": "P_DB", "document_id": "D_DB", "title": "Database paper", "abstract": "A", "authors": [], "keywords": []}
+        {
+            "paper_id": "P_DB",
+            "document_id": "D_DB",
+            "title": "Database paper",
+            "abstract": "A",
+            "authors": ["Researcher"],
+            "year": 2024,
+            "doi": "10.1234/db",
+            "keywords": ["LEO"],
+        }
     )
     repository.upsert_chunks(
         [{"chunk_id": "C_DB", "paper_id": "P_DB", "document_id": "D_DB", "content": "db fact", "section_path": []}]
@@ -96,7 +105,13 @@ def test_mysql_is_first_source_for_index_projections(tmp_path: Path, monkeypatch
     monkeypatch.setenv("LEO_MYSQL_ENABLED", "true")
     monkeypatch.setenv("LEO_MYSQL_URL", f"sqlite:///{tmp_path / 'structured.sqlite3'}")
     assert load_paper_records(tmp_path)[0]["paper_id"] == "P_DB"
-    assert load_chunks(tmp_path)[0]["chunk_id"] == "C_DB"
+    loaded_chunk = load_chunks(tmp_path)[0]
+    assert loaded_chunk["chunk_id"] == "C_DB"
+    assert loaded_chunk["title"] == "Database paper"
+    assert loaded_chunk["authors"] == ["Researcher"]
+    assert loaded_chunk["year"] == 2024
+    assert loaded_chunk["doi"] == "10.1234/db"
+    assert loaded_chunk["keywords"] == ["LEO"]
 
 
 def test_llm_controller_cannot_expand_fixed_tool_gateway() -> None:
