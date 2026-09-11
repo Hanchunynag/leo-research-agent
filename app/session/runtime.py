@@ -51,6 +51,7 @@ class SessionRuntime:
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    project_id TEXT,
                     schema_version INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS messages (
@@ -71,6 +72,8 @@ class SessionRuntime:
                     completed_at TEXT,
                     worker_id TEXT,
                     trace_id TEXT,
+                    job_id TEXT,
+                    project_id TEXT,
                     checkpoint_ref TEXT,
                     failure_message TEXT
                 );
@@ -91,15 +94,29 @@ class SessionRuntime:
                 );
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(session_info)")
+            }
+            if "project_id" not in columns:
+                connection.execute("ALTER TABLE session_info ADD COLUMN project_id TEXT")
+            run_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(agent_runs)")
+            }
+            for column in ("job_id", "project_id"):
+                if column not in run_columns:
+                    connection.execute(f"ALTER TABLE agent_runs ADD COLUMN {column} TEXT")
             connection.execute(
                 """
                 INSERT INTO session_info
-                    (session_id, title, status, created_at, updated_at, schema_version)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (session_id, title, status, created_at, updated_at, project_id, schema_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     title=excluded.title,
                     status=excluded.status,
                     updated_at=excluded.updated_at,
+                    project_id=excluded.project_id,
                     schema_version=excluded.schema_version
                 """,
                 (
@@ -108,11 +125,31 @@ class SessionRuntime:
                     self.session.status,
                     self.session.created_at,
                     self.session.updated_at,
+                    self.session.project_id,
                     self.session.schema_version,
                 ),
             )
 
-    def create_run(self, query: str, *, run_id: str, thread_id: str) -> RunRecord:
+    def attach_project(self, project_id: str) -> None:
+        value = project_id.strip()
+        if not value:
+            raise ValueError("project_id 不能为空。")
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE session_info SET project_id=?, updated_at=? WHERE session_id=?",
+                (value, _now(), self.session.session_id),
+            )
+
+    def create_run(
+        self,
+        query: str,
+        *,
+        run_id: str,
+        thread_id: str,
+        trace_id: str | None = None,
+        job_id: str | None = None,
+        project_id: str | None = None,
+    ) -> RunRecord:
         cleaned = query.strip()
         if not cleaned:
             raise ValueError("Run query 不能为空。")
@@ -121,10 +158,11 @@ class SessionRuntime:
             connection.execute(
                 """
                 INSERT INTO agent_runs
-                    (run_id, query, status, thread_id, created_at)
-                VALUES (?, ?, 'PENDING', ?, ?)
+                    (run_id, query, status, thread_id, created_at, trace_id,
+                     job_id, project_id)
+                VALUES (?, ?, 'PENDING', ?, ?, ?, ?, ?)
                 """,
-                (run_id, cleaned, thread_id, created),
+                (run_id, cleaned, thread_id, created, trace_id, job_id, project_id),
             )
         return self.get_run(run_id)
 
@@ -180,6 +218,27 @@ class SessionRuntime:
             item["metadata"] = json.loads(item.pop("metadata_json"))
             values.append(item)
         return values
+
+    def list_messages(self, limit: int = 1000) -> list[dict[str, Any]]:
+        return self.recent_messages(limit)
+
+    def list_results(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT run_id, status, answer, citations_json, evidence_json,
+                       metadata_json, created_at
+                FROM research_results ORDER BY created_at, result_id
+                """
+            ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            value = dict(row)
+            value["citations"] = json.loads(value.pop("citations_json"))
+            value["evidence"] = json.loads(value.pop("evidence_json"))
+            value["metadata"] = json.loads(value.pop("metadata_json"))
+            results.append(value)
+        return results
 
     def complete_run(
         self,

@@ -184,6 +184,10 @@ def create_app(
         return job_manager.submit(
             "answer",
             lambda emit: web_runtime.answer(request, emit),
+            payload={
+                "session_id": request.session_id,
+                "project_id": request.project_id,
+            },
         )
 
     @app.post("/api/answers/resume", response_model=JobCreated, status_code=202)

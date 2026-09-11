@@ -13,10 +13,17 @@ class ConversationContextBuilder:
     def __init__(self, recent_limit: int = 8) -> None:
         self.recent_limit = recent_limit
 
-    def build(self, runtime: SessionRuntime, query: str) -> dict[str, Any]:
+    def build(
+        self,
+        runtime: SessionRuntime,
+        query: str,
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
         return {
             "current_query": query,
             "recent_messages": runtime.recent_messages(self.recent_limit),
             "research_state": None,
+            "project_id": project_id,
             "shared_knowledge": "resolved by Research Engine",
         }

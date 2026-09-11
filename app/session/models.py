@@ -27,6 +27,7 @@ class SessionRecord:
     updated_at: str
     relative_path: str
     active_run_id: str | None = None
+    project_id: str | None = None
     schema_version: int = 1
 
 
@@ -42,5 +43,7 @@ class RunRecord:
     completed_at: str | None = None
     worker_id: str | None = None
     trace_id: str | None = None
+    job_id: str | None = None
+    project_id: str | None = None
     checkpoint_ref: str | None = None
     failure_message: str | None = None

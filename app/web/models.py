@@ -16,6 +16,7 @@ class AnswerRequest(WebModel):
 
     query: str = Field(min_length=1, max_length=8_000)
     session_id: str | None = Field(default=None, max_length=128)
+    project_id: str | None = Field(default=None, max_length=128)
     force_new_topic: bool = False
     include_context: bool = True
 

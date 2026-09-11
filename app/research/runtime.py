@@ -74,6 +74,12 @@ class WorkflowRequest:
         }
     )
     project_root: Path | None = None
+    # Application correlation only; Research decisions must not depend on it.
+    run_id: str | None = None
+    trace_id: str | None = None
+    thread_id: str | None = None
+    job_id: str | None = None
+    project_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.query.strip() or not self.workspace_id.strip() or self.scope_version < 1:
@@ -305,6 +311,18 @@ class ResearchRuntime:
         selected_evidence: list[Mapping[str, Any]] = (
             list(execution.evidence) if execution else []
         )
+        correlation = {
+            key: value
+            for key, value in {
+                "run_id": request.run_id,
+                "trace_id": request.trace_id,
+                "thread_id": request.thread_id,
+                "job_id": request.job_id,
+                "project_id": request.project_id,
+                "session_id": request.session_id,
+            }.items()
+            if value is not None
+        }
         result: dict[str, Any] = {
             "query": request.query,
             "workflow": workflow_name.value,
@@ -332,7 +350,10 @@ class ResearchRuntime:
                 if validation is not None
                 else 0,
             },
-            "diagnostics": harness.diagnostics(),
+            "diagnostics": {
+                **harness.diagnostics(),
+                "correlation": correlation,
+            },
             "workflow_details": dict(execution.details) if execution else {},
         }
         if self.trace_store is not None:
@@ -344,6 +365,7 @@ class ResearchRuntime:
                         "selected_evidence_ids": [
                             value.get("evidence_id") for value in selected_evidence
                         ],
+                        "correlation": correlation,
                     },
                 )
             )
@@ -525,6 +547,7 @@ class HarnessAgentService:
             query,
             session_id=session_id,
             force_new_topic=force_new_topic,
+            recent_conversation=_.get("recent_conversation"),
         )
         selected = WorkflowName(workflow) if workflow else None
         raw = self.runtime.run(
@@ -562,6 +585,11 @@ class HarnessAgentService:
                     for value in agent_instructions
                     if isinstance(value, str) and value.strip()
                 ),
+                run_id=str(_.get("run_id")) if _.get("run_id") else None,
+                trace_id=str(_.get("trace_id")) if _.get("trace_id") else None,
+                thread_id=self._thread_id_from_options(_),
+                job_id=str(_.get("job_id")) if _.get("job_id") else None,
+                project_id=str(_.get("project_id")) if _.get("project_id") else None,
             )
         )
         result = self._present(
@@ -580,9 +608,15 @@ class HarnessAgentService:
         *,
         session_id: str | None,
         force_new_topic: bool,
+        recent_conversation: Any = None,
     ) -> tuple[str | None, str | None, bool, tuple[Mapping[str, str], ...]]:
         if self.session_store is None:
-            return session_id, None, False, ()
+            recent = (
+                tuple(value for value in recent_conversation if isinstance(value, Mapping))
+                if isinstance(recent_conversation, (list, tuple))
+                else ()
+            )
+            return session_id, None, False, recent
         session, created = self.session_store.get_or_create_session(
             session_id,
             query,
@@ -617,6 +651,17 @@ class HarnessAgentService:
                 if answer:
                     recent.append({"role": "assistant", "content": str(answer)})
         return sid, topic_id, created, tuple(recent[-4:])
+
+    @staticmethod
+    def _thread_id_from_options(options: Mapping[str, Any]) -> str | None:
+        config = options.get("langchain_config")
+        if not isinstance(config, Mapping):
+            return None
+        configurable = config.get("configurable")
+        if not isinstance(configurable, Mapping):
+            return None
+        value = configurable.get("thread_id")
+        return str(value) if value else None
 
     @staticmethod
     def _present(

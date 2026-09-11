@@ -75,12 +75,24 @@ class SessionManager:
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(sessions)")
+            }
+            if "project_id" not in columns:
+                connection.execute("ALTER TABLE sessions ADD COLUMN project_id TEXT")
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS ix_catalog_status_updated "
                 "ON sessions(status, updated_at)"
             )
 
-    def create(self, title: str, *, session_id: str | None = None) -> SessionRecord:
+    def create(
+        self,
+        title: str,
+        *,
+        session_id: str | None = None,
+        project_id: str | None = None,
+    ) -> SessionRecord:
         requested = _validate(session_id) if session_id else None
         value = requested or f"session_{secrets.token_hex(6)}"
         timestamp = _now()
@@ -94,6 +106,8 @@ class SessionManager:
             created_at=timestamp,
             updated_at=timestamp,
             relative_path=relative_path,
+            project_id=project_id.strip() if project_id and project_id.strip() else None,
+            schema_version=2,
         )
         try:
             with self._connect_catalog() as connection:
@@ -101,8 +115,8 @@ class SessionManager:
                     """
                     INSERT INTO sessions
                         (session_id, title, status, created_at, updated_at,
-                         relative_path, active_run_id, schema_version)
-                    VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+                         relative_path, active_run_id, project_id, schema_version)
+                    VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
                     """,
                     (
                         record.session_id,
@@ -111,6 +125,7 @@ class SessionManager:
                         record.created_at,
                         record.updated_at,
                         record.relative_path,
+                        record.project_id,
                         record.schema_version,
                     ),
                 )
@@ -136,17 +151,24 @@ class SessionManager:
             updated_at=str(row["updated_at"]),
             relative_path=str(row["relative_path"]),
             active_run_id=row["active_run_id"],
+            project_id=row["project_id"] if "project_id" in row.keys() else None,
             schema_version=int(row["schema_version"]),
         )
 
-    def resolve(self, session_id: str | None, *, title: str) -> SessionRecord:
+    def resolve(
+        self,
+        session_id: str | None,
+        *,
+        title: str,
+        project_id: str | None = None,
+    ) -> SessionRecord:
         if session_id is None:
-            return self.create(title)
+            return self.create(title, project_id=project_id)
         try:
             record = self.get(session_id)
         except KeyError:
             try:
-                return self.create(title, session_id=session_id)
+                return self.create(title, session_id=session_id, project_id=project_id)
             except FileExistsError:
                 # Another worker may have created the requested Session between
                 # the read and the create. Re-read instead of creating a second
@@ -154,6 +176,19 @@ class SessionManager:
                 return self.get(session_id)
         if record.status == "DELETED":
             raise ValueError(f"Session 已删除：{record.session_id}")
+        if project_id and record.project_id and record.project_id != project_id:
+            raise ValueError(
+                f"Session 属于其他 Project：{record.session_id} / {record.project_id}"
+            )
+        if project_id and record.project_id is None:
+            runtime = self.open(record.session_id)
+            runtime.attach_project(project_id)
+            with self._connect_catalog() as connection:
+                connection.execute(
+                    "UPDATE sessions SET project_id=?, updated_at=? WHERE session_id=?",
+                    (project_id, _now(), record.session_id),
+                )
+            record = self.get(record.session_id)
         return record
 
     def open(self, session_id: str) -> SessionRuntime:
@@ -173,6 +208,16 @@ class SessionManager:
             rows = connection.execute(query, params).fetchall()
         return [self._record(row) for row in rows]
 
+    def set_active_run(self, session_id: str, run_id: str | None) -> None:
+        value = _validate(session_id)
+        with self._connect_catalog() as connection:
+            updated = connection.execute(
+                "UPDATE sessions SET active_run_id=?, updated_at=? WHERE session_id=?",
+                (run_id, _now(), value),
+            ).rowcount
+        if updated != 1:
+            raise KeyError(f"Session 不存在：{value}")
+
     @staticmethod
     def _record(row: sqlite3.Row) -> SessionRecord:
         return SessionRecord(
@@ -183,6 +228,7 @@ class SessionManager:
             updated_at=str(row["updated_at"]),
             relative_path=str(row["relative_path"]),
             active_run_id=row["active_run_id"],
+            project_id=row["project_id"] if "project_id" in row.keys() else None,
             schema_version=int(row["schema_version"]),
         )
 
@@ -217,7 +263,8 @@ class SessionManager:
                 updated_at=_now(),
                 relative_path=current.relative_path,
                 active_run_id=current.active_run_id,
-                schema_version=current.schema_version,
+                project_id=current.project_id,
+                schema_version=max(2, current.schema_version),
             ),
         )
         with runtime._connect() as connection:

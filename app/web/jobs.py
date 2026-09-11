@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import secrets
 import tempfile
+from contextvars import ContextVar
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -19,6 +20,15 @@ from app.web.models import JobCreated, JobEvent, JobSnapshot
 
 JobKind = Literal["answer", "parse"]
 JobTask = Callable[[Callable[..., None]], dict[str, Any]]
+_CURRENT_JOB_ID: ContextVar[str | None] = ContextVar(
+    "scholar_current_job_id", default=None
+)
+
+
+def current_job_id() -> str | None:
+    """返回当前 Web Worker 的运输 ID，不把它冒充 Agent Run ID。"""
+
+    return _CURRENT_JOB_ID.get()
 
 
 class JobManager:
@@ -144,6 +154,7 @@ class JobManager:
             )
             self._emit(job_id, stage, message, progress, details)
 
+        token = _CURRENT_JOB_ID.set(job_id)
         try:
             result = task(emit)
             if self.repository.cancellation_requested(job_id):
@@ -185,6 +196,8 @@ class JobManager:
                 },
             )
             return
+        finally:
+            _CURRENT_JOB_ID.reset(token)
         self.repository.set_status(
             job_id, "SUCCEEDED", result_reference=reference
         )

@@ -566,6 +566,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Agentic Session ID；省略时自动创建并在输出中返回。",
     )
     answer_command.add_argument(
+        "--project-id",
+        help="可选 Scholar Project 标识；与 Session 生命周期分离。",
+    )
+    answer_command.add_argument(
         "--force-new-topic",
         action="store_true",
         help="在现有 Agentic Session 中强制创建独立 Topic。",
@@ -984,7 +988,6 @@ def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) ->
     """延迟组装 Research Harness；fast 模式不导入这些模块。"""
 
     from app.agentic.provider import OpenAIAgenticReasoningProvider
-    from app.agentic.store import AgenticSessionStore
     from app.langchain_agent import build_langchain_agent_service
     from app.workspaces import WorkspaceService
 
@@ -999,10 +1002,6 @@ def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) ->
         runtime,
         answer_provider,
         llm_model_name=str(getattr(answer_provider, "model_name", "configured-model")),
-    )
-    store = AgenticSessionStore(
-        PROJECT_ROOT,
-        database_path=args.session_db_path,
     )
     workspaces = WorkspaceService(PROJECT_ROOT)
     from app.academic_mcp.service import AcademicDiscoveryService
@@ -1020,7 +1019,10 @@ def agentic_service_from_args(args: argparse.Namespace, answer_provider: Any) ->
             answer_provider,
             max_structure_repairs=args.max_structure_repairs,
         ),
-        session_store=store,
+        # New CLI Research Requests are persisted by Application Facade /
+        # SessionRuntime. The legacy session database remains available to
+        # the explicit `session` compatibility commands.
+        session_store=None,
         extra_tools=bootstrap.gateway_handlers,
         semantic_validation_enabled=not args.disable_semantic_validation,
     )
@@ -1495,9 +1497,25 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             try:
                 agentic_service = agentic_service_from_args(args, answer_provider)
-                agentic_result = agentic_service.answer(
+                from app.application import ResearchApplicationFacade
+                from app.application import LegacySessionAdapter
+                from app.agentic.store import AgenticSessionStore
+                from app.session import SessionManager
+
+                facade = ResearchApplicationFacade(
+                    agentic_service,
+                    SessionManager(PROJECT_ROOT),
+                    legacy_adapter=LegacySessionAdapter(
+                        AgenticSessionStore(
+                            PROJECT_ROOT,
+                            database_path=args.session_db_path,
+                        )
+                    ),
+                )
+                agentic_result = facade.research_topic(
                     args.query,
                     session_id=args.session_id,
+                    project_id=args.project_id,
                     force_new_topic=args.force_new_topic,
                     include_context=args.include_context,
                 )

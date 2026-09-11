@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from pathlib import Path
 
@@ -16,6 +17,7 @@ class ScholarProjectStore:
         self.project_root = project_root.expanduser().resolve()
         self.directory = self.project_root / ".scholar"
         self.database_path = self.directory / "project.db"
+        self._project_id: str | None = None
         self.directory.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -46,8 +48,29 @@ class ScholarProjectStore:
                     confirmed_by_user INTEGER NOT NULL,
                     source_run_id TEXT
                 );
+                CREATE TABLE IF NOT EXISTS project_info (
+                    project_id TEXT PRIMARY KEY,
+                    root_path TEXT NOT NULL UNIQUE
+                );
                 """
             )
+            row = connection.execute(
+                "SELECT project_id FROM project_info WHERE root_path=?",
+                (str(self.project_root),),
+            ).fetchone()
+            if row is None:
+                self._project_id = f"PROJECT_{secrets.token_hex(8)}"
+                connection.execute(
+                    "INSERT INTO project_info(project_id, root_path) VALUES (?, ?)",
+                    (self._project_id, str(self.project_root)),
+                )
+            else:
+                self._project_id = str(row["project_id"])
+
+    @property
+    def project_id(self) -> str:
+        assert self._project_id is not None
+        return self._project_id
 
     def put_fact(self, fact: ManuscriptFact) -> None:
         if fact.source != "user_confirmed" or not fact.confirmed:

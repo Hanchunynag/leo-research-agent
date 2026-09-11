@@ -12,10 +12,13 @@ from typing import Any, Protocol
 from app.agentic.config import AgenticRAGConfig
 from app.agentic.prompting import compact_topic
 from app.agentic.store import AgenticSessionStore
+from app.application import LegacySessionAdapter, ResearchApplicationFacade
 from app.generation.settings import load_local_llm_settings
 from app.ingestion.ingest import calculate_sha256
 from app.knowledge.catalog import library_status, load_catalog, rebuild_catalog
 from app.parsing.pipeline import PaperParseConfig, parse_paper
+from app.session import SessionManager
+from app.web.jobs import current_job_id
 from app.web.models import AnswerRequest, ParseOptions
 
 
@@ -153,9 +156,13 @@ class LocalRAGWebRuntime:
             self.project_root,
             database_path=self.agentic_config.session_db_path,
         )
+        self.session_manager = SessionManager(self.project_root)
+        self.legacy_adapter = LegacySessionAdapter(self.store)
         self._retrieval: Any | None = None
         self._service: Any | None = None
+        self._facade: ResearchApplicationFacade | None = None
         self._operation_lock = Lock()
+        self._service_lock = Lock()
         self._bootstrap_backend: Any | None = None
         self._bootstrap_composition: Any | None = None
         self._bootstrap_stop = Event()
@@ -282,7 +289,10 @@ class LocalRAGWebRuntime:
                 answer_provider,
                 max_structure_repairs=self.agentic_config.max_structure_repairs,
             ),
-            session_store=self.store,
+            # New Research Requests persist through Session Runtime. The
+            # legacy AgenticSessionStore remains readable through the legacy
+            # session endpoints but is not written by this service.
+            session_store=None,
             extra_tools=bootstrap.gateway_handlers,
         )
 
@@ -304,35 +314,52 @@ class LocalRAGWebRuntime:
                 loop.create_task(close())
 
     def answer(self, request: AnswerRequest, emit: EmitProgress) -> dict[str, Any]:
-        """串行执行问答，避免共享 Service 的运行诊断互相污染。"""
+        """通过 Application Facade 执行；Session 锁负责同会话串行化。"""
 
-        with self._operation_lock:
+        with self._service_lock:
             if self._service is None:
                 emit("loading_models", "正在加载 Embedding 和 Reranker。", 0.08)
                 self._service = self._build_service()
-            emit(
-                "langchain_rag",
-                "正在执行 LangChain 翻译、双语检索、生成和验证。",
-                0.20,
-            )
-            result = self._service.answer(
-                request.query,
-                session_id=request.session_id,
-                force_new_topic=request.force_new_topic,
-                include_context=request.include_context,
-                progress_callback=emit,
-            )
-            harness = result.get("diagnostics", {}).get("harness", {})
-            emit(
-                "validated",
-                "回答已完成证据和 Claim-Citation 验证。",
-                0.92,
-                {
-                    "answerable": bool(result.get("answerable")),
-                    "termination_reason": harness.get("termination_reason"),
-                },
-            )
-            return result
+                self._facade = ResearchApplicationFacade(
+                    self._service,
+                    self.session_manager,
+                    legacy_adapter=self.legacy_adapter,
+                )
+            facade = self._facade
+        assert facade is not None
+        emit(
+            "langchain_rag",
+            "正在执行 Application Facade、LangChain 翻译、双语检索、生成和验证。",
+            0.20,
+        )
+        result = facade.research_topic(
+            request.query,
+            session_id=request.session_id,
+            project_id=request.project_id,
+            job_id=current_job_id(),
+            force_new_topic=request.force_new_topic,
+            include_context=request.include_context,
+            progress_callback=emit,
+        )
+        diagnostics = result.get("diagnostics")
+        diagnostics_mapping = diagnostics if isinstance(diagnostics, dict) else {}
+        harness = diagnostics_mapping.get("harness")
+        harness_mapping = harness if isinstance(harness, dict) else {}
+        metadata = result.get("metadata")
+        metadata_mapping = metadata if isinstance(metadata, dict) else {}
+        emit(
+            "validated",
+            "回答已完成证据和 Claim-Citation 验证。",
+            0.92,
+            {
+                "answerable": bool(result.get("answerable")),
+                "status": result.get("status"),
+                "run_id": result.get("run_id"),
+                "trace_id": metadata_mapping.get("trace_id"),
+                "termination_reason": harness_mapping.get("termination_reason"),
+            },
+        )
+        return result
 
     def resume(self, thread_id: str, user_input: str, emit: EmitProgress) -> dict[str, Any]:
         """Continue a LangGraph clarification with the original thread checkpoint."""
@@ -393,7 +420,9 @@ class LocalRAGWebRuntime:
                     catalog_builder=rebuild_catalog,
                 )
                 # Scope/索引代际可能已推进，下次问答重新组合并固定新版本。
-                self._service = None
+                with self._service_lock:
+                    self._service = None
+                    self._facade = None
                 canonical = corpus.documents.canonical(duplicate.document_id) or {}
                 pipeline = canonical.get("pipeline")
                 mineru_value = (
@@ -438,7 +467,9 @@ class LocalRAGWebRuntime:
                 catalog_builder=rebuild_catalog,
             )
             # Scope/索引代际可能已推进，下次问答重新组合并固定新版本。
-            self._service = None
+            with self._service_lock:
+                self._service = None
+                self._facade = None
             return {
                 "paper": {
                     **asdict(result),
@@ -462,21 +493,71 @@ class LocalRAGWebRuntime:
         }
 
     def list_sessions(self) -> dict[str, Any]:
-        return {"sessions": self.store.list_sessions()}
+        current = [asdict(value) for value in self.session_manager.list()]
+        current_ids = {str(value["session_id"]) for value in current}
+        legacy = [
+            {**dict(value), "source": "legacy"}
+            for value in self.store.list_sessions()
+            if str(value.get("session_id")) not in current_ids
+        ]
+        return {"sessions": [*current, *legacy]}
 
     def session_details(self, session_id: str) -> dict[str, Any]:
-        return self.store.session_details(session_id)
+        try:
+            record = self.session_manager.get(session_id)
+        except KeyError:
+            return self.store.session_details(session_id)
+        runtime = self.session_manager.open(session_id)
+        return {
+            "session": asdict(record),
+            "runs": [asdict(value) for value in runtime.list_runs()],
+            "messages": runtime.list_messages(),
+            "source": "session_runtime",
+        }
 
     def session_evidence(self, session_id: str) -> dict[str, Any]:
-        session = self.store.get_session(session_id)
+        try:
+            self.session_manager.get(session_id)
+        except KeyError:
+            session = self.store.get_session(session_id)
+            return {
+                "session_id": session_id,
+                "active_topic_id": session.get("active_topic_id"),
+                "evidence": self.store.list_evidence(session_id),
+            }
+        evidence: list[dict[str, Any]] = []
+        for result in self.session_manager.open(session_id).list_results():
+            evidence.extend(result["evidence"])
+        evidence.extend(self.legacy_adapter.evidence(session_id))
         return {
             "session_id": session_id,
-            "active_topic_id": session.get("active_topic_id"),
-            "evidence": self.store.list_evidence(session_id),
+            "active_topic_id": None,
+            "evidence": evidence,
+            "source": "session_runtime",
         }
 
     def session_transcript(self, session_id: str) -> dict[str, Any]:
         """从活动 Topic 的 append-only 事件恢复可展示的对话。"""
+
+        try:
+            self.session_manager.get(session_id)
+        except KeyError:
+            pass
+        else:
+            messages = [
+                {
+                    "role": str(value["role"]),
+                    "text": str(value["content"]),
+                    "run_id": value.get("run_id"),
+                }
+                for value in self.session_manager.open(session_id).list_messages()
+            ]
+            return {
+                "session_id": session_id,
+                "topic_id": None,
+                "messages": messages,
+                "source": "session_runtime",
+            }
 
         session = self.store.get_session(session_id)
         topic_id = session.get("active_topic_id")
@@ -522,6 +603,17 @@ class LocalRAGWebRuntime:
         }
 
     def compact_session(self, session_id: str) -> dict[str, Any]:
+        try:
+            self.session_manager.get(session_id)
+        except KeyError:
+            pass
+        else:
+            return {
+                "session_id": session_id,
+                "status": "not_required",
+                "message": "Session Runtime 当前通过 recent-message Context Builder 控制上下文。",
+                "source": "session_runtime",
+            }
         session = self.store.get_session(session_id)
         topic_id = session.get("active_topic_id")
         if not isinstance(topic_id, str) or not topic_id:

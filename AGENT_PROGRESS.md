@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Phase 1: Session/Application foundation and Scholar domain contracts.
+Phase 1B: Application boundary convergence and Checkpointer compatibility.
 
 ## Completed
 
@@ -11,20 +11,26 @@ Phase 1: Session/Application foundation and Scholar domain contracts.
 - Added the first Session Runtime foundation: catalog, Session-per-DB, Conversation messages, Run metadata, result projection, Session lock and orphan-run marker.
 - Added an Application Facade contract through `ResearchApplicationFacade.research_topic(...)` without changing the existing Research Engine.
 - Added Scholar domain contracts, read-on-request LaTeX hash synchronization, base-hash Patch Guard, Manuscript Facts and user-confirmed Contribution storage.
+- Migrated CLI Agentic answer and Web `/api/answers` through `ResearchApplicationFacade`.
+- New Web/CLI requests no longer inject `AgenticSessionStore` into the existing Agent Service; legacy session APIs remain readable.
+- Added `LegacySessionAdapter` for read-only migrate-on-open Conversation compatibility; legacy Evidence remains readable from the compatibility Store until a stable Evidence projection is defined.
+- Added explicit `run_id`, `trace_id`, `thread_id`, `job_id`, and `project_id` correlation propagation.
+- Added and verified the official `langgraph-checkpoint-sqlite==2.0.0` Factory without switching the production Graph yet.
+- Full regression after boundary and correlation changes: `298 passed, 1 skipped, 6 warnings`.
 
 ## In progress
 
-- Existing Web/CLI construction still uses the legacy `AgenticSessionStore` path; migration and wiring must be completed through an Adapter.
-- Persistent LangGraph Checkpointer compatibility has not been solved. Production still uses `InMemorySaver`.
+- Explicit legacy Session management commands still read `AgenticSessionStore`; historical data migration is not performed.
+- LangGraph production Graph has not yet been switched to the SQLite Factory; the official Factory and isolated restart Spike pass.
 - No Deep Agents dependency, Supervisor, Research Agent, Reviewer Agent or Writing Skill has been added.
 
 ## Next step
 
-- Add focused tests for Session isolation, Facade normalization, manuscript hash refresh, patch conflicts and contribution/fact authority.
-- Run the existing regression suite.
-- Perform the official LangGraph SQLite Checkpointer compatibility spike before implementing restart resume.
+- Add the Graph Runtime checkpointer lifecycle switch behind the new Factory.
+- Add the legacy read/migrate-on-open Adapter and keep one-way ownership.
+- Proceed to Research Tool Adapter and EvidencePack only after the boundary regression remains green.
 
 ## Known compatibility issues
 
-- Current `langgraph==0.3.x` / `langgraph-checkpoint==2.x` environment has no verified compatible official SQLite Checkpointer package.
-- Legacy `HarnessAgentService` still persists through `AgenticSessionStore`; do not enable the new Facade in production until the Adapter migration path is tested.
+- `langgraph-checkpoint-sqlite==2.0.0` is compatible with the current `langgraph==0.3.34` / `langgraph-checkpoint==2.1.2` dependency graph; production integration still needs a Graph Runtime lifecycle change.
+- The legacy `AgenticSessionStore` remains a read-compatible source for old session commands, not a writer for new Web/CLI requests.
