@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
+from time import sleep
 from typing import Any
 
 import pytest
@@ -109,6 +112,38 @@ def test_capability_uses_unified_service_without_exposing_its_backend(tmp_path: 
 
     assert result.sections[0].chunk_ids == ("D_001_c1",)
     assert "embedding_provider" not in result.metadata
+
+
+def test_local_retrieval_serializes_concurrent_tool_calls(tmp_path: Path) -> None:
+    service = capability(tmp_path)
+    knowledge = service.knowledge
+    active = 0
+    maximum = 0
+    state_lock = Lock()
+    retrieve = knowledge.retrieve
+
+    def tracked_retrieve(query: str, **kwargs: Any) -> dict[str, Any]:
+        nonlocal active, maximum
+        with state_lock:
+            active += 1
+            maximum = max(maximum, active)
+        try:
+            sleep(0.02)
+            return retrieve(query, **kwargs)
+        finally:
+            with state_lock:
+                active -= 1
+
+    knowledge.retrieve = tracked_retrieve  # type: ignore[method-assign]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(service.search_papers, "measurement", top_k=1)
+            for _ in range(2)
+        ]
+        for future in futures:
+            assert future.result().papers
+
+    assert maximum == 1
 
 
 def test_read_evidence_checks_locator_ownership_and_provenance(tmp_path: Path) -> None:

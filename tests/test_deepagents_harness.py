@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 from pydantic import BaseModel
@@ -53,6 +53,31 @@ def test_langchain_1x_chat_model_adapter_binds_tools_without_json_mode() -> None
     assert response.tool_calls[0]["name"] == "get_project_context"
     assert "tools" in provider.calls[0]
     assert "response_format" not in provider.calls[0]
+
+
+def test_langchain_chat_model_serializes_tool_arguments_for_openai_wire_contract() -> None:
+    provider = _Provider()
+    model = OpenAICompatibleChatModel(provider=provider, model_name="fixture")
+
+    model.invoke(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "research_evidence",
+                        "args": {"query": "LEO", "latest": True},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(content='{"evidence": []}', tool_call_id="call-1"),
+        ]
+    )
+
+    tool_call = provider.calls[0]["messages"][0]["tool_calls"][0]
+    assert tool_call["function"]["arguments"] == '{"query":"LEO","latest":true}'
 
 
 def test_langchain_1x_structured_output_stays_at_provider_adapter_boundary() -> None:

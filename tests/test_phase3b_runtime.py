@@ -125,6 +125,28 @@ def test_harness_evaluation_detects_routing_and_forbidden_tools() -> None:
     assert report.metrics["Capability Violation Count"] >= 1
 
 
+def test_harness_evaluation_rejects_failed_domain_result_with_matching_type() -> None:
+    result = SimpleNamespace(
+        status="FAILED",
+        result_type="WritingResult",
+        metadata={"selected_skill": "write-introduction"},
+    )
+    case = HarnessEvaluationCase(
+        "failed-writing",
+        "write introduction",
+        "PROJECT",
+        "write-introduction",
+        None,
+        True,
+        "WritingResult",
+    )
+
+    record = ScholarHarnessEvaluationSuite().evaluate_result(case, result)
+
+    assert record.passed is False
+    assert "INVALID_DOMAIN_RESULT" in record.failures
+
+
 def test_session_runtime_tracks_scholar_run_lifecycle(tmp_path: Path) -> None:
     from tests.test_deepagents_harness import _ScriptedModel
 

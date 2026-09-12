@@ -179,6 +179,7 @@ def search_evidence(
                 "chunk_id": chunk.get("chunk_id"),
                 "work_id": chunk.get("work_id"),
                 "document_id": chunk.get("document_id"),
+                "section_id": chunk.get("section_id"),
                 "paper_id": chunk.get("paper_id"),
                 "title": chunk.get("title"),
                 "authors": chunk.get("authors"),

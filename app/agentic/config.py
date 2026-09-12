@@ -49,7 +49,11 @@ class AgenticRAGConfig:
     # object so Web/CLI do not grow a second environment parser.
     runtime_mode: RuntimeMode = "production"
     scholar_checkpoint_path: Path | None = None
-    scholar_max_steps: int = 24
+    # A real Introduction run can contain three bounded ResearchNeeds plus
+    # the writing/review handoff.  Keep this finite, but large enough for the
+    # production Harness graph rather than failing after the first research
+    # delegation.
+    scholar_max_steps: int = 96
     scholar_supervisor_context_budget: int = 4_000
     scholar_research_context_budget: int = 4_000
     scholar_reviewer_context_budget: int = 8_000

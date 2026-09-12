@@ -111,6 +111,7 @@ def make_chunk(
         "chunk_id": chunk_id,
         "work_id": work_id,
         "document_id": document_id,
+        "section_id": f"{document_id}_s0001",
         "paper_id": document_id.replace("D_", "P_"),
         "title": title,
         "authors": [],
@@ -411,6 +412,7 @@ def test_bm25_search_filters_deduplicates_and_cites(tmp_path: Path) -> None:
     ]
     assert result["results"][0]["citation"] == "D_a pp. 2-2"
     assert result["results"][0]["block_ids"] == ["D_a_b1"]
+    assert result["results"][0]["section_id"] == "D_a_s0001"
 
     filtered = search_evidence(tmp_path, "ephemeris", document_id="D_b")
     assert [item["document_id"] for item in filtered["results"]] == ["D_b"]

@@ -130,6 +130,7 @@ def search_dense_evidence(
                 "chunk_id": payload.get("chunk_id"),
                 "work_id": payload.get("work_id"),
                 "document_id": payload.get("document_id"),
+                "section_id": payload.get("section_id"),
                 "paper_id": payload.get("paper_id"),
                 "title": payload.get("title"),
                 "authors": payload.get("authors"),

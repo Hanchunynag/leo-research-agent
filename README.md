@@ -2,6 +2,92 @@
 
 面向低轨（LEO）机会信号定位研究的本地论文解析与 RAG 知识库项目。
 
+## ScholarHarness V1
+
+ScholarHarness 是建立在本地论文证据层之上的生产级 Scholar Agent Harness。
+它解决的不只是“从长上下文生成一段文字”：普通 RAG 或直接让 LLM 改稿无法
+可靠地区分 Manuscript Facts、用户确认的 Contributions、文献证据和待确认
+结论，也无法安全处理引用、并发编辑、恢复和人工审批。
+
+最终链路如下：
+
+```text
+User
+  → ScholarHarnessService
+  → Scholar Deep Agent
+  → Skill Registry / CapabilityProfile
+  → Research Subagent (Local/Web Evidence) or Reviewer Subagent
+  → Scholar Domain Runtime
+  → EvidencePack / CitationBinding / DraftPatch
+  → Human Approval
+  → .tex + .bib + LaTeX Workshop
+```
+
+核心边界是 Manuscript-as-State、用户控制的 Contributions、只读 Manuscript
+Facts、Evidence-first Generation、Freshness Policy、Citation Identity/BibKey
+Lifecycle、Persistent Checkpoint 和 Sub-Agent Context Isolation。Deep Agent 只
+负责任务级 Harness 编排；Research、Evidence、Citation、Project State、DraftPatch
+和 Human Approval 仍由确定性的 Domain Runtime 持有。
+
+### 快速启动
+
+复制 `.env.example` 为 `.env`，填写现有 OpenAI-compatible LLM 配置，并配置：
+
+```text
+LEO_AGENTIC_RUNTIME_MODE=production
+LEO_AGENTIC_SCHOLAR_CHECKPOINT_PATH=data/runtime/scholar/checkpoint.sqlite
+```
+
+Production 必须使用 Persistent SQLite Checkpoint；`InMemorySaver` 只用于显式的
+`test` / `local-fast` 模式。启动 Web API：
+
+```bash
+./.venv/bin/uvicorn app.web.api:create_app --factory --reload
+```
+
+Scholar 请求和恢复使用同一个入口：
+
+```bash
+./.venv/bin/python main.py scholar request \
+  "Write an evidence-grounded introduction about LEO positioning" \
+  --project-id PROJECT_ID --task-type WRITE_INTRODUCTION
+./.venv/bin/python main.py scholar status \
+  --project-id PROJECT_ID --thread-id THREAD_ID
+./.venv/bin/python main.py scholar resume \
+  --project-id PROJECT_ID --thread-id THREAD_ID \
+  --instruction "continue" --resume-value '{"decisions":[{"type":"approve"}]}'
+```
+
+生成的 DraftPatch 先通过 `scholar patch show PATCH_ID` 预览，再由人工执行
+`scholar patch accept PATCH_ID ...`。Agent 永远不能直接修改 `.tex`、`.bib` 或
+执行 Approval。
+
+### 可复现 Demo 与 Evaluation
+
+`examples/scholar-demo/` 是一个小型但真实主题的 LEO LaTeX Project。使用现有
+论文 Corpus 和配置运行四类最终 E2E：
+
+```bash
+rm -rf /private/tmp/leo-scholar-demo
+cp -R examples/scholar-demo /private/tmp/leo-scholar-demo
+LEO_WEB_RERANKER_MAX_LENGTH=256 \
+LEO_WEB_RERANKER_BATCH_SIZE=8 \
+./.venv/bin/python scripts/run_scholar_final_e2e.py \
+  --project-root /private/tmp/leo-scholar-demo \
+  --env-root "$PWD" \
+  --data-root "$PWD/data" \
+  --skills-root "$PWD/skills" \
+  --accept-introduction
+```
+
+脚本使用真实 Production Factory、SQLite Checkpoint、LLM 和本地 Evidence；输出
+来自实际 Trace 的 routing、tool visibility、subagent、Domain Result、approval
+和 build-bridge Evaluation。若本机没有 `latexmk`、`pdflatex` 或 `tectonic`，
+Bridge 会报告 `UNAVAILABLE`，可由 VS Code LaTeX Workshop 执行实际编译。
+CPU 环境可用上面的 reranker 覆盖降低 Demo 延迟；这仍使用真实 BGE 模型。
+如果 Production LLM 或 Academic Provider 不可用，脚本会保留结构化失败原因并以
+非零状态退出；它不会用 fake provider、InMemorySaver 或伪造 Domain Result 让评估通过。
+
 项目当前已经完成从 PDF 到本地混合证据检索的可评测 RAG 基线链路：
 
 ```text

@@ -2,7 +2,8 @@
 
 ## Current phase
 
-Phase 3B: Production Composition, Reliability & Harness Evaluation (completed).
+Phase 4: End-to-End Validation, Release Hardening & Project Finalization
+(release hardening complete; external-provider E2E gate pending).
 
 ## Completed
 
@@ -146,7 +147,32 @@ Phase 3B: Production Composition, Reliability & Harness Evaluation (completed).
 - Added production runtime architecture documentation and preserved the existing Research,
   Evidence, Citation, Writing, DraftPatch and Human Approval contracts.
 
-## Next phase decision
+## Phase 4 finalization
 
-Phase 3C Context/Tool Optimization or Phase 4 End-to-End Evaluation & Resume/Portfolio Packaging
-should be selected from the Harness Evaluation results; no new Skill or Agent is implied.
+- Committed the confirmed Phase 1A–3B implementation as the stable release baseline
+  (`16c80b5`) and kept local `.scholar/` Project Runtime databases out of Git.
+- Added the versioned `examples/scholar-demo/` LaTeX Project and
+  `scripts/run_scholar_final_e2e.py`; both use the existing Production Factory and
+  ScholarHarnessService rather than a second Demo pipeline.
+- Verified real Production composition with the configured LLM settings, real SQLite
+  `SqliteSaver`, existing corpus/index configuration, and managed resource shutdown.
+- Ran the fixed four-skill Production E2E against the configured DeepSeek endpoint.
+  Runtime startup, SQLite composition, routing, capability visibility and failure
+  classification were exercised; the provider returned HTTP 402
+  `Insufficient Balance` before Domain Results could be produced. This is recorded
+  as an external-provider release blocker, not converted into a passing fixture.
+- Added final release architecture and README guidance for Production startup,
+  Scholar request/resume/status, DraftPatch Human Approval, and evaluation.
+- Made Patch and Writing Runtime review identifiers deterministic per request so a
+  resumed Domain execution cannot create a duplicate immutable proposal.
+
+## V1 release status
+
+The implementation scope is frozen for V1 validation. V1 is not yet released:
+the real external LLM balance must be restored and the four end-to-end Domain
+flows, human-approved Introduction Apply/build and restart/failure validation
+must be rerun successfully. New Skills, Agents, Tools, Corpus import, cloud
+deployment, advanced citation recommendation, and complex Context Compression
+remain Future Work. Known limitations remain: the LaTeX compiler is external to
+the Bridge, cross-file Apply is ordered and can report `PARTIAL_APPLY`, and real
+external Web availability depends on provider/network configuration.

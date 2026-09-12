@@ -50,6 +50,7 @@ class HarnessEvaluationRecord:
     forbidden_tool_calls: int = 0
     context_isolation_violations: int = 0
     result_type: str | None = None
+    domain_result_valid: bool = False
     context_tokens: int = 0
     resumed: bool = False
 
@@ -79,6 +80,7 @@ class HarnessEvaluationReport:
                     "forbidden_tool_calls": record.forbidden_tool_calls,
                     "context_isolation_violations": record.context_isolation_violations,
                     "result_type": record.result_type,
+                    "domain_result_valid": record.domain_result_valid,
                     "context_tokens": record.context_tokens,
                     "resumed": record.resumed,
                 }
@@ -92,6 +94,20 @@ def _trace_events(result: Any) -> tuple[Mapping[str, Any], ...]:
     trace = metadata.get("trace", {}) if isinstance(metadata, Mapping) else {}
     events = trace.get("trace", ()) if isinstance(trace, Mapping) else ()
     return tuple(value for value in events if isinstance(value, Mapping))
+
+
+def _domain_result_is_valid(result: Any, expected_type: str | None) -> bool:
+    """Validate the outer Scholar result without judging prose quality.
+
+    A failed/ interrupted result can still carry the domain value type from a
+    partially completed execution.  It must not count as a valid release
+    result merely because that type happens to match the fixture expectation.
+    """
+
+    if expected_type is None or getattr(result, "result_type", None) != expected_type:
+        return False
+    status = getattr(result, "status", None)
+    return status not in {"FAILED", "INTERRUPTED"}
 
 
 class ScholarHarnessEvaluationSuite:
@@ -146,7 +162,7 @@ class ScholarHarnessEvaluationSuite:
             failures.append("UNEXPECTED_REVIEW")
         if case.resume_expected is True and not resumed:
             failures.append("RESUME_MISSED")
-        if case.expected_result_type and getattr(result, "result_type", None) != case.expected_result_type:
+        if case.expected_result_type and not _domain_result_is_valid(result, case.expected_result_type):
             failures.append("INVALID_DOMAIN_RESULT")
         if forbidden_calls:
             failures.append("FORBIDDEN_TOOL_CALL")
@@ -166,6 +182,7 @@ class ScholarHarnessEvaluationSuite:
             forbidden_tool_calls=forbidden_calls,
             context_isolation_violations=isolation_violations,
             result_type=getattr(result, "result_type", None),
+            domain_result_valid=_domain_result_is_valid(result, case.expected_result_type),
             context_tokens=context_tokens,
             resumed=resumed,
         )
@@ -206,7 +223,7 @@ class ScholarHarnessEvaluationSuite:
                 "Unexpected Research Rate": unexpected_research / count if count else 0.0,
                 "Required Research Miss Rate": required_miss / count if count else 0.0,
                 "Domain Result Validity": sum(
-                    record.result_type == case.expected_result_type
+                    record.domain_result_valid
                     for record, case in zip(records, case_values, strict=False)
                     if case.expected_result_type is not None
                 ) / max(1, sum(case.expected_result_type is not None for case in case_values)),

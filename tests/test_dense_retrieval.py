@@ -56,6 +56,7 @@ def chunk(
         "chunk_id": chunk_id,
         "work_id": work_id,
         "document_id": document_id,
+        "section_id": f"{document_id}_s0001",
         "paper_id": document_id.replace("D_", "P_"),
         "title": "Dense Test Paper",
         "authors": ["Ada Researcher"],
@@ -197,6 +198,7 @@ def test_qdrant_manifest_reuse_search_filters_and_stale_rejection(
     result = search_dense_evidence(tmp_path, provider, "alpha", limit=2)
     assert result["results"][0]["chunk_id"] == "C_alpha"
     assert result["results"][0]["retrieval_source"] == "dense"
+    assert result["results"][0]["section_id"] == "D_alpha_s0001"
     filtered = search_dense_evidence(
         tmp_path,
         provider,

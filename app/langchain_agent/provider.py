@@ -8,6 +8,7 @@ remains responsible for transport, authentication and response parsing.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any, Sequence
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -47,7 +48,16 @@ def _message_payload(message: BaseMessage) -> dict[str, Any]:
                     "type": "function",
                     "function": {
                         "name": str(call.get("name") or ""),
-                        "arguments": call.get("args") or {},
+                        # OpenAI-compatible Chat Completions expects the
+                        # function arguments on the wire as a JSON string.
+                        # LangChain's normalized AIMessage stores ``args`` as
+                        # a dict, which DeepSeek rejects as a map in a tool
+                        # call message.
+                        "arguments": json.dumps(
+                            call.get("args") or {},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
                     },
                 }
                 for index, call in enumerate(tool_calls, 1)

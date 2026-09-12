@@ -11,6 +11,7 @@ import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import date, datetime
+from threading import RLock
 from time import perf_counter
 from typing import Any
 
@@ -90,6 +91,11 @@ class ResearchCapabilityService:
         self.scope_version = int(scope_version or getattr(knowledge, "scope_version", 1))
         self.last_diagnostics: dict[str, Any] = {}
         self.web = web
+        # Qdrant local mode is a single-process resource and the embedding
+        # provider may lazily initialize a model. LangGraph's ToolNode can
+        # invoke multiple Research tools concurrently, so serialize the
+        # existing local retrieval boundary without changing Domain contracts.
+        self._retrieval_lock = RLock()
         if web is not None and hasattr(self.evidence, "external_resolver"):
             self.evidence.external_resolver = web.resolve
 
@@ -187,27 +193,28 @@ class ResearchCapabilityService:
         limit: int,
         paper_filters: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        started = perf_counter()
-        response = self.knowledge.retrieve(
-            request.query,
-            mode="hierarchical",
-            limit=limit,
-            paper_limit=max(limit, 1),
-            paper_candidate_limit=min(max(limit * 3, limit), 100),
-            chunk_candidate_limit=min(max(limit * 4, limit), 100),
-            paper_filters=dict(paper_filters or {}),
-            workspace_id=request.workspace_id,
-            scope_version=request.scope_version,
-        )
-        if not isinstance(response, Mapping):
-            raise RuntimeError("UnifiedKnowledgeService 返回了非对象结果。")
-        self.last_diagnostics = {
-            "request_id": request.request_id,
-            "query": request.query[:160],
-            "elapsed_ms": round((perf_counter() - started) * 1000, 3),
-            "retriever": response.get("retriever"),
-        }
-        return dict(response)
+        with self._retrieval_lock:
+            started = perf_counter()
+            response = self.knowledge.retrieve(
+                request.query,
+                mode="hierarchical",
+                limit=limit,
+                paper_limit=max(limit, 1),
+                paper_candidate_limit=min(max(limit * 3, limit), 100),
+                chunk_candidate_limit=min(max(limit * 4, limit), 100),
+                paper_filters=dict(paper_filters or {}),
+                workspace_id=request.workspace_id,
+                scope_version=request.scope_version,
+            )
+            if not isinstance(response, Mapping):
+                raise RuntimeError("UnifiedKnowledgeService 返回了非对象结果。")
+            self.last_diagnostics = {
+                "request_id": request.request_id,
+                "query": request.query[:160],
+                "elapsed_ms": round((perf_counter() - started) * 1000, 3),
+                "retriever": response.get("retriever"),
+            }
+            return dict(response)
 
     def search_papers(
         self,

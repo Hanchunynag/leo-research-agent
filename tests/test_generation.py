@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import httpx
 
 import main as cli
 from app.context.assembly import assemble_context_bundle
@@ -174,6 +175,40 @@ class FakeHTTPClient:
     def post(self, url: str, *, json: dict[str, Any]) -> FakeHTTPResponse:
         self.calls.append((url, json))
         return self.response
+
+
+class RetryHTTPClient(FakeHTTPClient):
+    def __init__(self, response: FakeHTTPResponse) -> None:
+        super().__init__(response)
+        self.failures = 2
+
+    def post(self, url: str, *, json: dict[str, Any]) -> FakeHTTPResponse:
+        self.calls.append((url, json))
+        if self.failures:
+            self.failures -= 1
+            raise httpx.ConnectError("temporary transport failure", request=httpx.Request("POST", url))
+        return self.response
+
+
+def test_openai_compatible_provider_retries_transport_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = FakeHTTPResponse(
+        {
+            "choices": [{"message": {"content": '{"answerable":false,"claims":[],"refusal_reason":"retry"}'}}]
+        }
+    )
+    client = RetryHTTPClient(response)
+    monkeypatch.setattr("app.generation.openai_compatible.time.sleep", lambda _: None)
+    provider = OpenAICompatibleAnswerProvider(
+        OpenAICompatibleConfig("http://127.0.0.1:11434", "local-model"),
+        client=client,
+    )
+
+    draft = provider.generate("question", context_bundle())
+
+    assert draft.answerable is False
+    assert len(client.calls) == 3
 
 
 def test_openai_compatible_provider_parses_structured_json_without_network() -> None:

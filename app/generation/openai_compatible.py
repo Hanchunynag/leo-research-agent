@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -155,6 +156,8 @@ def _parse_answer_draft(content: str) -> AnswerDraft:
 class OpenAICompatibleAnswerProvider:
     """调用单个 OpenAI-compatible `/v1/chat/completions` 服务。"""
 
+    _MAX_TRANSPORT_ATTEMPTS = 3
+
     def __init__(
         self,
         config: OpenAICompatibleConfig,
@@ -210,11 +213,41 @@ class OpenAICompatibleAnswerProvider:
             request_payload["tools"] = tools
         if tool_choice is not None:
             request_payload["tool_choice"] = tool_choice
-        response = self._client.post(
-            self.endpoint,
-            json=request_payload,
-        )
-        response.raise_for_status()
+        response = None
+        for attempt in range(self._MAX_TRANSPORT_ATTEMPTS):
+            try:
+                response = self._client.post(
+                    self.endpoint,
+                    json=request_payload,
+                )
+                break
+            except httpx.RequestError:
+                # Retry only transport failures.  HTTP 4xx/5xx responses are
+                # handled below and must not be retried as if they were
+                # transient; in particular, invalid tool schemas and provider
+                # policy errors need to fail with their original diagnostics.
+                if attempt + 1 >= self._MAX_TRANSPORT_ATTEMPTS:
+                    raise
+                time.sleep(0.25 * (2**attempt))
+        assert response is not None
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            # OpenAI-compatible servers commonly return the actionable schema
+            # diagnostic only in the response body.  Preserve the original
+            # exception type (the existing retry/termination policy relies on
+            # it), but include a bounded, credential-free detail so a real
+            # Production E2E failure is diagnosable instead of becoming a
+            # generic ``400 Bad Request``.
+            detail = str(getattr(error.response, "text", "") or "").strip()
+            if detail:
+                detail = detail[:1_000]
+                raise httpx.HTTPStatusError(
+                    f"{error}; provider_detail={detail}",
+                    request=error.request,
+                    response=error.response,
+                ) from error
+            raise
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Chat Completions 必须返回 JSON object。")

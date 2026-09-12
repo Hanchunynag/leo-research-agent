@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import json
 import secrets
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping
 
 from deepagents import HarnessProfile, GeneralPurposeSubagentProfile, register_harness_profile, create_deep_agent
-from deepagents.backends import FilesystemBackend
+from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.subagents import SubAgent
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -156,10 +156,26 @@ class _ResearchInput(BaseModel):
     query: str = Field(min_length=1)
     purpose: str = "background"
     target_claim: str | None = None
-    freshness_mode: str = "LOCAL_ONLY"
-    requested_from: str | None = None
-    requested_to: str | None = None
-    explicit_latest: bool = False
+    freshness_mode: Literal["LOCAL_ONLY", "LOCAL_FIRST", "FRESH_REQUIRED"] = Field(
+        default="LOCAL_ONLY",
+        description=(
+            "Deterministic research mode. Use LOCAL_ONLY unless the selected Skill "
+            "explicitly permits external research; use FRESH_REQUIRED only when the "
+            "user asks for latest, recent, current, newest, or gives a date range."
+        ),
+    )
+    requested_from: date | None = Field(
+        default=None,
+        description="Optional inclusive ISO date YYYY-MM-DD. Omit when no date range is requested.",
+    )
+    requested_to: date | None = Field(
+        default=None,
+        description="Optional inclusive ISO date YYYY-MM-DD. Omit when no date range is requested.",
+    )
+    explicit_latest: bool = Field(
+        default=False,
+        description="Set true only for an explicit latest/recent/current/newest request.",
+    )
 
 
 class _ReviewInput(BaseModel):
@@ -345,6 +361,73 @@ class ScholarHarnessService:
         harness.record_context(audience, estimate)
         return estimate
 
+    @staticmethod
+    def _bounded_reviewer_evidence(value: Any) -> tuple[Mapping[str, Any], ...]:
+        """Build the smallest reviewer projection that preserves grounding.
+
+        The deterministic Reviewer consumes evidence identity/locator fields
+        and, when configured, a bounded content sample.  Passing every full
+        local chunk through the Deep Agents reviewer context made an ordinary
+        multi-need Introduction exceed the runtime budget even though the
+        Reviewer does not need the entire source text.  Keep all evidence IDs
+        so citation/claim membership remains checkable, while bounding source
+        text and metadata at this Harness boundary.
+        """
+
+        allowed = (
+            "evidence_id",
+            "candidate_id",
+            "request_id",
+            "source_type",
+            "canonical_id",
+            "source_locator",
+            "locator_type",
+            "publication_date",
+            "retrieved_at",
+            "provider",
+            "validation_status",
+            "paper_id",
+            "work_id",
+            "document_id",
+            "section_id",
+            "chunk_id",
+            "block_ids",
+            "content_hash",
+            "verification_method",
+            "evidence_grade",
+            "directness",
+        )
+        output: list[Mapping[str, Any]] = []
+        for item in value if isinstance(value, (list, tuple)) else ():
+            if not isinstance(item, Mapping) or not item.get("evidence_id"):
+                continue
+            bounded = {
+                key: item[key]
+                for key in allowed
+                if key in item and item[key] is not None
+            }
+            metadata = item.get("metadata")
+            if isinstance(metadata, Mapping):
+                bounded["metadata"] = {
+                    key: metadata[key]
+                    for key in (
+                        "title",
+                        "authors",
+                        "venue",
+                        "doi",
+                        "arxiv_id",
+                        "canonical_id",
+                        "paper_id",
+                        "section_id",
+                    )
+                    if key in metadata and metadata[key] is not None
+                }
+            text = item.get("content") or item.get("text")
+            if text:
+                bounded["content"] = str(text)[:160]
+            output.append(bounded)
+        return tuple(output)
+
     def _prepare_session_run(
         self,
         instruction: str,
@@ -464,6 +547,14 @@ class ScholarHarnessService:
             return "CAPABILITY_DENIED"
         if code in {"DOMAIN_CONFLICT", "FACT_CONFLICT", "CONTRIBUTION_CONFLICT"}:
             return "DOMAIN_CONFLICT"
+        if type(error).__name__ in {
+            "HTTPStatusError",
+            "RequestError",
+            "TimeoutException",
+            "ReadTimeout",
+            "ConnectError",
+        }:
+            return "PROVIDER_FAILED"
         if code in {"BUDGET_EXHAUSTED", "CONTEXT_BUDGET_EXCEEDED"} or "CONTEXT_BUDGET_EXCEEDED" in message or "预算耗尽" in message:
             return "BUDGET_EXHAUSTED"
         return f"HARNESS_FAILED:{type(error).__name__}"
@@ -628,8 +719,8 @@ class ScholarHarnessService:
         purpose: str,
         target_claim: str | None,
         freshness_mode: str,
-        requested_from: str | None,
-        requested_to: str | None,
+        requested_from: date | None,
+        requested_to: date | None,
         explicit_latest: bool,
         *,
         harness: ResearchRunHarness,
@@ -677,7 +768,10 @@ class ScholarHarnessService:
                 "research_evidence",
                 "failed",
                 (perf_counter() - started) * 1000,
-                {"error_type": type(error).__name__},
+                {
+                    "error_type": type(error).__name__,
+                    "error": str(error)[:500],
+                },
             )
             return {"status": "FAILED", "error_code": "RESEARCH_FAILED", "message": str(error)}
         result_holder.setdefault("research_packs", []).append(pack)
@@ -703,8 +797,12 @@ class ScholarHarnessService:
         review_context = {
             "task_type": task_type,
             "draft": draft,
-            "claim_plan": result_holder.get("claim_plan"),
-            "evidence": result_holder.get("evidence"),
+            "claim_plan": (
+                replace(result_holder["claim_plan"], research_needs=())
+                if is_dataclass(result_holder.get("claim_plan"))
+                else result_holder.get("claim_plan")
+            ),
+            "evidence": self._bounded_reviewer_evidence(result_holder.get("evidence")),
             "facts": result_holder.get("facts"),
             "confirmed_contributions": result_holder.get("contributions"),
             "review_policy": task_type,
@@ -727,9 +825,26 @@ class ScholarHarnessService:
         harness: ResearchRunHarness,
         project_id: str,
         session_id: str,
+        user_instruction: str,
         result_holder: dict[str, Any],
     ) -> Any:
-        backend = FilesystemBackend(root_dir=self.skill_adapter.source_root, virtual_mode=True)
+        # Keep the skill source readable but keep Deep Agents' automatic
+        # conversation/large-result artifacts out of the repository.  The
+        # root route is the existing skill directory; the artifact route is
+        # ephemeral StateBackend data carried by the LangGraph checkpoint.
+        # Agent write/edit/execute tools remain excluded by the Harness profile
+        # and are not made available by this backend composition.
+        backend = CompositeBackend(
+            default=StateBackend(),
+            routes={
+                "/harness/": StateBackend(),
+                "/": FilesystemBackend(
+                    root_dir=self.skill_adapter.source_root,
+                    virtual_mode=True,
+                ),
+            },
+            artifacts_root="/harness",
+        )
         def readonly_filesystem() -> FilesystemMiddleware:
             return FilesystemMiddleware(backend=backend, tools=["read_file"])
 
@@ -740,9 +855,16 @@ class ScholarHarnessService:
             return value
 
         def execute_scholar_skill(task_type: str, instruction: str) -> dict[str, Any]:
+            # The selected route and the original user request are the Harness
+            # authority.  A model-generated tool argument may summarize or
+            # rewrite the request; allowing that text into the Domain Runtime
+            # can mismatch precomputed EvidencePacks and changes the claim the
+            # user asked to evaluate.  Keep the argument in the tool schema for
+            # the framework contract, but execute the original request.
+            del instruction
             result = self._execute_skill(
                 task_type,
-                instruction,
+                user_instruction,
                 project_id=project_id,
                 session_id=session_id,
                 harness=harness,
@@ -777,7 +899,12 @@ class ScholarHarnessService:
                 name="execute_scholar_skill",
                 description="Execute the already selected Scholar Skill and return its existing Domain Result. It never approves or applies a patch.",
                 args_schema=_SkillInput,
-                return_direct=True,
+                # A production bundle injects the isolated Reviewer adapter,
+                # so writing runs must remain in the graph long enough for the
+                # Supervisor to delegate review.  Lightweight callers that do
+                # not inject a reviewer retain the historical direct-result
+                # behavior used by unit/local-fast runtimes.
+                return_direct=definition.task_type == "SUPPORT_CLAIM" or self.reviewer is None,
             ),
             _tool(
                 get_patch_status,
@@ -790,6 +917,17 @@ class ScholarHarnessService:
         subagents: list[SubAgent] = []
         if definition.capabilities.allows("LOCAL_RESEARCH"):
             research_capabilities = definition.capabilities
+
+            research_instruction = (
+                "This is a Support Claim run: call research_evidence at most once. "
+                "Do not retry it, invent query variants, or delegate research again; "
+                "an insufficient EvidencePack is a valid bounded result."
+                if definition.task_type == "SUPPORT_CLAIM"
+                else
+                "This is an Introduction run: call research_evidence at most once per "
+                "distinct ResearchNeed (at most three calls total), do not retry a need "
+                "or invent extra query variants, then return the bounded EvidencePacks."
+            )
 
             def research_evidence(
                 query: str,
@@ -824,7 +962,11 @@ class ScholarHarnessService:
                 "description": "Researches bounded Local/Web evidence through ResearchCapabilityService and returns EvidencePack only.",
                 "tools": [research_tool],
                 "middleware": [readonly_filesystem()],
-                "system_prompt": "You are the isolated Research Subagent. Use only research_evidence. Never edit files, facts, contributions, bibliography, or patches.",
+                "system_prompt": (
+                    "You are the isolated Research Subagent. Use only research_evidence. "
+                    f"{research_instruction} "
+                    "Never edit files, facts, contributions, bibliography, or patches."
+                ),
             })
 
         if definition.task_type in {"WRITE_INTRODUCTION", "WRITE_CONCLUSION", "WRITE_ABSTRACT"}:
@@ -850,12 +992,22 @@ class ScholarHarnessService:
                 "system_prompt": "You are the isolated Reviewer Subagent. Use only review_draft. Never research, edit files, mutate Facts/Contributions, or approve patches.",
             })
 
+        review_instruction = (
+            "For this writing task, after execute_scholar_skill returns, delegate the proposed draft to "
+            "the reviewer subagent with review_draft before giving the final response. "
+            if definition.task_type != "SUPPORT_CLAIM"
+            else "After execute_scholar_skill returns, report the ClaimSupportResult without review delegation. "
+        )
         system_prompt = (
             "You are Scholar Deep Agent, the user-level Harness for an existing Scholar domain runtime. "
             f"The selected task is {definition.task_type} and selected skill is {definition.name}. "
-            "Use get_project_context first. Load the selected SKILL.md progressively with read_file when needed. "
+            "Use get_project_context first. Load only the selected SKILL.md progressively with read_file when needed; "
+            "do not use the read-only skills filesystem to inspect manuscript files because the authorized Project "
+            "Context and Skill Runtime provide manuscript state. "
             "Follow the selected skill's CapabilityProfile and delegate research/review only to the named isolated subagent. "
+            "If research is available, call the research subagent exactly once; never repeat the delegation. "
             "Call execute_scholar_skill exactly once after required context is ready. Its result is authoritative. "
+            f"{review_instruction}"
             "Never call filesystem write/edit/delete/execute, never write manuscript/bibliography/facts/contributions, "
             "and never approve or apply DraftPatch. Return no invented Domain Result."
         )
@@ -995,7 +1147,41 @@ class ScholarHarnessService:
                 trace_id,
                 "FAILED",
                 error_codes=("HARNESS_EXECUTION_FAILED",),
-                metadata={"error_type": type(error).__name__, "error": str(error), "trace": self._trace_with_correlation(run_harness, session, trace_id, project_id)},
+                metadata={
+                    "routing": asdict(decision),
+                    "selected_skill": definition.name,
+                    "resumed": resume_value is not _NO_RESUME,
+                    "visible_capabilities": sorted(definition.capabilities.allowed),
+                    "permission_audit": permission,
+                    "subagent_names": [
+                        name
+                        for name in ("research", "reviewer")
+                        if (name == "research" and definition.capabilities.allows("LOCAL_RESEARCH"))
+                        or (name == "reviewer" and definition.task_type != "SUPPORT_CLAIM")
+                    ],
+                    "visible_tools": {
+                        "main": ["get_project_context", "execute_scholar_skill", "get_patch_status", "read_file"],
+                        "research": ["research_evidence", "read_file"]
+                        if definition.capabilities.allows("LOCAL_RESEARCH")
+                        else [],
+                        "reviewer": ["review_draft", "read_file"]
+                        if definition.task_type != "SUPPORT_CLAIM"
+                        else [],
+                    },
+                    "unexpected_tool_calls": [
+                        event.name
+                        for event in run_harness.trace
+                        if event.kind == "tool" and event.name in (_SAFE_FS_TOOLS | _FORBIDDEN_AGENT_TOOLS)
+                    ],
+                    "capability_violations": [
+                        event.name
+                        for event in run_harness.trace
+                        if event.kind == "tool" and event.name in _FORBIDDEN_AGENT_TOOLS
+                    ],
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "trace": self._trace_with_correlation(run_harness, session, trace_id, project_id),
+                },
             )
         try:
             agent = self._build_agent(
@@ -1003,6 +1189,7 @@ class ScholarHarnessService:
                 harness=run_harness,
                 project_id=project_id,
                 session_id=session,
+                user_instruction=instruction,
                 result_holder=result_holder,
             )
             invoke_input: Any
@@ -1068,7 +1255,41 @@ class ScholarHarnessService:
                 trace_id,
                 "FAILED",
                 error_codes=("HARNESS_EXECUTION_FAILED",),
-                metadata={"error_type": type(error).__name__, "error": str(error), "trace": self._trace_with_correlation(run_harness, session, trace_id, project_id)},
+                metadata={
+                    "routing": asdict(decision),
+                    "selected_skill": definition.name,
+                    "resumed": resume_value is not _NO_RESUME,
+                    "visible_capabilities": sorted(definition.capabilities.allowed),
+                    "permission_audit": permission,
+                    "subagent_names": [
+                        name
+                        for name in ("research", "reviewer")
+                        if (name == "research" and definition.capabilities.allows("LOCAL_RESEARCH"))
+                        or (name == "reviewer" and definition.task_type != "SUPPORT_CLAIM")
+                    ],
+                    "visible_tools": {
+                        "main": ["get_project_context", "execute_scholar_skill", "get_patch_status", "read_file"],
+                        "research": ["research_evidence", "read_file"]
+                        if definition.capabilities.allows("LOCAL_RESEARCH")
+                        else [],
+                        "reviewer": ["review_draft", "read_file"]
+                        if definition.task_type != "SUPPORT_CLAIM"
+                        else [],
+                    },
+                    "unexpected_tool_calls": [
+                        event.name
+                        for event in run_harness.trace
+                        if event.kind == "tool" and event.name in (_SAFE_FS_TOOLS | _FORBIDDEN_AGENT_TOOLS)
+                    ],
+                    "capability_violations": [
+                        event.name
+                        for event in run_harness.trace
+                        if event.kind == "tool" and event.name in _FORBIDDEN_AGENT_TOOLS
+                    ],
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "trace": self._trace_with_correlation(run_harness, session, trace_id, project_id),
+                },
             )
         value = result_holder.get("value")
         skill_status = getattr(value, "status", None) or ("COMPLETED" if value is not None else "FAILED")
