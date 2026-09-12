@@ -317,6 +317,12 @@ class LightRAGKnowledgeEngine:
                     # 原始值仍保留在 metadata 供诊断和后续学习排序使用。
                     score=1.0 / source_position,
                     retrieval_source=f"lightrag_{source_type}",
+                    # Preserve the existing retrieval-source contract for
+                    # callers that distinguish a LightRAG chunk/entity from
+                    # a normal corpus retrieval.  Evidence validation still
+                    # treats these as local candidates because only the
+                    # explicit WEB_LITERATURE source type is external.
+                    source_type=f"lightrag_{source_type}",
                     work_id=locator.work_id,
                     document_id=locator.document_id,
                     chunk_id=locator.chunk_id,

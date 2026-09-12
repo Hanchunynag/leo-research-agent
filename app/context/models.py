@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -13,27 +13,34 @@ CONTEXT_SCHEMA_VERSION = "1.0"
 class EvidenceItem:
     source_id: str
     rank: int
-    score: float | None
-    retrieval_source: str
-    chunk_id: str
-    work_id: str
-    document_id: str
-    paper_id: str | None
-    title: str
-    authors: list[str]
-    year: int | None
-    doi: str | None
-    section_path: list[str]
-    page_start: int
-    page_end: int
-    primary_block_ids: list[str]
-    block_ids: list[str]
-    content_types: list[str]
-    content: str
-    truncated: bool
-    token_count: int
+    score: float | None = None
+    retrieval_source: str = "unknown"
+    chunk_id: str = ""
+    work_id: str = ""
+    document_id: str = ""
+    paper_id: str | None = None
+    title: str = ""
+    authors: list[str] = field(default_factory=list)
+    year: int | None = None
+    doi: str | None = None
+    section_path: list[str] = field(default_factory=list)
+    page_start: int = 0
+    page_end: int = 0
+    primary_block_ids: list[str] = field(default_factory=list)
+    block_ids: list[str] = field(default_factory=list)
+    content_types: list[str] = field(default_factory=list)
+    content: str = ""
+    truncated: bool = False
+    token_count: int = 0
     evidence_id: str | None = None
     origin: str = "newly_retrieved"
+    source_type: str = "LOCAL_CORPUS"
+    canonical_id: str | None = None
+    source_locator: str | None = None
+    locator_type: str | None = None
+    publication_date: str | None = None
+    retrieved_at: str | None = None
+    provider: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

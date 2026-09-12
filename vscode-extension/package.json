@@ -1,0 +1,45 @@
+{
+  "name": "scholarharness-vscode",
+  "displayName": "ScholarHarness",
+  "description": "Human approval bridge for ScholarHarness manuscript patches.",
+  "version": "0.1.0",
+  "publisher": "scholarharness",
+  "engines": { "vscode": "^1.86.0" },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onCommand:scholar.openPatchPreview",
+    "onCommand:scholar.acceptPatch",
+    "onCommand:scholar.rejectPatch",
+    "onCommand:scholar.buildManuscript",
+    "onCommand:scholar.showDiagnostics"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "ScholarHarness",
+      "properties": {
+        "scholar.backendUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8000",
+          "description": "ScholarHarness local backend URL."
+        }
+      }
+    },
+    "commands": [
+      { "command": "scholar.openPatchPreview", "title": "Scholar: Open Patch Preview" },
+      { "command": "scholar.acceptPatch", "title": "Scholar: Accept Patch" },
+      { "command": "scholar.rejectPatch", "title": "Scholar: Reject Patch" },
+      { "command": "scholar.buildManuscript", "title": "Scholar: Build Manuscript" },
+      { "command": "scholar.showDiagnostics", "title": "Scholar: Show Diagnostics" }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.86.0",
+    "typescript": "^5.7.0"
+  }
+}

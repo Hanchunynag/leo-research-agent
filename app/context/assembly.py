@@ -110,6 +110,15 @@ def _candidate_evidence_content(
 
 
 def _render_header(item: EvidenceItem) -> str:
+    if item.source_type == "WEB_LITERATURE":
+        return (
+            f"[{item.source_id}]\n"
+            f"Title: {item.title}\n"
+            f"Source Type: WEB_LITERATURE\n"
+            f"Canonical ID: {item.canonical_id or ''}\n"
+            f"Locator ({item.locator_type or 'unknown'}): {item.source_locator or ''}\n"
+            "Evidence:\n"
+        )
     section = " > ".join(item.section_path) or "Unsectioned"
     block_ids = ", ".join(item.block_ids)
     return (
@@ -158,6 +167,43 @@ def _candidate_item(
     context_block_ids: list[str],
     context_pages: list[int],
 ) -> EvidenceItem | None:
+    if candidate.get("source_type") == "WEB_LITERATURE":
+        locator_type = candidate.get("locator_type")
+        locator = candidate.get("source_locator")
+        if (
+            not isinstance(candidate.get("canonical_id"), str)
+            or not candidate["canonical_id"].strip()
+            or not isinstance(locator, str)
+            or not locator.strip()
+            or locator_type not in {"ABSTRACT", "FULLTEXT_SPAN"}
+            or not content.strip()
+        ):
+            return None
+        score = candidate.get("score")
+        normalized_score = (
+            float(score)
+            if isinstance(score, (int, float)) and not isinstance(score, bool)
+            else None
+        )
+        return EvidenceItem(
+            source_id=source_id,
+            rank=int(candidate.get("rank") or source_id.removeprefix("S")),
+            score=normalized_score,
+            retrieval_source=str(candidate.get("retrieval_source") or "external_literature"),
+            content=content,
+            evidence_id=str(candidate["evidence_id"]) if isinstance(candidate.get("evidence_id"), str) else None,
+            source_type="WEB_LITERATURE",
+            canonical_id=str(candidate["canonical_id"]),
+            source_locator=locator,
+            locator_type=str(locator_type),
+            publication_date=str(candidate["publication_date"]) if candidate.get("publication_date") else None,
+            retrieved_at=str(candidate["retrieved_at"]) if candidate.get("retrieved_at") else None,
+            provider=str(candidate["provider"]) if candidate.get("provider") else None,
+            title=str(candidate.get("title") or ""),
+            authors=_string_list(candidate.get("authors")),
+            truncated=False,
+            token_count=0,
+        )
     required = {
         field: candidate.get(field)
         for field in ("chunk_id", "work_id", "document_id", "title")
@@ -254,6 +300,7 @@ def assemble_context_bundle(
     evidence: list[EvidenceItem] = []
     rendered: list[str] = []
     seen_chunk_ids: set[str] = set()
+    seen_external_ids: set[str] = set()
     seen_content_fingerprints: set[str] = set()
     selected_document_by_work: dict[str, str] = {}
     work_counts: defaultdict[str, int] = defaultdict(int)
@@ -264,6 +311,43 @@ def assemble_context_bundle(
     for candidate in results:
         if len(evidence) >= evidence_limit:
             break
+        if candidate.get("source_type") == "WEB_LITERATURE":
+            primary_content = str(candidate.get("content") or "").strip()
+            identity = str(candidate.get("canonical_id") or candidate.get("source_locator") or "")
+            if not primary_content or not identity:
+                skipped_reasons["invalid_source_metadata"] += 1
+                continue
+            if identity in seen_external_ids:
+                skipped_reasons["duplicate_external_source"] += 1
+                continue
+            source_id = f"S{len(evidence) + 1}"
+            item = _candidate_item(candidate, source_id, primary_content, [], [])
+            if item is None:
+                skipped_reasons["invalid_source_metadata"] += 1
+                continue
+            current_text = "\n\n".join(rendered)
+            remaining = budget - token_count(current_text)
+            full_block = render_evidence_item(item)
+            if token_count(full_block) > remaining:
+                header_tokens = token_count(_render_header(item))
+                content_budget = remaining - header_tokens
+                if content_budget < DEFAULT_MIN_CONTENT_TOKENS:
+                    skipped_reasons["token_budget_exhausted"] += 1
+                    break
+                truncated_content = _truncate_to_budget(primary_content, content_budget)
+                if not truncated_content:
+                    skipped_reasons["token_budget_exhausted"] += 1
+                    break
+                item = replace(item, content=truncated_content, truncated=True)
+                full_block = render_evidence_item(item)
+                truncated_count += 1
+            item = replace(item, token_count=token_count(full_block))
+            evidence.append(item)
+            rendered.append(full_block)
+            seen_external_ids.add(identity)
+            if item.truncated:
+                break
+            continue
         chunk_id = candidate.get("chunk_id")
         work_id = candidate.get("work_id")
         document_id = candidate.get("document_id")

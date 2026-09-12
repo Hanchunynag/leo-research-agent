@@ -698,6 +698,63 @@ def build_parser() -> argparse.ArgumentParser:
         command = session_subparsers.add_parser(action, help=help_text)
         command.add_argument("session_id")
 
+    scholar_command = subparsers.add_parser(
+        "scholar",
+        help="ScholarHarness 人工审批与 Patch 预览。",
+    )
+    scholar_subparsers = scholar_command.add_subparsers(
+        dest="scholar_command",
+        required=True,
+    )
+    request_command = scholar_subparsers.add_parser(
+        "request",
+        help="通过 Production Scholar Runtime 执行一个用户级 Scholar Request。",
+    )
+    request_command.add_argument("instruction")
+    request_command.add_argument("--project-id", required=True)
+    request_command.add_argument(
+        "--task-type",
+        choices=["WRITE_INTRODUCTION", "SUPPORT_CLAIM", "WRITE_CONCLUSION", "WRITE_ABSTRACT"],
+    )
+    request_command.add_argument("--session-id")
+    request_command.add_argument("--thread-id")
+    resume_command = scholar_subparsers.add_parser(
+        "resume",
+        help="恢复一个已有 persistent checkpoint 的 Scholar Request。",
+    )
+    resume_command.add_argument("instruction")
+    resume_command.add_argument("--project-id", required=True)
+    resume_command.add_argument("--thread-id", required=True)
+    resume_command.add_argument("--resume-value", required=True, help="JSON 编码的框架 resume 值。")
+    resume_command.add_argument("--task-type", choices=["WRITE_INTRODUCTION", "SUPPORT_CLAIM", "WRITE_CONCLUSION", "WRITE_ABSTRACT"])
+    resume_command.add_argument("--session-id")
+    status_command = scholar_subparsers.add_parser(
+        "status",
+        help="只读查询 Scholar thread/checkpoint 状态。",
+    )
+    status_command.add_argument("--project-id", required=True)
+    status_command.add_argument("--thread-id", required=True)
+    status_command.add_argument("--session-id")
+    patch_command = scholar_subparsers.add_parser(
+        "patch",
+        help="查看、接受或拒绝一个已持久化的 DraftPatch。",
+    )
+    patch_subparsers = patch_command.add_subparsers(
+        dest="patch_command",
+        required=True,
+    )
+    patch_show = patch_subparsers.add_parser("show", help="显示 Patch Preview。")
+    patch_show.add_argument("patch_id")
+    for action, help_text in (
+        ("accept", "人工接受并安全应用 Patch。"),
+        ("reject", "人工拒绝 Patch。"),
+    ):
+        approval_command = patch_subparsers.add_parser(action, help=help_text)
+        approval_command.add_argument("patch_id")
+        approval_command.add_argument("--project-id", required=True)
+        approval_command.add_argument("--expected-base-hash", required=True)
+        approval_command.add_argument("--actor", required=True)
+
     evaluate_command = subparsers.add_parser(
         "evaluate",
         help="运行本地检索与后续 RAG 质量评测。",
@@ -1127,6 +1184,77 @@ def main(argv: Sequence[str] | None = None) -> None:
             return
         except (KeyError, OSError, ValueError) as error:
             raise SystemExit(f"Session 错误：{error}") from error
+
+    if args.command == "scholar":
+        from app.scholar.approval import PatchApprovalRequest, PatchApprovalService
+
+        try:
+            if args.scholar_command == "request":
+                from app.scholar.composition import ScholarRuntimeFactory
+
+                with ScholarRuntimeFactory(PROJECT_ROOT).open() as runtime:
+                    result = runtime.harness.scholar_request(
+                        args.instruction,
+                        args.project_id,
+                        session_id=args.session_id,
+                        task_type=args.task_type,
+                        thread_id=args.thread_id,
+                    )
+                    print_json(result.to_dict())
+                return
+            if args.scholar_command == "resume":
+                from app.scholar.composition import ScholarRuntimeFactory
+
+                try:
+                    resume_value = json.loads(args.resume_value)
+                except json.JSONDecodeError as error:
+                    raise ValueError("--resume-value 必须是合法 JSON。") from error
+                with ScholarRuntimeFactory(PROJECT_ROOT).open() as runtime:
+                    result = runtime.harness.resume(
+                        args.thread_id,
+                        resume_value,
+                        args.project_id,
+                        instruction=args.instruction,
+                        session_id=args.session_id,
+                        task_type=args.task_type,
+                    )
+                    print_json(result.to_dict())
+                return
+            if args.scholar_command == "status":
+                from app.scholar.composition import ScholarRuntimeFactory
+
+                with ScholarRuntimeFactory(PROJECT_ROOT).open() as runtime:
+                    print_json(
+                        runtime.harness.status(
+                            args.thread_id,
+                            args.project_id,
+                            session_id=args.session_id,
+                        )
+                    )
+                return
+
+            service = PatchApprovalService(PROJECT_ROOT)
+            if args.scholar_command != "patch":
+                raise ValueError("未知 Scholar 命令。")
+            if args.patch_command == "show":
+                print_json(asdict(service.get_preview(args.patch_id)))
+                return
+            decision = "ACCEPT" if args.patch_command == "accept" else "REJECT"
+            result = service.approve(
+                PatchApprovalRequest(
+                    patch_id=args.patch_id,
+                    project_id=args.project_id,
+                    decision=decision,
+                    expected_base_hash=args.expected_base_hash,
+                    actor=args.actor,
+                )
+            )
+            print_json(asdict(result))
+            if result.error_code:
+                raise SystemExit(2)
+            return
+        except (KeyError, OSError, RuntimeError, ValueError) as error:
+            raise SystemExit(f"Scholar Patch 错误：{error}") from error
 
     if args.command == "library":
         if args.library_command == "rebuild":

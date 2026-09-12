@@ -1,0 +1,87 @@
+"""ScholarHarness Writing Vertical。"""
+
+from app.scholar.writing.models import (
+    CapabilitySet,
+    CapabilityProfile,
+    ClaimPlan,
+    CitationRequirement,
+    PlannedClaim,
+    ResearchNeed,
+    SectionDraft,
+    TaskType,
+    WritingContext,
+    WritingRequest,
+    WritingResult,
+    deterministic_patch_id,
+    deterministic_review_report_id,
+)
+from app.scholar.writing.provider import (
+    ChatCompletionIntroductionWriter,
+    ChatCompletionSemanticReviewJudge,
+    ChatCompletionSynthesisWriter,
+)
+from app.scholar.writing.reviewer import IntroductionReviewer, SharedManuscriptReviewer
+from app.scholar.writing.runtime import (
+    CapabilityDenied,
+    RoutingDecision,
+    SkillDefinition,
+    SkillExecutionContext,
+    SkillRegistry,
+    SkillResult,
+    SkillRuntimeError,
+    TaskRouter,
+)
+from app.scholar.writing.service import CitationResolver, ManuscriptSupervisor, MetadataCitationResolver, ResearchDelegate, ScholarWritingService
+from app.scholar.writing.skill import IntroductionSkill
+from app.scholar.writing.support import (
+    ClaimSupportResult,
+    ClaimSupportService,
+    ClaimSupportSubclaim,
+    ConservativeClaimNormalizer,
+    SupportClaimRequest,
+)
+from app.scholar.writing.synthesis import AbstractFactSet, SynthesisWritingService
+from app.scholar.writing.harness import ScholarSkillRuntime
+
+__all__ = [
+    "CapabilitySet",
+    "CapabilityProfile",
+    "ChatCompletionIntroductionWriter",
+    "ChatCompletionSemanticReviewJudge",
+    "ChatCompletionSynthesisWriter",
+    "ClaimPlan",
+    "CitationResolver",
+    "CitationRequirement",
+    "IntroductionReviewer",
+    "SharedManuscriptReviewer",
+    "IntroductionSkill",
+    "ManuscriptSupervisor",
+    "MetadataCitationResolver",
+    "PlannedClaim",
+    "ResearchDelegate",
+    "ResearchNeed",
+    "SectionDraft",
+    "ScholarWritingService",
+    "WritingContext",
+    "WritingRequest",
+    "WritingResult",
+    "deterministic_patch_id",
+    "deterministic_review_report_id",
+    "AbstractFactSet",
+    "CapabilityDenied",
+    "ClaimSupportResult",
+    "ClaimSupportService",
+    "ClaimSupportSubclaim",
+    "ConservativeClaimNormalizer",
+    "RoutingDecision",
+    "ScholarSkillRuntime",
+    "SkillDefinition",
+    "SkillExecutionContext",
+    "SkillRegistry",
+    "SkillResult",
+    "SkillRuntimeError",
+    "SupportClaimRequest",
+    "SynthesisWritingService",
+    "TaskRouter",
+    "TaskType",
+]

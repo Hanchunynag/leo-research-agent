@@ -21,6 +21,7 @@ class HarnessState(StrEnum):
     EVALUATING = "evaluating"
     RECOVERING = "recovering"
     COMMITTING = "committing"
+    INTERRUPTED = "interrupted"
     COMPLETED = "completed"
     FAILED = "failed"
     REFUSED = "refused"
@@ -37,13 +38,13 @@ class RecoveryLevel(IntEnum):
 
 _TRANSITIONS: dict[HarnessState, frozenset[HarnessState]] = {
     HarnessState.CREATED: frozenset({HarnessState.CONTEXT_PREPARING}),
-    HarnessState.CONTEXT_PREPARING: frozenset({HarnessState.PLANNING}),
-    HarnessState.PLANNING: frozenset({HarnessState.EXECUTING}),
+    HarnessState.CONTEXT_PREPARING: frozenset({HarnessState.PLANNING, HarnessState.FAILED, HarnessState.REFUSED}),
+    HarnessState.PLANNING: frozenset({HarnessState.EXECUTING, HarnessState.FAILED, HarnessState.REFUSED}),
     HarnessState.EXECUTING: frozenset(
-        {HarnessState.EVALUATING, HarnessState.RECOVERING, HarnessState.COMMITTING}
+        {HarnessState.EVALUATING, HarnessState.RECOVERING, HarnessState.COMMITTING, HarnessState.INTERRUPTED, HarnessState.FAILED, HarnessState.REFUSED}
     ),
     HarnessState.EVALUATING: frozenset(
-        {HarnessState.RECOVERING, HarnessState.COMMITTING}
+        {HarnessState.RECOVERING, HarnessState.COMMITTING, HarnessState.INTERRUPTED, HarnessState.FAILED, HarnessState.REFUSED}
     ),
     HarnessState.RECOVERING: frozenset(
         {
@@ -56,6 +57,7 @@ _TRANSITIONS: dict[HarnessState, frozenset[HarnessState]] = {
     HarnessState.COMMITTING: frozenset(
         {HarnessState.COMPLETED, HarnessState.FAILED, HarnessState.REFUSED}
     ),
+    HarnessState.INTERRUPTED: frozenset(),
     HarnessState.COMPLETED: frozenset(),
     HarnessState.FAILED: frozenset(),
     HarnessState.REFUSED: frozenset(),
@@ -132,8 +134,14 @@ def _safe(value: Any) -> Any:
 class ResearchRunHarness:
     """只感知通用状态、Step、Tool、Context、Budget、Evaluation 和 Recovery。"""
 
-    def __init__(self, workflow: str, policy: ResearchBudgetPolicy) -> None:
-        self.run_id = f"RR_{secrets.token_hex(8)}"
+    def __init__(
+        self,
+        workflow: str,
+        policy: ResearchBudgetPolicy,
+        *,
+        run_id: str | None = None,
+    ) -> None:
+        self.run_id = run_id or f"RR_{secrets.token_hex(8)}"
         self.workflow = workflow
         self.policy = policy
         self.usage = BudgetUsage()
@@ -233,7 +241,7 @@ class ResearchRunHarness:
         )
 
     def finish(self, target: HarnessState, reason: str) -> None:
-        if target not in {HarnessState.COMPLETED, HarnessState.FAILED, HarnessState.REFUSED}:
+        if target not in {HarnessState.COMPLETED, HarnessState.INTERRUPTED, HarnessState.FAILED, HarnessState.REFUSED}:
             raise ValueError("非法终止状态。")
         self.transition(target)
         self.termination_reason = reason

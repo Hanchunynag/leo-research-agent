@@ -28,6 +28,13 @@ def _issue(
 
 
 def _valid_evidence_metadata(item: EvidenceItem) -> bool:
+    if item.source_type == "WEB_LITERATURE":
+        return bool(
+            item.canonical_id
+            and item.source_locator
+            and item.locator_type in {"ABSTRACT", "FULLTEXT_SPAN"}
+            and item.content.strip()
+        )
     return bool(
         SOURCE_ID_PATTERN.fullmatch(item.source_id)
         and item.chunk_id.strip()
@@ -193,6 +200,13 @@ def validate_answer_draft(
                     page_end=evidence.page_end,
                     block_ids=evidence.block_ids,
                     evidence_id=evidence.evidence_id,
+                    source_type=evidence.source_type,
+                    canonical_id=evidence.canonical_id,
+                    source_locator=evidence.source_locator,
+                    locator_type=evidence.locator_type,
+                    publication_date=evidence.publication_date,
+                    retrieved_at=evidence.retrieved_at,
+                    provider=evidence.provider,
                 )
             )
 

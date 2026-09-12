@@ -24,6 +24,7 @@ from app.langchain_agent.planning import (
     classify_research_task,
 )
 from app.langchain_agent.tools import build_research_tools
+from app.langchain_agent.provider import OpenAICompatibleChatModel, ScholarChatModelAdapter
 
 __all__ = [
     "LangChainHarnessAgentService",
@@ -39,6 +40,8 @@ __all__ = [
     "ReferenceResolver",
     "LLMActionDecider",
     "build_research_tools",
+    "OpenAICompatibleChatModel",
+    "ScholarChatModelAdapter",
     "COMPARISON_DIMENSIONS",
     "build_research_plan",
     "classify_research_task",

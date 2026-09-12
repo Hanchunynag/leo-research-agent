@@ -27,12 +27,14 @@ dependencies = [
     "python-igraph==0.11.9",
     "leidenalg==0.10.2",
     "lightrag-hku==1.5.6",
-    "langchain==0.3.30",
-    "langchain-core==0.3.86",
+    "langchain>=1,<2",
+    "langchain-core>=1,<2",
     "typer>=0.27.0",
     "uvicorn>=0.35,<1",
-    "langgraph>=0.2,<0.4",
-    "langgraph-checkpoint-sqlite==2.0.0",
+    "langgraph>=1,<2",
+    "langgraph-checkpoint-sqlite>=3,<4",
+    "deepagents>=0.7,<1",
+    "bibtexparser>=1.4,<2",
 ]
 
 [dependency-groups]
@@ -47,12 +49,4 @@ pythonpath = ["."]
 markers = [
     "neo4j: requires a running Neo4j 5.26 integration service",
     "qdrant: exercises local or remote Qdrant integration",
-]
-
-[tool.uv]
-# RAGAS 0.3.x and the production agent both use the pre-1.0 LangChain APIs.
-constraint-dependencies = [
-    "langchain<1",
-    "langchain-core<1",
-    "langchain-community==0.3.31",
 ]

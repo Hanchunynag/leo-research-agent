@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
 
 
@@ -73,6 +73,9 @@ class EvidencePack:
     unresolved: tuple[str, ...] = ()
     local_coverage: float = 0.0
     web_used: bool = False
+    coverage: float | None = None
+    counter_evidence: tuple[Mapping[str, Any], ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +87,20 @@ class DraftPatch:
     used_claim_ids: tuple[str, ...] = ()
     used_evidence_ids: tuple[str, ...] = ()
     reviewer_status: str = "pending"
+    project_id: str | None = None
+    citation_keys: tuple[str, ...] = ()
+    contribution_ids: tuple[str, ...] = ()
+    review_report_id: str | None = None
+    change_summary: str = ""
+    original_content: str = ""
+    warnings: tuple[str, ...] = ()
+    # Citation lifecycle projections.  These remain immutable proposal data;
+    # the Approval service is the only component allowed to apply changes.
+    bibliography_base_hash: str | None = None
+    citation_bindings: tuple[Any, ...] = ()
+    bibliography_changes: tuple[Any, ...] = ()
+    citation_requirements: tuple[Any, ...] = ()
+    citation_binding_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.patch_id.strip() or not self.target_section.strip():
@@ -105,3 +122,4 @@ class ReviewReport:
     valid: bool
     issues: tuple[ReviewIssue, ...] = ()
     revision_round: int = 0
+    report_id: str = ""

@@ -53,6 +53,13 @@ class CitationRecord:
     page_end: int
     block_ids: list[str]
     evidence_id: str | None = None
+    source_type: str = "LOCAL_CORPUS"
+    canonical_id: str | None = None
+    source_locator: str | None = None
+    locator_type: str | None = None
+    publication_date: str | None = None
+    retrieved_at: str | None = None
+    provider: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

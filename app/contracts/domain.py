@@ -7,7 +7,9 @@ Agentic Service。阶段一不要求现有业务对象立即迁移到这些类�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Any, Literal, Mapping
+from urllib.parse import urlparse
 
 
 RunState = Literal["created", "running", "completed", "failed", "cancelled"]
@@ -37,6 +39,8 @@ EvidenceGrade = Literal[
     "analogy",
     "graph_inference",
 ]
+EvidenceSourceType = Literal["LOCAL_CORPUS", "WEB_LITERATURE"]
+ExternalLocatorType = Literal["ABSTRACT", "FULLTEXT_SPAN"]
 
 
 def _required(value: str, field_name: str) -> None:
@@ -205,6 +209,14 @@ class CandidateEvidence:
     evidence_grade: EvidenceGrade = "candidate"
     directness: EvidenceDirectness | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    source_type: EvidenceSourceType = "LOCAL_CORPUS"
+    canonical_id: str | None = None
+    source_locator: str | None = None
+    locator_type: ExternalLocatorType | None = None
+    publication_date: date | None = None
+    retrieved_at: datetime | None = None
+    provider: str | None = None
+    validation_status: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -216,6 +228,12 @@ class CandidateEvidence:
         ):
             _required(getattr(self, name), name)
         _positive(self.scope_version, "scope_version")
+        if self.source_type == "WEB_LITERATURE":
+            if not self.canonical_id or not self.source_locator or self.locator_type not in {"ABSTRACT", "FULLTEXT_SPAN"}:
+                raise ValueError("External CandidateEvidence 必须携带 canonical locator。")
+            parsed = urlparse(self.source_locator)
+            if parsed.scheme not in {"http", "https", "doi", "arxiv"}:
+                raise ValueError("External CandidateEvidence locator 不可验证。")
 
     @property
     def evidence_id(self) -> str:
@@ -224,12 +242,35 @@ class CandidateEvidence:
         return self.candidate_id
 
     @property
-    def source_type(self) -> str:
-        return self.retrieval_source
-
-    @property
     def retrieval_score(self) -> float:
         return self.score
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalEvidenceResolution:
+    """A resolver-verified snapshot for a real external locator."""
+
+    candidate_id: str
+    canonical_id: str
+    source_locator: str
+    locator_type: ExternalLocatorType
+    content: str
+    content_hash: str
+    provider: str
+    validation_status: str
+    publication_date: date | None = None
+    retrieved_at: datetime | None = None
+    work_id: str = ""
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in ("candidate_id", "canonical_id", "source_locator", "content", "content_hash", "provider", "validation_status"):
+            _required(getattr(self, name), name)
+        if self.locator_type not in {"ABSTRACT", "FULLTEXT_SPAN"}:
+            raise ValueError("External locator_type 不受支持。")
+        parsed = urlparse(self.source_locator)
+        if parsed.scheme not in {"http", "https", "doi", "arxiv"}:
+            raise ValueError("External source_locator 必须是可验证的 URL 或 canonical locator。")
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,19 +283,27 @@ class VerifiedEvidence:
     workspace_id: str
     scope_version: int
     content: str
-    work_id: str
-    document_id: str
-    chunk_id: str
-    page_start: int
-    page_end: int
-    block_ids: tuple[str, ...]
-    verification_method: str
-    content_hash: str
+    work_id: str = ""
+    document_id: str = ""
+    chunk_id: str = ""
+    page_start: int = 0
+    page_end: int = 0
+    block_ids: tuple[str, ...] = ()
+    verification_method: str = ""
+    content_hash: str = ""
     relation_path: tuple[str, ...] = ()
     state: EvidenceState = "verified"
     evidence_grade: EvidenceGrade = "primary"
     directness: EvidenceDirectness = "direct"
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    source_type: EvidenceSourceType = "LOCAL_CORPUS"
+    canonical_id: str | None = None
+    source_locator: str | None = None
+    locator_type: ExternalLocatorType | None = None
+    publication_date: date | None = None
+    retrieved_at: datetime | None = None
+    provider: str | None = None
+    validation_status: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -269,14 +318,23 @@ class VerifiedEvidence:
             "verification_method",
             "content_hash",
         ):
+            if name in {"work_id", "document_id", "chunk_id", "verification_method"} and self.source_type == "WEB_LITERATURE":
+                continue
             _required(getattr(self, name), name)
         _positive(self.scope_version, "scope_version")
-        _positive(self.page_start, "page_start")
-        _positive(self.page_end, "page_end")
-        if self.page_end < self.page_start:
-            raise ValueError("page_end 不能小于 page_start。")
-        if not self.block_ids:
-            raise ValueError("VerifiedEvidence.block_ids 不能为空。")
+        if self.source_type == "LOCAL_CORPUS":
+            _positive(self.page_start, "page_start")
+            _positive(self.page_end, "page_end")
+            if self.page_end < self.page_start:
+                raise ValueError("page_end 不能小于 page_start。")
+            if not self.block_ids:
+                raise ValueError("VerifiedEvidence.block_ids 不能为空。")
+        else:
+            if not self.canonical_id or not self.source_locator or self.locator_type not in {"ABSTRACT", "FULLTEXT_SPAN"}:
+                raise ValueError("External VerifiedEvidence 必须携带真实 canonical locator。")
+            parsed = urlparse(self.source_locator)
+            if parsed.scheme not in {"http", "https", "doi", "arxiv"}:
+                raise ValueError("External VerifiedEvidence locator 不可验证。")
 
 
 @dataclass(frozen=True, slots=True)

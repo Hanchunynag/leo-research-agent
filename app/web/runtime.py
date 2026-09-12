@@ -146,6 +146,8 @@ class LocalRAGWebRuntime:
         self,
         project_root: Path,
         config: WebRuntimeConfig | None = None,
+        *,
+        scholar_harness: Any | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve()
         self.config = config or WebRuntimeConfig.from_environment(self.project_root)
@@ -163,6 +165,9 @@ class LocalRAGWebRuntime:
         self._facade: ResearchApplicationFacade | None = None
         self._operation_lock = Lock()
         self._service_lock = Lock()
+        # Scholar-level requests are opt-in deployment composition.  The
+        # established answer API remains on ResearchApplicationFacade.
+        self.scholar_harness = scholar_harness
         self._bootstrap_backend: Any | None = None
         self._bootstrap_composition: Any | None = None
         self._bootstrap_stop = Event()
@@ -312,6 +317,13 @@ class LocalRAGWebRuntime:
                 # Scheduling the coroutine avoids both nested ``asyncio.run``
                 # and an un-awaited coroutine warning.
                 loop.create_task(close())
+
+    def scholar_request(self, instruction: str, project_id: str, **kwargs: Any) -> Any:
+        """Forward a Scholar-level request to the injected in-process Harness."""
+
+        if self.scholar_harness is None:
+            raise RuntimeError("SCHOLAR_HARNESS_NOT_CONFIGURED: Scholar Harness 未配置。")
+        return self.scholar_harness.scholar_request(instruction, project_id, **kwargs)
 
     def answer(self, request: AnswerRequest, emit: EmitProgress) -> dict[str, Any]:
         """通过 Application Facade 执行；Session 锁负责同会话串行化。"""

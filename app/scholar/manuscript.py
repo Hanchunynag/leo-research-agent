@@ -21,6 +21,13 @@ class PatchConflict(RuntimeError):
 class ManuscriptSynchronizer:
     """只读取 LaTeX Project；不会启动编译器或修改文件。"""
 
+    DEPENDENTS = {
+        "method": {"conclusion", "abstract"},
+        "experiment": {"results", "conclusion", "abstract"},
+        "results": {"conclusion", "abstract"},
+        "conclusion": {"abstract"},
+    }
+
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root.expanduser().resolve()
 
@@ -49,8 +56,21 @@ class ManuscriptSynchronizer:
             or name not in previous.sections
             or previous.sections[name].content_hash != section.content_hash
         }
-        stale = tuple(sorted(changed)) if previous is not None else ()
+        stale_names: set[str] = set()
+        if previous is not None:
+            stale_names.update(set(previous.stale_sections) - changed)
+            stale_names.update(changed)
+            queue = list(changed)
+            while queue:
+                source = queue.pop()
+                for dependent in self.DEPENDENTS.get(source.casefold(), set()):
+                    if dependent in sections and dependent not in stale_names:
+                        stale_names.add(dependent)
+                        queue.append(dependent)
+        stale = tuple(sorted(stale_names))
         for name in stale:
+            if name not in sections:
+                continue
             sections[name] = ManuscriptSection(
                 name=sections[name].name,
                 relative_path=sections[name].relative_path,
@@ -85,6 +105,12 @@ class ManuscriptSynchronizer:
                 f"PATCH_CONFLICT: {patch.target_section} 当前 hash 已从 "
                 f"{patch.base_hash} 变为 {current_hash}。"
             )
+        if patch.original_content:
+            current_content = path.read_text(encoding="utf-8")
+            if current_content != patch.original_content:
+                raise PatchConflict(
+                    f"PATCH_CONFLICT: {patch.target_section} 当前内容与 Patch 的 original_content 不一致。"
+                )
         temporary: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -102,7 +128,27 @@ class ManuscriptSynchronizer:
         finally:
             if temporary is not None and temporary.exists():
                 temporary.unlink()
-        return self.scan(previous=state)
+        refreshed = self.scan(previous=state)
+        refreshed_sections = dict(refreshed.sections)
+        target = refreshed_sections.get(patch.target_section)
+        if target is not None:
+            refreshed_sections[patch.target_section] = ManuscriptSection(
+                name=target.name,
+                relative_path=target.relative_path,
+                content_hash=target.content_hash,
+                version=target.version,
+                stale=False,
+            )
+        return ManuscriptState(
+            project_root=refreshed.project_root,
+            root_tex=refreshed.root_tex,
+            project_hash=refreshed.project_hash,
+            version=refreshed.version,
+            sections=refreshed_sections,
+            stale_sections=tuple(
+                value for value in refreshed.stale_sections if value != patch.target_section
+            ),
+        )
 
     def _root_tex(self) -> Path:
         preferred = self.project_root / "main.tex"

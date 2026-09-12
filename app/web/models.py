@@ -62,3 +62,48 @@ class JobSnapshot(WebModel):
 class JobCreated(WebModel):
     job_id: str
     status: Literal["queued"] = "queued"
+
+
+class PatchDecisionRequest(WebModel):
+    project_id: str = Field(min_length=1, max_length=128)
+    expected_base_hash: str = Field(min_length=1, max_length=128)
+    actor: str = Field(min_length=1, max_length=256)
+
+
+class ScholarTaskRequest(WebModel):
+    """User-level Scholar request; execution is owned by ScholarHarnessService."""
+
+    instruction: str = Field(min_length=1, max_length=16_000)
+    project_id: str = Field(min_length=1, max_length=128)
+    task_type: Literal[
+        "WRITE_INTRODUCTION",
+        "SUPPORT_CLAIM",
+        "WRITE_CONCLUSION",
+        "WRITE_ABSTRACT",
+    ] | None = None
+    session_id: str | None = Field(default=None, max_length=128)
+    thread_id: str | None = Field(default=None, max_length=128)
+
+
+class ScholarResumeRequest(WebModel):
+    """Framework checkpoint resume data, never Patch Approval data."""
+
+    project_id: str = Field(min_length=1, max_length=128)
+    thread_id: str = Field(min_length=1, max_length=128)
+    instruction: str = Field(min_length=1, max_length=16_000)
+    resume_value: Any
+    task_type: Literal[
+        "WRITE_INTRODUCTION",
+        "SUPPORT_CLAIM",
+        "WRITE_CONCLUSION",
+        "WRITE_ABSTRACT",
+    ] | None = None
+    session_id: str | None = Field(default=None, max_length=128)
+
+
+class BuildReportRequest(WebModel):
+    build_id: str = Field(min_length=1, max_length=128)
+    status: Literal["SUCCESS", "FAILED", "UNAVAILABLE", "UNKNOWN", "BUILD_TRIGGERED"]
+    diagnostics: list[dict[str, Any]] = Field(default_factory=list)
+    completed_at: str | None = None
+    message: str = ""

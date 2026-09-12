@@ -5,6 +5,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
+
+
+RuntimeMode = Literal["production", "test", "local-fast"]
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,15 @@ class AgenticRAGConfig:
     model_context_window: int = 32_768
     recent_events_after_compaction: int = 8
     session_db_path: Path | None = None
+    # Scholar-level runtime settings live in this existing configuration
+    # object so Web/CLI do not grow a second environment parser.
+    runtime_mode: RuntimeMode = "production"
+    scholar_checkpoint_path: Path | None = None
+    scholar_max_steps: int = 24
+    scholar_supervisor_context_budget: int = 4_000
+    scholar_research_context_budget: int = 4_000
+    scholar_reviewer_context_budget: int = 8_000
+    scholar_total_context_budget: int = 16_000
 
     @classmethod
     def from_environment(cls, env_file: Path | None = None) -> AgenticRAGConfig:
@@ -90,6 +103,8 @@ class AgenticRAGConfig:
             raise ValueError(f"LEO_AGENTIC_{name} 必须是布尔值。")
 
         database = raw("SESSION_DB_PATH")
+        checkpoint = raw("SCHOLAR_CHECKPOINT_PATH") or raw("CHECKPOINT_PATH")
+        runtime_mode = raw("RUNTIME_MODE") or raw("SCHOLAR_RUNTIME_MODE") or defaults.runtime_mode
         return cls(
             candidate_limit=integer("CANDIDATE_LIMIT", defaults.candidate_limit),
             rerank_top_k=integer("RERANK_TOP_K", defaults.rerank_top_k),
@@ -171,6 +186,25 @@ class AgenticRAGConfig:
                 defaults.recent_events_after_compaction,
             ),
             session_db_path=Path(database) if database else None,
+            runtime_mode=runtime_mode,  # type: ignore[arg-type]
+            scholar_checkpoint_path=Path(checkpoint) if checkpoint else None,
+            scholar_max_steps=integer("SCHOLAR_MAX_STEPS", defaults.scholar_max_steps),
+            scholar_supervisor_context_budget=integer(
+                "SCHOLAR_SUPERVISOR_CONTEXT_BUDGET",
+                defaults.scholar_supervisor_context_budget,
+            ),
+            scholar_research_context_budget=integer(
+                "SCHOLAR_RESEARCH_CONTEXT_BUDGET",
+                defaults.scholar_research_context_budget,
+            ),
+            scholar_reviewer_context_budget=integer(
+                "SCHOLAR_REVIEWER_CONTEXT_BUDGET",
+                defaults.scholar_reviewer_context_budget,
+            ),
+            scholar_total_context_budget=integer(
+                "SCHOLAR_TOTAL_CONTEXT_BUDGET",
+                defaults.scholar_total_context_budget,
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -234,3 +268,27 @@ class AgenticRAGConfig:
             raise ValueError("model_context_window 不能小于 1024。")
         if self.recent_events_after_compaction < 1:
             raise ValueError("recent_events_after_compaction 不能小于 1。")
+        if self.runtime_mode not in {"production", "test", "local-fast"}:
+            raise ValueError("runtime_mode 必须是 production、test 或 local-fast。")
+        if self.scholar_max_steps < 1:
+            raise ValueError("scholar_max_steps 必须大于 0。")
+        for name in (
+            "scholar_supervisor_context_budget",
+            "scholar_research_context_budget",
+            "scholar_reviewer_context_budget",
+            "scholar_total_context_budget",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} 必须大于 0。")
+        if max(
+            self.scholar_supervisor_context_budget,
+            self.scholar_research_context_budget,
+            self.scholar_reviewer_context_budget,
+        ) > self.scholar_total_context_budget:
+            raise ValueError("Scholar context budget 不能超过 scholar_total_context_budget。")
+
+    @property
+    def scholar_runtime_mode(self) -> RuntimeMode:
+        """Compatibility spelling used by composition callers."""
+
+        return self.runtime_mode

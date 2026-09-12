@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from app.agentic.models import AgenticAnswerDraft, AgenticClaim
 from app.contracts import ResearchScope
 from app.langchain_agent import build_langchain_agent_service
+from app.langchain_agent.checkpoint_factory import open_checkpointer
 from app.langchain_agent.translation import BilingualQueryTranslator, build_translation_tool
 
 
@@ -301,3 +302,21 @@ def test_timeline_plan_adds_bounded_title_evidence_probes(
         "Paper B method contribution limitation",
     )
     assert captured["target_document_ids"] == ("D_1", "D_2")
+
+
+def test_langchain_service_passes_injected_checkpointer_to_existing_graph(
+    tmp_path: Path,
+) -> None:
+    with open_checkpointer("memory") as checkpointer:
+        _, chat, knowledge = _service(tmp_path)
+        # Rebuild through the public production composition boundary with the
+        # same established knowledge/workspace adapters.
+        configured = build_langchain_agent_service(
+            tmp_path,
+            knowledge,
+            _Workspaces(),
+            _ReasoningProvider(chat),
+            checkpointer=checkpointer,
+        )
+
+    assert configured._graph_runtime.checkpointer is checkpointer  # noqa: SLF001

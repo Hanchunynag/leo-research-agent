@@ -16,6 +16,7 @@ node_modules/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+.scholar/
 tmp/
 .env
 .env.*

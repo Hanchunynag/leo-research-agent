@@ -104,7 +104,7 @@ class SessionRuntime:
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(agent_runs)")
             }
-            for column in ("job_id", "project_id"):
+            for column in ("job_id", "project_id", "checkpoint_ref"):
                 if column not in run_columns:
                     connection.execute(f"ALTER TABLE agent_runs ADD COLUMN {column} TEXT")
             connection.execute(
@@ -179,6 +179,18 @@ class SessionRuntime:
             ).rowcount
         if updated != 1:
             raise ValueError(f"Run 不能进入 RUNNING：{run_id}")
+        return self.get_run(run_id)
+
+    def set_checkpoint_ref(self, run_id: str, checkpoint_ref: str | None) -> RunRecord:
+        """Record the LangGraph working-state reference without copying state."""
+
+        with self._connect() as connection:
+            updated = connection.execute(
+                "UPDATE agent_runs SET checkpoint_ref=? WHERE run_id=?",
+                (checkpoint_ref, run_id),
+            ).rowcount
+        if updated != 1:
+            raise KeyError(f"Run 不存在：{run_id}")
         return self.get_run(run_id)
 
     def append_message(

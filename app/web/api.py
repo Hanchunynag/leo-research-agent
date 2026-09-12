@@ -6,6 +6,7 @@ import asyncio
 import json
 import shutil
 import tempfile
+from dataclasses import asdict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,8 +18,26 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 from app.ingestion.ingest import sanitize_pdf_filename
+from app.scholar.approval import (
+    LatexBridgeService,
+    PatchApprovalRequest,
+    PatchApprovalError,
+    PatchApprovalService,
+)
+from app.scholar.approval.build import normalize_diagnostic
+from app.scholar.project import ScholarProjectStore
 from app.web.jobs import JobManager
-from app.web.models import AnswerRequest, JobCreated, JobSnapshot, ParseOptions, ResumeRequest
+from app.web.models import (
+    AnswerRequest,
+    BuildReportRequest,
+    JobCreated,
+    JobSnapshot,
+    ParseOptions,
+    PatchDecisionRequest,
+    ResumeRequest,
+    ScholarResumeRequest,
+    ScholarTaskRequest,
+)
 from app.web.runtime import EmitProgress, LocalRAGWebRuntime
 
 
@@ -54,6 +73,28 @@ class WebRuntime(Protocol):
 
 
 def _http_error(error: Exception) -> HTTPException:
+    # Patch approval errors also expose ``code``.  Handle them before the
+    # generic runtime-code mapping so PATCH_NOT_FOUND keeps its established
+    # 404 contract instead of being flattened into a generic 400.
+    if isinstance(error, PatchApprovalError):
+        status = 404 if error.code == "PATCH_NOT_FOUND" else 409
+        return HTTPException(status_code=status, detail={"code": error.code, "message": str(error)})
+    code = getattr(error, "code", None)
+    if isinstance(code, str):
+        status_by_code = {
+            "CAPABILITY_DENIED": 403,
+            "CAPABILITY_VIOLATION": 403,
+            "CHECKPOINT_UNAVAILABLE": 503,
+            "CONFIGURATION_ERROR": 503,
+            "PROVIDER_UNAVAILABLE": 503,
+            "RESUME_UNAVAILABLE": 409,
+            "DOMAIN_CONFLICT": 409,
+            "RUN_CORRELATION_INVALID": 409,
+        }
+        return HTTPException(
+            status_code=status_by_code.get(code, 400),
+            detail={"code": code, "message": str(error)},
+        )
     if isinstance(error, KeyError):
         return HTTPException(status_code=404, detail=str(error).strip("'"))
     if isinstance(error, (OSError, ValueError)):
@@ -66,20 +107,49 @@ def create_app(
     *,
     runtime: WebRuntime | None = None,
     jobs: JobManager | None = None,
+    approval_service: PatchApprovalService | None = None,
+    latex_bridge: LatexBridgeService | None = None,
+    scholar_harness: Any | None = None,
 ) -> FastAPI:
     """创建可测试的 API；默认使用仓库根目录和本地长驻 Runtime。"""
 
     root = (project_root or Path(__file__).resolve().parents[2]).resolve()
+    supplied_runtime = runtime is not None
     web_runtime: WebRuntime = runtime or LocalRAGWebRuntime(root)
+    production_factory: Any | None = None
+    if not supplied_runtime and scholar_harness is None:
+        # The default deployment path owns one complete Scholar Runtime. Test
+        # callers can still inject a lightweight WebRuntime/Harness pair.
+        from app.scholar.composition import ScholarRuntimeFactory
+
+        production_factory = ScholarRuntimeFactory(root)
     job_manager = jobs or JobManager(max_workers=2, project_root=root)
+    project_store = ScholarProjectStore(root)
+    patch_approval = approval_service or PatchApprovalService(
+        root,
+        project_store=project_store,
+    )
+    build_bridge = latex_bridge or LatexBridgeService(
+        root,
+        project_store=project_store,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        yield
-        job_manager.close()
-        close_runtime = getattr(web_runtime, "close", None)
-        if callable(close_runtime):
-            close_runtime()
+        try:
+            if production_factory is not None:
+                bundle = production_factory.build()
+                app.state.scholar_runtime = bundle
+                app.state.scholar_harness = bundle.harness
+            yield
+        finally:
+            if production_factory is not None:
+                production_factory.close()
+                app.state.scholar_runtime = None
+            job_manager.close()
+            close_runtime = getattr(web_runtime, "close", None)
+            if callable(close_runtime):
+                close_runtime()
 
     app = FastAPI(
         title="LEO Research Agent API",
@@ -88,6 +158,11 @@ def create_app(
     )
     app.state.runtime = web_runtime
     app.state.jobs = job_manager
+    app.state.patch_approval = patch_approval
+    app.state.latex_bridge = build_bridge
+    app.state.scholar_harness = scholar_harness or getattr(web_runtime, "scholar_harness", None)
+    app.state.scholar_runtime = None
+    app.state.scholar_runtime_factory = production_factory
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -102,6 +177,126 @@ def create_app(
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/api/scholar/patches/{patch_id}")
+    def patch_preview(patch_id: str) -> dict[str, Any]:
+        try:
+            preview = patch_approval.get_preview(patch_id)
+            return {"preview": asdict(preview)}
+        except Exception as error:
+            raise _http_error(error) from error
+
+    @app.post("/api/scholar/requests")
+    def scholar_request(request: ScholarTaskRequest) -> dict[str, Any]:
+        harness = app.state.scholar_harness
+        if harness is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "SCHOLAR_HARNESS_NOT_CONFIGURED", "message": "Scholar Harness 未配置。"},
+            )
+        try:
+            result = harness.scholar_request(
+                request.instruction,
+                request.project_id,
+                session_id=request.session_id,
+                task_type=request.task_type,
+                thread_id=request.thread_id,
+            )
+            return result.to_dict() if callable(getattr(result, "to_dict", None)) else dict(result)
+        except Exception as error:
+            raise _http_error(error) from error
+
+    @app.post("/api/scholar/requests/resume")
+    def resume_scholar_request(request: ScholarResumeRequest) -> dict[str, Any]:
+        harness = app.state.scholar_harness
+        if harness is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "SCHOLAR_HARNESS_NOT_CONFIGURED", "message": "Scholar Harness 未配置。"},
+            )
+        try:
+            result = harness.resume(
+                request.thread_id,
+                request.resume_value,
+                request.project_id,
+                instruction=request.instruction,
+                session_id=request.session_id,
+                task_type=request.task_type,
+            )
+            return result.to_dict() if callable(getattr(result, "to_dict", None)) else dict(result)
+        except Exception as error:
+            raise _http_error(error) from error
+
+    @app.post("/api/scholar/patches/{patch_id}/accept")
+    def accept_patch(patch_id: str, request: PatchDecisionRequest) -> Response:
+        try:
+            result = patch_approval.approve(
+                PatchApprovalRequest(
+                    patch_id=patch_id,
+                    project_id=request.project_id,
+                    decision="ACCEPT",
+                    expected_base_hash=request.expected_base_hash,
+                    actor=request.actor,
+                )
+            )
+        except Exception as error:
+            raise _http_error(error) from error
+        status_code = 409 if result.error_code else 200
+        return JSONResponse(asdict(result), status_code=status_code)
+
+    @app.post("/api/scholar/patches/{patch_id}/reject")
+    def reject_patch(patch_id: str, request: PatchDecisionRequest) -> dict[str, Any]:
+        try:
+            result = patch_approval.reject(
+                PatchApprovalRequest(
+                    patch_id=patch_id,
+                    project_id=request.project_id,
+                    decision="REJECT",
+                    expected_base_hash=request.expected_base_hash,
+                    actor=request.actor,
+                )
+            )
+            return asdict(result)
+        except Exception as error:
+            raise _http_error(error) from error
+
+    @app.post("/api/scholar/projects/{project_id}/build")
+    def request_build(project_id: str, patch_id: str | None = None) -> dict[str, Any]:
+        try:
+            return asdict(build_bridge.request_build(project_id, patch_id=patch_id))
+        except Exception as error:
+            raise _http_error(error) from error
+
+    @app.get("/api/scholar/projects/{project_id}/diagnostics")
+    def project_diagnostics(project_id: str) -> dict[str, Any]:
+        try:
+            latest = build_bridge.latest(project_id)
+            return {
+                "project_id": project_id,
+                "build": asdict(latest) if latest is not None else None,
+                "diagnostics": [asdict(value) for value in build_bridge.diagnostics(project_id)],
+            }
+        except Exception as error:
+            raise _http_error(error) from error
+
+    @app.post("/api/scholar/projects/{project_id}/build/report")
+    def report_build(project_id: str, request: BuildReportRequest) -> dict[str, Any]:
+        try:
+            diagnostics = tuple(
+                normalize_diagnostic(value)
+                for value in request.diagnostics
+            )
+            result = build_bridge.report_build(
+                project_id,
+                build_id=request.build_id,
+                status=request.status,
+                diagnostics=diagnostics,
+                completed_at=request.completed_at,
+                message=request.message,
+            )
+            return asdict(result)
+        except Exception as error:
+            raise _http_error(error) from error
 
     @app.get("/api/system/status")
     def system_status() -> dict[str, Any]:

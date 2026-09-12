@@ -50,6 +50,7 @@ class LangChainHarnessAgentService:
         action_decider: Any | None = None,
         scope_reader: Any | None = None,
         validation_llm_call: bool = False,
+        checkpointer: Any | None = None,
     ) -> None:
         self.delegate = delegate
         self.translation_skill = translation_skill
@@ -63,6 +64,7 @@ class LangChainHarnessAgentService:
             scope_reader=scope_reader,
             action_decider=action_decider,
             tool_handlers=tool_handlers,
+            checkpointer=checkpointer,
         )
 
     def _run_research(self, state: Mapping[str, Any]) -> dict[str, Any]:
@@ -449,6 +451,7 @@ def build_langchain_agent_service(
     session_store: Any | None = None,
     extra_tools: Mapping[str, Any] | None = None,
     semantic_validation_enabled: bool = True,
+    checkpointer: Any | None = None,
 ) -> LangChainHarnessAgentService:
     """唯一生产组装点：Agent 检索必经 LangChain 双 Tool 编排。"""
 
@@ -545,4 +548,5 @@ def build_langchain_agent_service(
             state["workspace_id"], state["scope_version"]
         ),
         validation_llm_call=semantic_judge is not None,
+        checkpointer=checkpointer,
     )
