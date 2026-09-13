@@ -637,6 +637,7 @@ class LocalRAGWebRuntime:
         """只返回可展示配置，绝不包含 API Key。"""
 
         llm = load_local_llm_settings(self.project_root)
+        from app.knowledge.corpus import corpus_summary
         from app.knowledge_engine import knowledge_serving_status
 
         serving = knowledge_serving_status(self.project_root)
@@ -651,6 +652,7 @@ class LocalRAGWebRuntime:
             "reranker_revision": self.config.reranker_revision,
             "local_files_only": self.config.local_files_only,
             "models_initialized": self._retrieval is not None,
+            "corpus_summary": corpus_summary(self.project_root).to_dict(),
             **serving,
             "candidate_limit": self.agentic_config.candidate_limit,
             "rerank_top_k": self.agentic_config.rerank_top_k,

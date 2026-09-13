@@ -124,6 +124,9 @@ class LibraryStatus:
         payload = asdict(self)
         payload["canonical_issues"] = [asdict(issue) for issue in self.canonical_issues]
         payload["catalog_issues"] = [asdict(issue) for issue in self.catalog_issues]
+        from app.knowledge.corpus import corpus_summary
+
+        payload["corpus_summary"] = corpus_summary(Path(self.catalog_path).parents[2]).to_dict()
         return payload
 
 

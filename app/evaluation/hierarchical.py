@@ -233,6 +233,9 @@ def evaluate_hierarchical(
         },
         "per_question": rows,
     }
+    from app.knowledge.corpus import corpus_summary
+
+    report["corpus_summary"] = corpus_summary(root).to_dict()
     if output_path is not None:
         resolved = output_path.expanduser().resolve()
         report["output_path"] = str(resolved)

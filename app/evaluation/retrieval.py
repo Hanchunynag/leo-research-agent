@@ -311,6 +311,9 @@ def evaluate_bm25(
         k_values=k_values,
     )
     report["questions_path"] = str(questions_path.expanduser().resolve())
+    from app.knowledge.corpus import corpus_summary
+
+    report["corpus_summary"] = corpus_summary(root).to_dict()
     if output_path is not None:
         resolved_output = output_path.expanduser().resolve()
         report["output_path"] = str(resolved_output)
@@ -355,6 +358,9 @@ def evaluate_dense(
     )
     report["model_name"] = getattr(provider, "model_name", None)
     report["model_revision"] = getattr(provider, "revision", None)
+    from app.knowledge.corpus import corpus_summary
+
+    report["corpus_summary"] = corpus_summary(root).to_dict()
     report["questions_path"] = str(questions_path.expanduser().resolve())
     if output_path is not None:
         resolved_output = output_path.expanduser().resolve()
@@ -406,6 +412,9 @@ def evaluate_hybrid_rrf(
     report["model_revision"] = getattr(provider, "revision", None)
     report["candidate_limit_per_source"] = candidate_limit
     report["rrf_k"] = rrf_k
+    from app.knowledge.corpus import corpus_summary
+
+    report["corpus_summary"] = corpus_summary(root).to_dict()
     report["questions_path"] = str(questions_path.expanduser().resolve())
     if output_path is not None:
         resolved_output = output_path.expanduser().resolve()
@@ -426,6 +435,7 @@ def evaluate_candidate_pool_oracle(
 
     from app.retrieval.dense import search_dense_evidence
     from app.retrieval.hybrid import reciprocal_rank_fusion
+    from app.knowledge.corpus import corpus_summary
 
     root = project_root.expanduser().resolve()
     questions = load_retrieval_questions(questions_path)
@@ -518,6 +528,7 @@ def evaluate_candidate_pool_oracle(
         "rrf_k": rrf_k,
         "model_name": getattr(provider, "model_name", None),
         "model_revision": getattr(provider, "revision", None),
+        "corpus_summary": corpus_summary(root).to_dict(),
         "union_top_n_each": {
             **pool_summary(union_recalls),
             "mean_candidate_count": round(sum(union_sizes) / len(union_sizes), 3),
@@ -668,6 +679,8 @@ def evaluate_reranked(
 
     reranking_seconds = sum(reranking_ms) / 1000
     total_seconds = sum(total_ms) / 1000
+    from app.knowledge.corpus import corpus_summary
+
     report.update(
         {
             "embedding_model_name": getattr(embedding_provider, "model_name", None),
@@ -699,6 +712,7 @@ def evaluate_reranked(
                 ),
             },
             "questions_path": str(questions_path.expanduser().resolve()),
+            "corpus_summary": corpus_summary(root).to_dict(),
         }
     )
     if output_path is not None:

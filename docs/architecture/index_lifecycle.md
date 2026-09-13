@@ -16,7 +16,9 @@ paper.json
      -> qdrant_dense replacement + dense_manifest.json
 ```
 
-实现分别位于 [`app/chunking/builder.py`](../../app/chunking/builder.py)、[`app/indexing/bm25.py`](../../app/indexing/bm25.py) 和 [`app/indexing/dense.py`](../../app/indexing/dense.py)。BM25 读取时用 chunks digest 拒绝 stale index；Dense 用 manifest 校验模型、revision、text policy 和 chunks digest。
+实现分别位于 [`app/chunking/builder.py`](../../app/chunking/builder.py)、[`app/indexing/bm25.py`](../../app/indexing/bm25.py) 和 [`app/indexing/dense.py`](../../app/indexing/dense.py)。BM25 读取时用 chunks digest 拒绝 stale index；Dense 用 manifest 校验模型、revision/artifact fingerprint、text policy、tokenizer/chunk policy、向量配置和 chunks digest；无法证明 Provider 与索引兼容时拒绝查询。
+
+CLI、Web 和 Evaluation 的数量口径统一由 [`app/knowledge/corpus.py`](../../app/knowledge/corpus.py) 的 `CorpusSummary` 提供。`paper_count` 包含 metadata-only 发现记录，`indexed_document_count` 只表示已经进入当前检索投影的文档，二者不得直接比较为同一个数量。
 
 ### GraphRAG 增量路径
 

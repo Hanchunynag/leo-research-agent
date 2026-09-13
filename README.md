@@ -85,6 +85,27 @@ span 和 CitationBinding/BibKey；未解决 CitationRequirement 会明确显示�
 DeepSeek Provider 恢复后，必须重新通过四类 Production E2E、Human Approval Apply、
 LaTeX 更新和 Restart Resume，才可更新为 `V1 COMPLETE`。
 
+### Corpus Statistics 与 Index Provenance
+
+所有 CLI、Web 和离线评测使用同一个 `CorpusSummary` 统计边界，可通过以下命令查看：
+
+```bash
+./.venv/bin/python main.py library status
+```
+
+其中 `paper_count` 是 Paper metadata 总数，包含尚未下载和解析的
+`abstract_only` 外部发现记录；`canonical_document_count`、`indexed_paper_count`
+和 `indexed_document_count` 只统计已经进入本地 Canonical/Chunk 检索链路的论文。
+因此当前 workspace 的 `paper_count=27`、`canonical_document_count=15` 并不矛盾，
+差额是 12 条 metadata-only 外部记录。当前统一统计为：15 canonical documents、
+15 indexed papers/documents、281 sections、283 chunks/searchable chunks，BM25 和
+Dense 各覆盖 283 chunks；Paper BM25 和 Paper Dense 各覆盖 27 条 metadata。
+
+`CorpusSummary` 同时输出 `corpus_revision`、`chunks_digest`、`papers_digest` 和
+索引覆盖状态。Dense manifest 还固定记录 embedding provider/model/revision 或
+local artifact fingerprint、向量维度、距离度量、归一化、chunk/tokenizer policy
+和 index schema；Provider 与 manifest 不一致时会拒绝查询并要求重建索引。
+
 ### 可复现 Demo 与 Evaluation
 
 `examples/scholar-demo/` 是一个小型但真实主题的 LEO LaTeX Project。使用现有
@@ -1117,7 +1138,8 @@ Web Runtime 默认 `LEO_WEB_LOCAL_FILES_ONLY=true`，不会因打开页面而下
 `.env.example` 中的 `LEO_WEB_*`。如果未显式设置
 `LEO_WEB_EMBEDDING_MODEL/REVISION`，Web Runtime 会自动继承已有
 `dense_manifest.json` 中的模型名和精确 revision，保证查询 Provider 与建库
-Provider 一致，不会为了修复配置而无效重算向量。
+Provider 一致；manifest 缺少可验证的 revision/fingerprint 或发生不一致时，
+查询会明确失败并要求重建向量索引。
 
 当前 Web 任务队列是单机进程内状态；持久化的是论文、索引、Session、Topic
 和 Evidence，正在运行的 `job_id` 不会跨 FastAPI 重启恢复。为了保护本地
@@ -1493,7 +1515,7 @@ PDF。
 | 本地 BM25 索引 | 已完成 |
 | 带页码/block 的关键词证据检索 | 已完成 |
 | block 级检索评测集与 BM25 基线 | 已完成 |
-| BGE-M3 单向量与 Qdrant local Manifest 索引 | 已完成 |
+| BGE-M3 单向量与 Qdrant local Manifest 索引（含 revision/artifact provenance） | 已完成 |
 | Dense 基线与逐题退化分析 | 已完成 |
 | BM25 + Dense RRF 混合检索基线 | 已完成 |
 | 联合候选池 Oracle Recall | 已完成 |

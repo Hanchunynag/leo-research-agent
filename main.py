@@ -1461,7 +1461,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             minimum_chunk_tokens=args.min_chunk_tokens,
             overlap_tokens=args.overlap_tokens,
         )
-        print_json(knowledge_report.to_dict())
+        from app.knowledge.corpus import corpus_summary
+
+        print_json({
+            **knowledge_report.to_dict(),
+            "corpus_summary": corpus_summary(PROJECT_ROOT).to_dict(),
+        })
         if knowledge_report.issues:
             raise SystemExit(1)
         return
@@ -1736,17 +1741,34 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     if args.command == "evaluate":
+        from app.knowledge.corpus import corpus_summary
+        from app.storage import write_json_atomic
+
+        def finish_evaluation(report: dict[str, Any], output: Path | None) -> None:
+            if output is not None:
+                write_json_atomic(output.expanduser().resolve(), report)
+            print_json(report)
+
         if args.evaluate_command == "graphrag":
             from app.evaluation.graphrag import evaluate_files
-            print_json(evaluate_files(args.questions, args.predictions, args.output))
+
+            report = evaluate_files(args.questions, args.predictions, args.output)
+            report["corpus_summary"] = corpus_summary(PROJECT_ROOT).to_dict()
+            finish_evaluation(report, args.output)
             return
         if args.evaluate_command == "agent":
             from app.evaluation.agent import evaluate_agent_files
-            print_json(evaluate_agent_files(args.questions, args.predictions, args.output))
+
+            report = evaluate_agent_files(args.questions, args.predictions, args.output)
+            report["corpus_summary"] = corpus_summary(PROJECT_ROOT).to_dict()
+            finish_evaluation(report, args.output)
             return
         if args.evaluate_command == "generation":
             from app.evaluation.generation import evaluate_generation_files
-            print_json(evaluate_generation_files(args.predictions, args.output))
+
+            report = evaluate_generation_files(args.predictions, args.output)
+            report["corpus_summary"] = corpus_summary(PROJECT_ROOT).to_dict()
+            finish_evaluation(report, args.output)
             return
         if args.evaluate_command == "hierarchical":
             from app.evaluation.hierarchical import evaluate_hierarchical
@@ -1767,7 +1789,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 max_chunks_per_work=args.max_chunks_per_work,
                 rrf_k=args.rrf_k,
             )
-            print_json(report)
+            finish_evaluation(report, args.output)
             return
         from app.evaluation.retrieval import (
             evaluate_bm25,
