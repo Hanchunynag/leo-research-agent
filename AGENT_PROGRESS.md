@@ -206,3 +206,5 @@ deployment, advanced citation recommendation, and complex Context Compression
 remain Future Work. Known limitations remain: the LaTeX compiler is external to
 the Bridge, cross-file Apply is ordered and can report `PARTIAL_APPLY`, and real
 external Web availability depends on provider/network configuration.
+
+**Release Status:** `NOT RELEASED — EXTERNAL_PROVIDER_UNAVAILABLE`

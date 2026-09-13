@@ -81,6 +81,10 @@ Run Event 使用 Run-local 单调 cursor；断线后的订阅从最后 cursor �
 去重。Evidence 展开项包含 Claim、source locator、identity、日期、验证状态、证据
 span 和 CitationBinding/BibKey；未解决 CitationRequirement 会明确显示为待人工审核。
 
+当前 V1 Release Status：`NOT RELEASED — EXTERNAL_PROVIDER_UNAVAILABLE`。真实
+DeepSeek Provider 恢复后，必须重新通过四类 Production E2E、Human Approval Apply、
+LaTeX 更新和 Restart Resume，才可更新为 `V1 COMPLETE`。
+
 ### 可复现 Demo 与 Evaluation
 
 `examples/scholar-demo/` 是一个小型但真实主题的 LEO LaTeX Project。使用现有

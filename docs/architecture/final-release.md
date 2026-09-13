@@ -68,3 +68,5 @@ verified with `SqliteSaver`, local retrieval configuration and managed shutdown,
 but the configured DeepSeek endpoint currently returns HTTP 402
 `Insufficient Balance`. Consequently the four Domain flows and Human Approval
 release gate remain pending an available external LLM account.
+
+**Release Status:** `NOT RELEASED — EXTERNAL_PROVIDER_UNAVAILABLE`
