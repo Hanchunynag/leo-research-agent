@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -242,7 +242,10 @@ def create_app(
             raise _http_error(error) from error
 
     @app.get("/api/scholar/runs/{run_id}/events")
-    async def scholar_run_events(run_id: str, after: int = 0) -> StreamingResponse:
+    async def scholar_run_events(
+        run_id: str,
+        after: int = Query(default=0, ge=0),
+    ) -> StreamingResponse:
         try:
             app.state.scholar_console.run_snapshot(run_id)
         except Exception as error:
@@ -250,11 +253,13 @@ def create_app(
 
         async def stream() -> AsyncIterator[str]:
             events = app.state.scholar_console.run_events(run_id)
-            for index, event in enumerate(events):
-                if index < after:
+            for event in events:
+                cursor = int(event["cursor"])
+                if cursor <= after:
                     continue
                 payload = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                yield f"id: {index + 1}\nevent: scholar_run\ndata: {payload}\n\n"
+                yield f"id: {cursor}\nevent: scholar_run\ndata: {payload}\n\n"
+            yield "event: end\ndata: {}\n\n"
 
         return StreamingResponse(
             stream(),

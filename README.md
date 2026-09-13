@@ -77,6 +77,9 @@ fixture 结果写入 Project。
 
 Console 的后端读模型、Run Event/SSE replay、Evidence/Citation 和 Demo 边界见
 [`docs/architecture/scholar-console.md`](docs/architecture/scholar-console.md)。
+Run Event 使用 Run-local 单调 cursor；断线后的订阅从最后 cursor 重放并按 event_id
+去重。Evidence 展开项包含 Claim、source locator、identity、日期、验证状态、证据
+span 和 CitationBinding/BibKey；未解决 CitationRequirement 会明确显示为待人工审核。
 
 ### 可复现 Demo 与 Evaluation
 

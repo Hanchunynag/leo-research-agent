@@ -300,7 +300,9 @@ h1, h2, h3, p { margin-top: 0; }
 .web-tag { color: #8a4b22; background: #f4e1d2; }
 .local-tag { color: var(--console-green); background: #dfeee5; }
 .citation-chain { margin-top: 13px; color: var(--console-muted); font: 9px "IBM Plex Mono", monospace; line-height: 1.6; }
+.citation-requirement { margin-top: 7px; padding: 8px 10px; color: var(--console-orange); background: #fff8ed; font: 9px "IBM Plex Mono", monospace; line-height: 1.5; overflow-wrap: anywhere; }
 .section-list { display: grid; gap: 2px; }
+.section-record { padding: 2px 0 5px; border-bottom: 1px solid #ebe9e1; }
 .section-row { display: grid; grid-template-columns: 8px minmax(72px, .35fr) minmax(100px, 1fr) auto auto; align-items: center; gap: 8px; padding: 9px 0; border-bottom: 1px solid #ebe9e1; }
 .section-row strong { font-size: 11px; }
 .section-row code, .section-row small { color: var(--console-muted); font: 9px "IBM Plex Mono", monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -310,6 +312,8 @@ h1, h2, h3, p { margin-top: 0; }
 .current-label, .stale-label { font: 8px "IBM Plex Mono", monospace; }
 .current-label { color: var(--console-green); }
 .stale-label { color: var(--console-orange); }
+.section-detail { padding: 0 0 6px 15px; color: var(--console-muted); font: 9px "IBM Plex Mono", monospace; line-height: 1.5; overflow-wrap: anywhere; }
+.warning-detail { color: var(--console-orange); }
 .patch-callout { display: grid; gap: 5px; margin-top: 14px; padding-top: 13px; border-top: 1px solid var(--console-line); }
 .patch-callout strong { color: var(--console-blue); font: 600 11px "IBM Plex Mono", monospace; }
 .patch-callout span:last-child { color: var(--console-muted); font-size: 10px; }

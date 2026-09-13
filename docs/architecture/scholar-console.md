@@ -34,10 +34,12 @@ RUN_STARTED → SKILL_SELECTED → RESEARCH/EVIDENCE → DRAFT/REVIEW
 → PATCH_CREATED → WAITING_USER → RUN_COMPLETED/FAILED/INTERRUPTED
 ```
 
-事件的 `event_id` 使用 `run_id` 前缀和稳定顺序。当前 Scholar Request API 是
-同步 Domain 调用，因此 SSE 端点提供持久化 trace 的 replay stream；`after` cursor
-用于断线后从指定位置重放。它不是一个绕过 Harness 的第二个 publisher。若需要
-更长任务的即时更新，调用方可以在完成 snapshot 后继续订阅同一事件端点。
+事件的 `event_id` 使用 `run_id` 前缀和稳定顺序，`cursor` 是从 1 开始的单调
+Run-local 序号。SSE 的 `after` 表示客户端最后已消费的 cursor，服务端只发送
+更大的 cursor，并以 `event: end` 结束一次 replay。前端收到重复事件时按
+`event_id` 去重，连接异常则从最后 cursor 退避重连；旧连接的迟到事件不会污染
+新 Run。当前 Scholar Request API 是同步 Domain 调用，因此该 SSE 端点是持久化
+trace 的 replay stream，不是绕过 Harness 的第二个 publisher。
 
 ## Read models
 
@@ -46,10 +48,12 @@ RUN_STARTED → SKILL_SELECTED → RESEARCH/EVIDENCE → DRAFT/REVIEW
 - Workflow：Supervisor、Skill、Research/Validation、Writing、Reviewer、Patch
   和 Human Approval 的状态、摘要、耗时和有限 metadata。
 - Evidence/Citation：只显示 Verified Evidence 或已持久化的 external audit
-  projection；未验证 Discovery Candidate 不会被渲染成证据。Citation 状态仍由
-  `CitationBinding` / `CitationRequirement` 表达。
+  projection；校验状态和 content hash 必须匹配，未验证 Discovery Candidate 不会
+  被渲染成证据。视图同时提供 claim、source、identity、日期、locator、evidence span、
+  validation、CitationBinding/BibKey 和 Patch reference。
 - Manuscript State：直接读取 `ManuscriptSynchronizer` 和 Project Store，展示
-  section path/hash/version、CURRENT/STALE、dependency 和最后一个 Patch。
+  section path/hash/version、CURRENT/STALE、dependency reason、review status 和
+  最后一个 Patch。
 - Evaluation：读取 `ScholarHarnessEvaluationSuite` 的确定性指标，不由前端
   根据文字猜测 PASS/FAIL，也不把文本质量伪装成精确分数。
 

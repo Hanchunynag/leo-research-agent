@@ -8,10 +8,11 @@ small event vocabulary suitable for a browser and SSE replay.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, is_dataclass
-from datetime import UTC, datetime
+import hashlib
+from dataclasses import asdict, dataclass, field, is_dataclass
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from app.scholar.evaluation import HarnessEvaluationCase, ScholarHarnessEvaluationSuite
 from app.scholar.manuscript import ManuscriptSynchronizer
@@ -26,6 +27,8 @@ def _jsonable(value: Any) -> Any:
         return {str(key): _jsonable(child) for key, child in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
         return [_jsonable(child) for child in value]
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
     if hasattr(value, "to_dict") and callable(value.to_dict):
         return _jsonable(value.to_dict())
     return value
@@ -42,9 +45,79 @@ def _status(value: Any) -> str:
         "success": "COMPLETED",
         "failed": "FAILED",
         "running": "RUNNING",
+        "pending": "PENDING",
+        "queued": "PENDING",
         "waiting_user": "WAITING_USER",
         "interrupted": "INTERRUPTED",
+        "cancelled": "FAILED",
+        "skipped": "COMPLETED",
     }.get(raw, raw.upper())
+
+
+RunEventType = Literal[
+    "RUN_STARTED",
+    "RUN_RESUMED",
+    "SKILL_SELECTED",
+    "CONTEXT_ASSEMBLED",
+    "SUBAGENT_STARTED",
+    "SUBAGENT_COMPLETED",
+    "TOOL_STARTED",
+    "TOOL_COMPLETED",
+    "RESEARCH_COMPLETED",
+    "EVIDENCE_VERIFIED",
+    "DOMAIN_RESULT",
+    "DRAFT_CREATED",
+    "REVIEW_STARTED",
+    "REVIEW_COMPLETED",
+    "PATCH_CREATED",
+    "CHECKPOINT_SAVED",
+    "WAITING_USER",
+    "RUN_INTERRUPTED",
+    "RUN_COMPLETED",
+    "RUN_FAILED",
+]
+RunEventStatus = Literal[
+    "PENDING",
+    "RUNNING",
+    "COMPLETED",
+    "FAILED",
+    "WAITING_USER",
+    "INTERRUPTED",
+]
+_RUN_EVENT_TYPES = frozenset(RunEventType.__args__)
+_RUN_EVENT_STATUSES = frozenset(RunEventStatus.__args__)
+
+
+@dataclass(frozen=True, slots=True)
+class RunEvent:
+    """Stable read-only event contract projected from persisted Harness trace."""
+
+    event_id: str
+    cursor: int
+    run_id: str
+    session_id: str | None
+    timestamp: str
+    type: RunEventType
+    node: str
+    status: RunEventStatus
+    summary: str
+    duration_ms: float | int | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.event_id.strip() or not self.run_id.strip():
+            raise ValueError("RunEvent event_id/run_id 不能为空。")
+        if self.cursor < 1:
+            raise ValueError("RunEvent cursor 必须从 1 开始。")
+        if not self.node.strip() or not self.summary.strip():
+            raise ValueError("RunEvent node/summary 不能为空。")
+        if self.type not in _RUN_EVENT_TYPES:
+            raise ValueError(f"RunEvent type 不受支持：{self.type}")
+        if self.status not in _RUN_EVENT_STATUSES:
+            raise ValueError(f"RunEvent status 不受支持：{self.status}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(asdict(self))
 
 
 def _is_verified_evidence(value: Mapping[str, Any]) -> bool:
@@ -57,13 +130,19 @@ def _is_verified_evidence(value: Mapping[str, Any]) -> bool:
 
     metadata = value.get("metadata") if isinstance(value.get("metadata"), Mapping) else {}
     status = str(value.get("validation_status") or metadata.get("validation_status") or "").casefold()
-    if status in {"", "candidate", "unverified", "rejected", "invalid", "failed"}:
+    if not (
+        status == "verified"
+        or "verified" in status
+        or "validated" in status
+    ):
         return False
     content = value.get("content") or value.get("text") or metadata.get("content") or metadata.get("text")
     if not value.get("content_hash") or not content:
         return False
+    if hashlib.sha256(str(content).encode("utf-8")).hexdigest() != str(value["content_hash"]):
+        return False
     source_type = value.get("source_type") or metadata.get("source_type")
-    if source_type == "WEB_LITERATURE":
+    if str(source_type).casefold() == "web_literature":
         return bool(value.get("canonical_id") and value.get("source_locator"))
     return bool(
         (value.get("paper_id") or metadata.get("paper_id"))
@@ -71,24 +150,24 @@ def _is_verified_evidence(value: Mapping[str, Any]) -> bool:
     )
 
 
-def _event_type(kind: str, name: str, *, terminal: bool = False, resumed: bool = False) -> str:
-    if terminal:
-        return "RUN_COMPLETED"
-    if resumed:
-        return "RUN_RESUMED"
+def _event_type(kind: str, name: str, *, task_type: str | None = None) -> RunEventType:
     normalized = name.casefold()
-    if normalized in {"get_project_context", "read_file"}:
+    if normalized == "harness_context":
+        return "CONTEXT_ASSEMBLED"
+    if normalized == "harness_plan":
+        return "SKILL_SELECTED"
+    if normalized == "harness_result":
+        return "DOMAIN_RESULT"
+    if normalized in {"get_project_context", "read_file", "get_patch_status"}:
         return "TOOL_COMPLETED"
     if normalized == "research_evidence":
         return "RESEARCH_COMPLETED"
     if normalized == "review_draft":
         return "REVIEW_COMPLETED"
     if normalized == "execute_scholar_skill":
-        return "PATCH_CREATED" if kind == "tool" else "DRAFT_CREATED"
+        return "DOMAIN_RESULT" if task_type == "SUPPORT_CLAIM" else "DRAFT_CREATED"
     if normalized.startswith("web_") or normalized.startswith("evidence_"):
         return "EVIDENCE_VERIFIED" if "validate" in normalized or "verified" in normalized else "RESEARCH_COMPLETED"
-    if normalized in {"harness_context", "harness_plan"}:
-        return "SKILL_SELECTED" if normalized == "harness_plan" else "RUN_STARTED"
     if "checkpoint" in normalized:
         return "CHECKPOINT_SAVED"
     return "TOOL_COMPLETED" if kind == "tool" else "SUBAGENT_COMPLETED"
@@ -103,14 +182,22 @@ class ScholarConsoleProjection:
         self.session_manager = session_manager or SessionManager(self.project_root)
 
     def _find_run(self, run_id: str) -> tuple[Any, Any, dict[str, Any]]:
+        requested = run_id.strip()
+        if not requested:
+            raise KeyError("Run ID 不能为空。")
         for session in self.session_manager.list(include_deleted=False):
+            session_project = getattr(session, "project_id", None)
+            if session_project and session_project != self.project_store.project_id:
+                continue
             runtime = self.session_manager.open(session.session_id)
             for run in runtime.list_runs():
-                if run.run_id != run_id:
+                if run.run_id != requested:
                     continue
-                result = next((item for item in runtime.list_results() if item["run_id"] == run_id), {})
+                if run.project_id and run.project_id != self.project_store.project_id:
+                    continue
+                result = next((item for item in runtime.list_results() if item["run_id"] == requested), {})
                 return run, session, result
-        raise KeyError(f"Run 不存在：{run_id}")
+        raise KeyError(f"Run 不存在：{requested}")
 
     @staticmethod
     def _metadata(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -155,57 +242,104 @@ class ScholarConsoleProjection:
     def run_events(self, run_id: str) -> list[dict[str, Any]]:
         snapshot = self.run_snapshot(run_id)
         run = snapshot["run"]
-        metadata = snapshot["routing"]
-        events: list[dict[str, Any]] = [{
-            "event_id": f"{run_id}:0",
-            "run_id": run_id,
-            "session_id": run.get("session_id"),
-            "timestamp": run.get("created_at") or _now(),
-            "type": "RUN_STARTED",
-            "node": "Supervisor",
-            "status": "COMPLETED" if run.get("status") != "RUNNING" else "RUNNING",
-            "summary": "Scholar Run started",
-            "metadata": {"selected_skill": metadata.get("selected_skill")},
-        }]
-        if metadata.get("resumed"):
-            events.append({
-                "event_id": f"{run_id}:resumed",
-                "run_id": run_id,
-                "session_id": run.get("session_id"),
-                "timestamp": run.get("started_at") or _now(),
-                "type": "RUN_RESUMED",
-                "node": "Supervisor",
-                "status": "COMPLETED",
-                "summary": "Scholar Run resumed from persistent checkpoint",
-                "metadata": {"thread_id": run.get("thread_id")},
-            })
+        routing = snapshot["routing"]
+        events: list[dict[str, Any]] = []
+        sequence = 0
+
+        def emit(
+            event_type: RunEventType,
+            *,
+            node: str,
+            status: str,
+            summary: str,
+            timestamp: str | None = None,
+            duration_ms: float | int | None = None,
+            metadata: Mapping[str, Any] | None = None,
+        ) -> None:
+            nonlocal sequence
+            sequence += 1
+            allowed_statuses = {"PENDING", "RUNNING", "COMPLETED", "FAILED", "WAITING_USER", "INTERRUPTED"}
+            normalized_status = status if status in allowed_statuses else "FAILED"
+            events.append(
+                RunEvent(
+                    event_id=f"{run_id}:{sequence}",
+                    cursor=sequence,
+                    run_id=run_id,
+                    session_id=run.get("session_id"),
+                    timestamp=timestamp or run.get("started_at") or run.get("created_at") or _now(),
+                    type=event_type,
+                    node=node,
+                    status=normalized_status,  # type: ignore[arg-type]
+                    summary=summary,
+                    duration_ms=duration_ms,
+                    metadata=_jsonable(dict(metadata or {})),
+                ).to_dict()
+            )
+
+        run_status = _status(run.get("status"))
+        start_status = {
+            "RUNNING": "RUNNING",
+            "PENDING": "PENDING",
+        }.get(run_status, "COMPLETED")
+        emit(
+            "RUN_STARTED",
+            node="Supervisor",
+            status=start_status,
+            summary="Scholar Run started",
+            timestamp=run.get("created_at"),
+            metadata={"selected_skill": routing.get("selected_skill")},
+        )
+        if routing.get("resumed"):
+            emit(
+                "RUN_RESUMED",
+                node="Supervisor",
+                status="COMPLETED",
+                summary="Scholar Run resumed from persistent checkpoint",
+                timestamp=run.get("started_at"),
+                metadata={"thread_id": run.get("thread_id")},
+            )
+
         harness = snapshot.get("harness", {})
         trace = harness.get("trace", []) if isinstance(harness, Mapping) else []
-        for ordinal, item in enumerate(trace if isinstance(trace, list) else [], 1):
+        task_type = str(routing.get("task_type") or "")
+        for item in trace if isinstance(trace, list) else []:
             if not isinstance(item, Mapping):
                 continue
             name = str(item.get("name") or item.get("stage") or "step")
+            normalized_name = name.casefold()
             kind = str(item.get("kind") or "step")
-            event_type = _event_type(kind, name)
-            node = {
-                "get_project_context": "Supervisor",
-                "read_file": "Skill",
-                "research_evidence": "Research Subagent",
-                "review_draft": "Reviewer",
-                "execute_scholar_skill": "Writing Runtime",
-            }.get(name, "Evidence / Runtime" if name.upper().startswith(("WEB_", "EVIDENCE_")) else name.replace("_", " ").title())
-            events.append({
-                "event_id": f"{run_id}:{ordinal}",
-                "run_id": run_id,
-                "session_id": run.get("session_id"),
-                "timestamp": run.get("started_at") or _now(),
-                "type": event_type,
-                "node": node,
-                "status": _status(item.get("status")),
-                "summary": name.replace("_", " ").title(),
-                "duration_ms": item.get("elapsed_ms"),
-                "metadata": _jsonable(item.get("details") or {}),
-            })
+            event_status = _status(item.get("status"))
+            event_type = _event_type(kind, name, task_type=task_type)
+            if event_status == "RUNNING":
+                event_type = "REVIEW_STARTED" if normalized_name == "review_draft" else "TOOL_STARTED" if kind == "tool" else "SUBAGENT_STARTED"
+            if normalized_name == "harness_plan":
+                node = str(routing.get("selected_skill") or "Skill")
+            elif normalized_name == "harness_context":
+                node = "Supervisor"
+            elif normalized_name == "execute_scholar_skill":
+                node = "Research Capability" if task_type == "SUPPORT_CLAIM" else "Writing Runtime"
+            elif normalized_name == "research_evidence":
+                node = "Research Subagent"
+            elif normalized_name == "review_draft":
+                node = "Reviewer"
+            elif normalized_name == "harness_result":
+                node = "Research Capability" if task_type == "SUPPORT_CLAIM" else "Writing Runtime"
+            elif normalized_name.startswith(("web_", "evidence_")):
+                node = "Evidence Validation" if "valid" in normalized_name or "verif" in normalized_name else "Research Subagent"
+            else:
+                node = name.replace("_", " ").title()
+            details = dict(item.get("details") or {}) if isinstance(item.get("details"), Mapping) else {}
+            details.update({"trace_name": name, "kind": kind})
+            emit(
+                event_type,
+                node=node,
+                status=event_status,
+                summary=name.replace("_", " ").title(),
+                timestamp=run.get("started_at"),
+                duration_ms=item.get("elapsed_ms"),
+                metadata=details,
+            )
+
         result = snapshot.get("result", {})
         value = result.get("value") if isinstance(result, Mapping) else None
         patch = value.get("patch") if isinstance(value, Mapping) else None
@@ -213,7 +347,7 @@ class ScholarConsoleProjection:
             patch_status = "AWAITING_APPROVAL"
             try:
                 stored_patch = self.project_store.get_patch(str(patch.get("patch_id") or ""))
-                patch_status = str(getattr(stored_patch, "status", patch_status))
+                patch_status = str(getattr(stored_patch, "status", patch_status)).upper()
             except (KeyError, ValueError):
                 pass
             approval_status, approval_summary = {
@@ -221,30 +355,35 @@ class ScholarConsoleProjection:
                 "REJECTED": ("COMPLETED", "DraftPatch rejected by human approval"),
                 "CONFLICT": ("FAILED", "DraftPatch approval encountered a conflict"),
                 "FAILED": ("FAILED", "DraftPatch apply failed"),
+                "APPROVED": ("RUNNING", "DraftPatch approved; applying changes"),
+                "APPLYING": ("RUNNING", "DraftPatch is being applied"),
             }.get(patch_status, ("WAITING_USER", "DraftPatch awaits human approval"))
-            events.append({
-                "event_id": f"{run_id}:patch",
-                "run_id": run_id,
-                "session_id": run.get("session_id"),
-                "timestamp": run.get("completed_at") or _now(),
-                "type": "WAITING_USER" if approval_status == "WAITING_USER" else "PATCH_CREATED",
-                "node": "Human Approval",
-                "status": approval_status,
-                "summary": approval_summary,
-                "metadata": {"patch_id": patch.get("patch_id"), "patch_status": patch_status},
-            })
-        terminal = "RUN_INTERRUPTED" if run.get("status") == "INTERRUPTED" else "RUN_FAILED" if run.get("status") == "FAILED" else "RUN_COMPLETED"
-        events.append({
-            "event_id": f"{run_id}:terminal",
-            "run_id": run_id,
-            "session_id": run.get("session_id"),
-            "timestamp": run.get("completed_at") or _now(),
-            "type": terminal,
-            "node": "Scholar Run",
-            "status": _status(run.get("status")),
-            "summary": snapshot.get("termination_reason") or terminal,
-            "metadata": {"termination_reason": snapshot.get("termination_reason")},
-        })
+            emit(
+                "WAITING_USER" if approval_status == "WAITING_USER" else "PATCH_CREATED",
+                node="Human Approval",
+                status=approval_status,
+                summary=approval_summary,
+                timestamp=run.get("completed_at"),
+                metadata={"patch_id": patch.get("patch_id"), "patch_status": patch_status},
+            )
+
+        terminal = {
+            "INTERRUPTED": ("RUN_INTERRUPTED", "INTERRUPTED"),
+            "FAILED": ("RUN_FAILED", "FAILED"),
+            "CANCELLED": ("RUN_FAILED", "FAILED"),
+            "WAITING_USER": ("WAITING_USER", "WAITING_USER"),
+            "COMPLETED": ("RUN_COMPLETED", "COMPLETED"),
+        }.get(str(run.get("status") or ""))
+        if terminal is not None:
+            event_type, terminal_status = terminal
+            emit(
+                event_type,  # type: ignore[arg-type]
+                node="Scholar Run",
+                status=terminal_status,
+                summary=str(snapshot.get("termination_reason") or event_type),
+                timestamp=run.get("completed_at"),
+                metadata={"termination_reason": snapshot.get("termination_reason")},
+            )
         return events
 
     def project_state(self, project_id: str) -> dict[str, Any]:
@@ -258,19 +397,51 @@ class ScholarConsoleProjection:
             patch = getattr(stored, "patch", None)
             if patch is not None:
                 patch_by_section[patch.target_section] = stored
+        sections: list[dict[str, Any]] = []
+        for name, section in sorted(state.sections.items()):
+            stored = patch_by_section.get(name)
+            dependencies = tuple(
+                sorted(
+                    source
+                    for source, dependents in ManuscriptSynchronizer.DEPENDENTS.items()
+                    if name.casefold() in {value.casefold() for value in dependents}
+                )
+            )
+            review_report = getattr(stored, "review_report", None)
+            patch_status = str(getattr(stored, "status", "")) if stored is not None else None
+            review_status = (
+                "NONE"
+                if stored is None
+                else "PASSED"
+                if review_report is not None and review_report.valid
+                else "NEEDS_USER_REVIEW"
+                if review_report is not None
+                else patch_status or "UNKNOWN"
+            )
+            if section.stale and dependencies:
+                dependency_reason = f"upstream section changed: {', '.join(dependencies)}"
+            elif section.stale:
+                dependency_reason = "section changed since the previous Project State"
+            else:
+                dependency_reason = None
+            item = _jsonable(section)
+            item.update(
+                {
+                    "dependencies": list(dependencies),
+                    "dependency_reason": dependency_reason,
+                    "last_patch": _jsonable(stored),
+                    "patch_status": patch_status,
+                    "review_status": review_status,
+                }
+            )
+            sections.append(item)
         return {
             "project_id": project_id,
             "root_tex": state.root_tex,
             "project_hash": state.project_hash,
             "version": state.version,
             "stale_sections": list(state.stale_sections),
-            "sections": [
-                {
-                    **_jsonable(section),
-                    "last_patch": _jsonable(patch_by_section.get(name)),
-                }
-                for name, section in sorted(state.sections.items())
-            ],
+            "sections": sections,
             "facts": _jsonable(self.project_store.list_facts()),
             "contributions": _jsonable(self.project_store.list_contributions()),
             "patches": _jsonable(patches),
@@ -285,7 +456,21 @@ class ScholarConsoleProjection:
             evidence_ids = binding.get("evidence_ids", ()) if isinstance(binding, Mapping) else ()
             for evidence_id in evidence_ids:
                 binding_by_evidence[str(evidence_id)] = binding
-        external = []
+        patches_by_evidence: dict[str, list[dict[str, Any]]] = {}
+        for stored in self.project_store.list_patches():
+            patch = getattr(stored, "patch", None)
+            if patch is None:
+                continue
+            patch_ref = {
+                "patch_id": patch.patch_id,
+                "target_section": patch.target_section,
+                "status": str(getattr(stored, "status", "UNKNOWN")),
+            }
+            for evidence_id in patch.used_evidence_ids:
+                patches_by_evidence.setdefault(str(evidence_id), []).append(patch_ref)
+
+        verified: list[dict[str, Any]] = []
+        claims: dict[str, dict[str, Any]] = {}
         for row in self.project_store.list_external_evidence_projections():
             item = dict(row)
             metadata = item.get("metadata_json")
@@ -295,33 +480,54 @@ class ScholarConsoleProjection:
                 except json.JSONDecodeError:
                     item["metadata"] = {}
                 item.pop("metadata_json", None)
+            item.setdefault("source_type", "WEB_LITERATURE")
             if not _is_verified_evidence(item):
                 continue
-            binding = binding_by_evidence.get(str(item.get("evidence_id")))
-            if binding is not None:
-                item["citation_binding"] = binding
-                item["bibkey"] = binding.get("bibkey")
-            external.append(item)
+            verified.append(item)
         citation_requirements: list[Any] = []
         if run_id:
             snapshot = self.run_snapshot(run_id)
             value = snapshot.get("result", {}).get("value")
-            seen = {str(item.get("evidence_id")) for item in external if item.get("evidence_id")}
+            seen = {str(item.get("evidence_id")) for item in verified if item.get("evidence_id")}
+
+            def collect_claim(candidate: Any) -> None:
+                if isinstance(candidate, Mapping):
+                    claim_id = candidate.get("claim_id") or candidate.get("subclaim_id")
+                    evidence_ids = candidate.get("evidence_ids")
+                    if evidence_ids is None:
+                        evidence_ids = (
+                            *(candidate.get("supporting_evidence_ids") or ()),
+                            *(candidate.get("qualifying_evidence_ids") or ()),
+                            *(candidate.get("counter_evidence_ids") or ()),
+                        )
+                    if claim_id:
+                        claims[str(claim_id)] = {
+                            "claim_id": str(claim_id),
+                            "text": str(candidate.get("text") or candidate.get("claim") or ""),
+                            "status": candidate.get("status") or candidate.get("support_status"),
+                            "evidence_ids": list(dict.fromkeys(str(item) for item in evidence_ids or () if item)),
+                        }
+                    for child in candidate.values():
+                        if isinstance(child, (Mapping, list, tuple)):
+                            collect_claim(child)
+                elif isinstance(candidate, (list, tuple)):
+                    for child in candidate:
+                        collect_claim(child)
 
             def collect(candidate: Any, *, evidence_context: bool = False) -> None:
                 if isinstance(candidate, Mapping):
-                    if evidence_context and candidate.get("evidence_id") and _is_verified_evidence(candidate) and candidate.get("evidence_id") not in seen:
+                    evidence_id = str(candidate.get("evidence_id") or "")
+                    if evidence_context and evidence_id and _is_verified_evidence(candidate) and evidence_id not in seen:
                         item = dict(candidate)
-                        binding = binding_by_evidence.get(str(item.get("evidence_id")))
-                        if binding is not None:
-                            item["citation_binding"] = binding
-                            item["bibkey"] = binding.get("bibkey")
-                        external.append(_jsonable(item))
-                        seen.add(str(candidate["evidence_id"]))
+                        verified.append(_jsonable(item))
+                        seen.add(evidence_id)
                     for key, child in candidate.items():
                         if key == "citation_requirements":
                             if isinstance(child, (list, tuple)):
                                 citation_requirements.extend(_jsonable(value) for value in child)
+                            continue
+                        if key in {"claims", "subclaims"}:
+                            collect_claim(child)
                             continue
                         if key in {"evidence", "supporting_evidence", "counter_evidence", "qualifying_evidence", "verified_evidence"}:
                             collect(child, evidence_context=True)
@@ -332,10 +538,44 @@ class ScholarConsoleProjection:
                         collect(child, evidence_context=evidence_context)
 
             collect(value)
+
+        enriched: list[dict[str, Any]] = []
+        for original in verified:
+            item = dict(original)
+            evidence_id = str(item.get("evidence_id") or "")
+            binding = binding_by_evidence.get(evidence_id)
+            if binding is not None:
+                item["citation_binding"] = binding
+                item["citation_status"] = binding.get("status")
+                item["bibkey"] = binding.get("bibkey")
+            else:
+                item["citation_binding"] = None
+                item["citation_status"] = None
+                item["bibkey"] = None
+            item["claim_ids"] = [
+                claim_id
+                for claim_id, claim in claims.items()
+                if evidence_id in claim.get("evidence_ids", [])
+            ]
+            item["claims"] = [claims[claim_id] for claim_id in item["claim_ids"]]
+            item["patch_references"] = patches_by_evidence.get(evidence_id, [])
+            item["evidence_span"] = item.get("content") or item.get("text") or (
+                item.get("metadata", {}).get("content")
+                if isinstance(item.get("metadata"), Mapping)
+                else None
+            )
+            enriched.append(_jsonable(item))
+        enriched.sort(key=lambda item: str(item.get("evidence_id") or ""))
+        citation_requirements = list({
+            str(item.get("evidence_id") or item.get("identity_key") or index): item
+            for index, item in enumerate(citation_requirements)
+            if isinstance(item, Mapping)
+        }.values())
         return {
             "project_id": project_id,
             "run_id": run_id,
-            "verified_evidence": external,
+            "claims": list(claims.values()),
+            "verified_evidence": enriched,
             "citation_bindings": bindings,
             "citation_requirements": citation_requirements,
             "note": "仅展示已验证或已持久化审计投影；Discovery Candidate 不进入此视图。",
@@ -383,7 +623,11 @@ class ScholarConsoleProjection:
                 "Required Research Miss Rate": int("REQUIRED_RESEARCH_MISSED" in record.failures),
                 "Domain Result Validity": int(record.domain_result_valid),
                 "Context Isolation Violation Count": record.context_isolation_violations,
-                "Resume Success Rate": int(record.resumed),
+                "Resume Success Rate": (
+                    int(record.resumed)
+                    if case.resume_expected is True
+                    else 1.0
+                ),
                 "Capability Violation Count": record.forbidden_tool_calls + record.context_isolation_violations,
             },
             "record": _jsonable(record),
@@ -414,15 +658,15 @@ def demo_console_payload() -> dict[str, Any]:
             {"event_id": "DEMO:8", "type": "WAITING_USER", "node": "Human Approval", "status": "WAITING_USER", "summary": "Awaiting human approval"},
         ],
         "evidence": [
-            {"evidence_id": "EV_LOCAL_01", "claim": "C1", "title": "Ephemeris error compensation for LEO navigation", "source_type": "LOCAL_CORPUS", "locator": "results · chunk C_019", "validation_status": "VERIFIED", "citation": "Khalife2024"},
-            {"evidence_id": "EV_WEB_02", "claim": "C1", "title": "Robust signals-of-opportunity positioning", "source_type": "WEB_LITERATURE", "locator": "ABSTRACT · DOI 10.1234/demo", "validation_status": "VERIFIED", "citation": "Smith2023SOO"},
+            {"evidence_id": "EV_LOCAL_01", "claim_ids": ["C1"], "title": "Ephemeris error compensation for LEO navigation", "authors": ["Khalife et al."], "source_type": "LOCAL_CORPUS", "paper_id": "PAPER_LOCAL_01", "locator": "results · chunk C_019", "source_locator": "results · chunk C_019", "publication_date": "2024-01-01", "provider": "local corpus", "evidence_span": "Ephemeris error compensation improves the local positioning estimate.", "validation_status": "VERIFIED", "citation_binding": {"status": "RESOLVED_EXISTING", "bibkey": "Khalife2024"}, "bibkey": "Khalife2024"},
+            {"evidence_id": "EV_WEB_02", "claim_ids": ["C1"], "title": "Robust signals-of-opportunity positioning", "authors": ["Smith et al."], "source_type": "WEB_LITERATURE", "canonical_id": "doi:10.1234/demo", "locator": "ABSTRACT · DOI 10.1234/demo", "source_locator": "https://doi.org/10.1234/demo#abstract", "publication_date": "2023-06-01", "retrieved_at": "2026-09-13T00:00:00+00:00", "provider": "Crossref", "evidence_span": "Signals of opportunity provide a robust positioning reference.", "validation_status": "VERIFIED", "citation_binding": {"status": "RESOLVED_EXISTING", "bibkey": "Smith2023SOO"}, "bibkey": "Smith2023SOO"},
         ],
         "sections": [
-            {"name": "introduction", "relative_path": "sections/introduction.tex", "version": 3, "stale": False, "status": "CURRENT"},
-            {"name": "method", "relative_path": "sections/method.tex", "version": 2, "stale": False, "status": "CURRENT"},
-            {"name": "results", "relative_path": "sections/results.tex", "version": 2, "stale": False, "status": "CURRENT"},
-            {"name": "conclusion", "relative_path": "sections/conclusion.tex", "version": 1, "stale": True, "status": "STALE"},
-            {"name": "abstract", "relative_path": "sections/abstract.tex", "version": 1, "stale": True, "status": "STALE"},
+            {"name": "introduction", "relative_path": "sections/introduction.tex", "content_hash": "demo-intro-hash", "version": 3, "stale": False, "status": "CURRENT", "dependencies": [], "review_status": "PASSED", "patch_status": "AWAITING_APPROVAL"},
+            {"name": "method", "relative_path": "sections/method.tex", "content_hash": "demo-method-hash", "version": 2, "stale": False, "status": "CURRENT", "dependencies": [], "review_status": "NONE", "patch_status": None},
+            {"name": "results", "relative_path": "sections/results.tex", "content_hash": "demo-results-hash", "version": 2, "stale": False, "status": "CURRENT", "dependencies": [], "review_status": "NONE", "patch_status": None},
+            {"name": "conclusion", "relative_path": "sections/conclusion.tex", "content_hash": "demo-conclusion-hash", "version": 1, "stale": True, "status": "STALE", "dependencies": ["results"], "dependency_reason": "upstream section changed: results", "review_status": "NONE", "patch_status": None},
+            {"name": "abstract", "relative_path": "sections/abstract.tex", "content_hash": "demo-abstract-hash", "version": 1, "stale": True, "status": "STALE", "dependencies": ["conclusion", "experiment", "method", "results"], "dependency_reason": "upstream section changed: conclusion, experiment, method, results", "review_status": "NONE", "patch_status": None},
         ],
         "evaluation": {"metrics": {"Task Routing Accuracy": 1.0, "Forbidden Tool Call Count": 0, "Unexpected Research Rate": 0.0, "Required Research Miss Rate": 0.0, "Domain Result Validity": 1.0, "Context Isolation Violation Count": 0, "Resume Success Rate": 1.0, "Capability Violation Count": 0}},
     }

@@ -45,6 +45,7 @@ from app.scholar.evaluation import (
     ScholarHarnessEvaluationSuite,
     default_harness_cases,
 )
+from app.scholar.console import RunEvent, ScholarConsoleProjection
 from app.scholar.citation import (
     BibEntryCandidate,
     BibEntrySnapshot,
@@ -156,6 +157,8 @@ __all__ = [
     "HarnessEvaluationSuite",
     "ScholarHarnessEvaluationSuite",
     "default_harness_cases",
+    "RunEvent",
+    "ScholarConsoleProjection",
     "EvidenceCandidate",
     "EvidenceRef",
     "EvidenceSource",

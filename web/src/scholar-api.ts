@@ -8,6 +8,7 @@ export type ScholarRequest = {
 
 export type ScholarRunEvent = {
   event_id: string;
+  cursor?: number;
   run_id?: string;
   session_id?: string;
   timestamp?: string;
@@ -105,19 +106,53 @@ export function subscribeScholarEvents(
   onError: (error: Error) => void,
   after = 0,
 ): () => void {
-  const source = new EventSource(`/api/scholar/runs/${encodeURIComponent(runId)}/events?after=${after}`);
-  const handleEvent = (event: Event) => {
-    try {
-      onEvent(JSON.parse((event as MessageEvent).data) as ScholarRunEvent);
-    } catch (error) {
-      onError(error instanceof Error ? error : new Error("Run Event 格式无效。"));
-    }
+  let source: EventSource | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  let lastCursor = Math.max(0, after);
+  let retryDelay = 500;
+
+  const connect = () => {
+    if (stopped) return;
+    const nextSource = new EventSource(`/api/scholar/runs/${encodeURIComponent(runId)}/events?after=${lastCursor}`);
+    source = nextSource;
+    const handleEvent = (event: Event) => {
+      try {
+        const message = event as MessageEvent;
+        const payload = JSON.parse(message.data) as ScholarRunEvent;
+        const cursor = Number(payload.cursor || message.lastEventId || 0);
+        if (Number.isFinite(cursor) && cursor > lastCursor) lastCursor = cursor;
+        retryDelay = 500;
+        onEvent(payload);
+      } catch (error) {
+        onError(error instanceof Error ? error : new Error("Run Event 格式无效。"));
+      }
+    };
+    nextSource.addEventListener("scholar_run", handleEvent);
+    nextSource.addEventListener("end", () => {
+      nextSource.close();
+      if (source === nextSource) source = null;
+    });
+    nextSource.onerror = () => {
+      if (source !== nextSource) return;
+      nextSource.close();
+      source = null;
+      if (stopped) return;
+      if (retryTimer !== undefined) return;
+      onError(new Error("Run Event SSE 连接已中断，正在从最后 cursor 重连。"));
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined;
+        connect();
+      }, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 5_000);
+    };
   };
-  source.addEventListener("scholar_run", handleEvent);
-  source.addEventListener("end", () => source.close());
-  source.onerror = () => {
-    if (source.readyState !== EventSource.CLOSED) onError(new Error("Run Event SSE 连接已中断。"));
-    source.close();
+
+  connect();
+  return () => {
+    stopped = true;
+    if (retryTimer !== undefined) clearTimeout(retryTimer);
+    source?.close();
+    source = null;
   };
-  return () => source.close();
 }

@@ -178,6 +178,24 @@ Phase 4: End-to-End Validation, Release Hardening & Project Finalization
 - Added Console contract tests, React production build coverage and browser checks;
   the Console remains usable while the real external Provider is unavailable.
 
+## Phase 4R strict contract audit
+
+- Stabilized the read-only `RunEvent` contract with a Run-local monotonic cursor and
+  deterministic event IDs; terminal events now distinguish completed, failed,
+  interrupted and waiting-user runs without fabricating completion.
+- Corrected Capability-aware workflow mapping so Support Claim never renders a
+  DraftPatch node and Conclusion/Abstract traces do not render Research nodes.
+- Hardened external Evidence projection with source type, content-hash verification,
+  claim mapping, locator/span, citation status and Patch references; pending or invalid
+  candidates remain excluded.
+- Hardened SSE replay/reconnect and browser state: `after` is last consumed cursor,
+  replay ends explicitly, duplicate/late events are ignored, and concurrent refreshes
+  cannot overwrite the active Run.
+- Added contract coverage for event ordering, cursor validation, failure/interruption,
+  capability boundaries, external audit Evidence and manuscript dependency/review data.
+- Regression result after audit: 380 passed, 1 skipped, 5 warnings; Ruff, frontend
+  build, `git diff --check` and `uv lock --check` pass.
+
 ## V1 release status
 
 The implementation scope is frozen for V1 validation. V1 is not yet released:
