@@ -43,6 +43,14 @@ def _accepted() -> dict[str, Any]:
     return {"passed": True, "official_cutover_approved": True, "failures": []}
 
 
+def test_light_rag_shadow_is_opt_in_by_default(tmp_path: Path) -> None:
+    config = KnowledgeServingConfigRepository(tmp_path).load()
+
+    assert config.official_engine == "legacy"
+    assert config.shadow_engine == "none"
+    assert config.shadow_generation_id is None
+
+
 def test_cutover_requires_machine_acceptance_and_keeps_legacy_on_failure(
     tmp_path: Path,
 ) -> None:

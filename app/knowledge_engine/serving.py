@@ -24,7 +24,9 @@ def _now() -> str:
 class KnowledgeServingConfig:
     official_engine: Literal["legacy", "lightrag"] = "legacy"
     official_generation_id: str | None = None
-    shadow_engine: EngineName = "lightrag"
+    # LightRAG remains an explicitly opt-in experimental/shadow path. The
+    # production default is the validated legacy BM25 + Dense + RRF path.
+    shadow_engine: EngineName = "none"
     shadow_generation_id: str | None = None
     revision: int = 1
     updated_at: str | None = None

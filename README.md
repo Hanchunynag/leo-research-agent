@@ -106,6 +106,18 @@ Dense 各覆盖 283 chunks；Paper BM25 和 Paper Dense 各覆盖 27 条 metadat
 local artifact fingerprint、向量维度、距离度量、归一化、chunk/tokenizer policy
 和 index schema；Provider 与 manifest 不一致时会拒绝查询并要求重建索引。
 
+### Production Retrieval Path 与 LightRAG 定位
+
+当前 Production Retrieval Path 固定为：`UnifiedKnowledgeService` → Legacy
+BM25 + BGE-M3 Dense → RRF → 可选 Reranker → Evidence Verification/Selection。
+这是正式回答、Citation 和离线评测使用的链路。
+
+LightRAG 是 `EXPERIMENTAL / OPTIONAL / SHADOW` 路径，默认关闭；它只通过显式
+Generation Pin 和 `configure_shadow` 进入影子比较，不参与正式回答，也不是本地
+Release Gate 的 blocker。只有未来独立 Shadow Acceptance 在质量、关系真值、成本、
+增量更新和回滚方面全部通过，才允许通过已有 `EngineCutoverService` 进行显式切换。
+当前结论是保持 Legacy Official，不为了增加技术栈数量切换正式链路。
+
 ### 可复现 Demo 与 Evaluation
 
 `examples/scholar-demo/` 是一个小型但真实主题的 LEO LaTeX Project。使用现有

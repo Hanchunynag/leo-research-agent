@@ -62,7 +62,7 @@ Harness 只编排 Workflow/Step/Tool/Context/Budget/State/Evaluation/Recovery。
 
 ## 阶段二实现映射
 
-- `KnowledgeEngine`：[`LightRAGKnowledgeEngine`](../../app/knowledge_engine/lightrag_engine.py)；旧实现由 [`LegacyKnowledgeEngineAdapter`](../../app/contracts/adapters.py) 包装。
+- `KnowledgeEngine`：Production 默认由 [`LegacyKnowledgeEngineAdapter`](../../app/contracts/adapters.py) 包装旧 BM25/Dense/Graph 检索；[`LightRAGKnowledgeEngine`](../../app/knowledge_engine/lightrag_engine.py) 仅作为显式 Generation Pin 的实验/影子实现。
 - `EvidenceIntelligenceService`：[`EvidenceIntelligencePipeline`](../../app/evidence/service.py)。
 - `ContextBuilder`：[`SelectedEvidenceContextBuilder`](../../app/evidence/context.py)，只接收 state=`selected`。
 - `UnifiedKnowledgeService`：[`app/knowledge_engine/unified_service.py`](../../app/knowledge_engine/unified_service.py)，生产 Agent 不直接接触旧 Dense/Graph 存储。

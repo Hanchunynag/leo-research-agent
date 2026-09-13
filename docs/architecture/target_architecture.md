@@ -65,6 +65,6 @@ Harness 只感知 Workflow、Step/Stage、Tool、Context、Budget、State、Eval
 
 ## 阶段二实现状态
 
-目标正式知识引擎已由 [`LightRAGKnowledgeEngine`](../../app/knowledge_engine/lightrag_engine.py) 实现，统一边界是 [`UnifiedKnowledgeService`](../../app/knowledge_engine/unified_service.py)。Canonical 与 scope 分别由 [`CanonicalCorpusService`](../../app/corpus/service.py) 和 [`WorkspaceService`](../../app/workspaces/service.py) 强制执行；Evidence 流程由 [`EvidenceIntelligencePipeline`](../../app/evidence/service.py) 收口。
+统一边界是 [`UnifiedKnowledgeService`](../../app/knowledge_engine/unified_service.py)。Production 默认使用 Legacy BM25/Dense/Graph 适配器；[`LightRAGKnowledgeEngine`](../../app/knowledge_engine/lightrag_engine.py) 仅作为显式 Generation Pin 的 `EXPERIMENTAL / OPTIONAL / SHADOW` 实现。Canonical 与 scope 分别由 [`CanonicalCorpusService`](../../app/corpus/service.py) 和 [`WorkspaceService`](../../app/workspaces/service.py) 强制执行；Evidence 流程由 [`EvidenceIntelligencePipeline`](../../app/evidence/service.py) 收口。
 
-当前 LightRAG `active` generation 仍是 shadow active，不是 answer-serving active。正式回答继续走 legacy Adapter；这一保守状态由真实 Q001 nDCG 仍低于 legacy 的结果支持，详见 [`stage2_shadow_comparison.md`](stage2_shadow_comparison.md)。旧 Dense/GraphRAG 全部保留，Harness 和前端未改写。
+当前正式回答继续走 legacy Adapter；LightRAG generation 默认不启用，只有显式 shadow 配置才参与比较。该保守状态由真实 Shadow Acceptance 中 LightRAG nDCG 低于 legacy 的结果支持，详见 [`stage4_shadow_acceptance.md`](stage4_shadow_acceptance.md)。旧 Dense/GraphRAG 全部保留，Harness 和前端未改写。

@@ -25,15 +25,26 @@ knowledge:
 
 `app.knowledge_engine.unified_service.build_configured_unified_service` 只按持久化 Pin 组装服务。LightRAG Official 缺 Pin、Pin 不存在、状态不可服务或审计不匹配时直接失败，不选择“最新 Generation”。一次查询由 `UnifiedKnowledgeService` 捕获一个固定 Engine/Generation 实例，查询期间配置文件变化不会改变该请求。
 
-## 当前状态
+## 当前产品决策
 
 - Official Engine：`legacy`
 - Official Generation：`null`
-- Shadow Engine：`lightrag`
-- Shadow Generation：`IG_419c4e228f0dd1a8`
-- Shadow Profile：`lightrag-1.5.6-bge-m3-deepseek-chat-json-v1`
+- Shadow Engine：`none`（默认关闭，可显式 opt-in）
+- Shadow Generation：`null`
+- LightRAG：`EXPERIMENTAL / OPTIONAL / SHADOW`
 
-当前 LightRAG 未达到正式门槛，未执行 Cutover。
+当前正式回答继续使用 Legacy BM25 + Dense + RRF + Reranker。LightRAG 的历史
+Shadow Acceptance 结果保留在 [`stage4_shadow_acceptance.md`](stage4_shadow_acceptance.md)
+用于研究和未来重新验收；它不再作为本地 Release Gate blocker。若显式启用 Shadow，
+必须绑定可服务的 Generation Pin，并通过既有 `configure_shadow` 入口；若要切换
+Official，仍必须通过 `EngineCutoverService` 的完整 Acceptance，不允许自动切换。
+
+## 两条检索路径
+
+```text
+Production:   UnifiedKnowledgeService → Legacy BM25/Dense → RRF/Reranker → Evidence
+Experimental:  UnifiedKnowledgeService → LightRAG pinned generation → Shadow comparison
+```
 
 ## 接口兼容
 
