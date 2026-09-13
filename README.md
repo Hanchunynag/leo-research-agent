@@ -1036,10 +1036,13 @@ nDCG@10、按问题类型聚合的指标以及每道题的排名。当前 21 道
 
 1. Retrieval：Paper-level Recall/Precision/MRR/nDCG、Chunk Evidence Recall、
    Paper survival/cascade recall、Scope leakage、RRF 与 Cross-Encoder 延迟。
-2. Generation：离线确定性检查 citation scope precision、citation precision/recall、
-   context recall proxy、引用页码完整性和 answerable accuracy。
+2. Generation：离线确定性检查 Claim Unit → Supporting Evidence → Citation Binding，
+   citation scope precision、claim binding coverage、citation precision/recall、
+   context recall proxy、引用页码完整性和 answerable accuracy。拒答或生成失败且没有
+   Claim Unit 的样本会明确标为 N/A，不把“没有生成 Citation”误报成 Citation 越界；
+   有 Claim 但缺少绑定仍然失败，并保留逐样本 failure analysis。
 3. Agent：Planner task accuracy、Paper/Evidence recall、固定工具合法性与覆盖率、
-   trajectory/budget compliance、生成失败时 Evidence 保留和引用完整性。
+   trajectory/budget compliance、合法失败终止轨迹、生成失败时 Evidence 保留和引用完整性。
 
 运行分层检索评测：
 
@@ -1068,6 +1071,10 @@ uv run python main.py evaluate generation \
 它们通过 `app.evaluation.generation.run_ragas()` 可选启用，必须提供 Judge LLM、
 Embedding 和带 reference 的评测集；默认 CI 不调用外部模型，防止网络/模型波动污染
 检索与 Agent 回归结果。Agent 轨迹评测不允许自由工具名，工具必须属于固定 Gateway。
+当前离线报告还会检查显式 `TOOL_STARTED → TOOL_COMPLETED`、`APPROVAL_GRANTED →
+APPLY_COMPLETED`、安全提交和终止状态；Research Harness 的 atomic tool 记录按一次
+完整调用解释，不人为补造开始事件。合法的 `generation_failed`、`insufficient_evidence`
+等 fail-closed 终止不会因为存在一个预期失败 Step 而被判作轨迹错误。
 
 ### FastAPI + React 科研工作台
 

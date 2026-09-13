@@ -10,7 +10,7 @@ from typing import Any, Mapping, Sequence
 from app.storage import write_json_atomic
 
 
-EVALUATION_SCHEMA_VERSION = "1.0"
+EVALUATION_SCHEMA_VERSION = "1.1"
 ALLOWED_TOOLS = frozenset({
     "knowledge.retrieve",
     "workspace.read_scope",
@@ -110,6 +110,120 @@ def _mean(rows: Sequence[Mapping[str, Any]], key: str) -> float:
     return round(sum(float(row.get(key) or 0.0) for row in rows) / max(1, len(rows)), 6)
 
 
+_TERMINAL_FAILURE_OUTCOMES = frozenset(
+    {"generation_failed", "insufficient_evidence", "budget_exhausted", "validation_failed"}
+)
+_TERMINAL_STATES = frozenset({"completed", "interrupted", "failed", "refused"})
+_STATE_TRANSITIONS: dict[str, frozenset[str]] = {
+    "created": frozenset({"context_preparing"}),
+    "context_preparing": frozenset({"planning", "failed", "refused"}),
+    "planning": frozenset({"executing", "failed", "refused"}),
+    "executing": frozenset({"evaluating", "recovering", "committing", "interrupted", "failed", "refused"}),
+    "evaluating": frozenset({"recovering", "committing", "interrupted", "failed", "refused"}),
+    "recovering": frozenset({"executing", "committing", "failed", "refused"}),
+    "committing": frozenset({"completed", "failed", "refused"}),
+    "interrupted": frozenset(),
+    "completed": frozenset(),
+    "failed": frozenset(),
+    "refused": frozenset(),
+}
+
+
+def _trace_contract_validation(
+    prediction: Mapping[str, Any],
+    harness: Mapping[str, Any],
+    trace: Sequence[Any],
+) -> tuple[bool, list[str]]:
+    """Validate trace order without treating an expected refusal as a bug."""
+
+    issues: list[str] = []
+    ordinals = [
+        int(value["ordinal"])
+        for value in trace
+        if isinstance(value, Mapping) and isinstance(value.get("ordinal"), int)
+    ]
+    if ordinals and ordinals != list(range(1, len(ordinals) + 1)):
+        issues.append("trace_ordinals_not_contiguous")
+
+    state_history = harness.get("state_history")
+    if isinstance(state_history, list) and state_history:
+        states = [str(value) for value in state_history]
+        if states[0] != "created":
+            issues.append("state_history_must_start_created")
+        for current, target in zip(states, states[1:]):
+            if target not in _STATE_TRANSITIONS.get(current, frozenset()):
+                issues.append(f"illegal_state_transition:{current}->{target}")
+        if states[-1] not in _TERMINAL_STATES:
+            issues.append("state_history_has_no_terminal_state")
+
+    outcome_code = str((prediction.get("outcome") or {}).get("code") or "")
+    failed_positions: list[int] = []
+    commit_positions: list[int] = []
+    active_tools: set[str] = set()
+    approvals: set[str] = set()
+    open_actions: set[str] = set()
+    for position, value in enumerate(trace):
+        if not isinstance(value, Mapping):
+            issues.append(f"trace_item_not_mapping:{position + 1}")
+            continue
+        name = str(value.get("name") or value.get("event_type") or "").upper()
+        status = str(value.get("status") or "").casefold()
+        kind = str(value.get("kind") or "").casefold()
+        details = value.get("details") if isinstance(value.get("details"), Mapping) else {}
+        if status in {"failed", "error"}:
+            failed_positions.append(position)
+        if name == "COMMIT_SAFE_STATE" and status in {"succeeded", "success", "completed"}:
+            commit_positions.append(position)
+
+        # ResearchRunHarness.record_tool is an atomic completed observation.
+        # Explicit lifecycle events, when supplied by a projection, are
+        # checked as paired TOOL_STARTED/TOOL_COMPLETED events.
+        is_tool_started = name == "TOOL_STARTED" or name.endswith("_TOOL_STARTED")
+        is_tool_completed = name == "TOOL_COMPLETED" or name.endswith("_TOOL_COMPLETED")
+        tool_key = str(value.get("tool_name") or details.get("tool_name") or name)
+        if is_tool_started:
+            active_tools.add(tool_key)
+        elif is_tool_completed:
+            if tool_key not in active_tools:
+                issues.append(f"tool_completed_before_started:{tool_key}")
+            else:
+                active_tools.remove(tool_key)
+        elif kind == "tool" and status in {"succeeded", "success", "completed"}:
+            # The internal Research Harness records the tool call atomically;
+            # requiring a synthetic start event would falsify its trace.
+            pass
+
+        if name in {"APPROVAL_GRANTED", "HUMAN_APPROVAL_GRANTED"}:
+            approvals.add(str(details.get("patch_id") or value.get("patch_id") or "*"))
+        if name in {"APPLY_COMPLETED", "PATCH_APPLY_COMPLETED"}:
+            patch_id = str(details.get("patch_id") or value.get("patch_id") or "*")
+            if patch_id not in approvals and "*" not in approvals:
+                issues.append(f"apply_without_approval:{patch_id}")
+        if name in {"REQUIRED_ACTION_OPENED", "ACTION_REQUIRED"}:
+            open_actions.add(str(details.get("action_id") or value.get("action_id") or position))
+        if name in {"REQUIRED_ACTION_CLOSED", "ACTION_RESOLVED"}:
+            open_actions.discard(str(details.get("action_id") or value.get("action_id") or position))
+        if name == "RUN_COMPLETED" and open_actions:
+            issues.append("run_completed_with_open_required_action")
+
+    # A failed generation/retrieval path is valid when the harness records the
+    # failure, commits the safe state, and exposes a matching terminal outcome.
+    if failed_positions:
+        if outcome_code not in _TERMINAL_FAILURE_OUTCOMES:
+            issues.append("unexpected_failed_trace_without_terminal_failure_outcome")
+        if not any(position > failed_positions[-1] for position in commit_positions):
+            issues.append("failed_trace_missing_safe_commit")
+    if active_tools:
+        issues.append("unclosed_tool_lifecycle")
+
+    terminal_state = str(harness.get("state") or "")
+    if outcome_code == "answered" and terminal_state != "completed":
+        issues.append("answered_outcome_without_completed_state")
+    if outcome_code in _TERMINAL_FAILURE_OUTCOMES and terminal_state not in {"refused", "failed", "interrupted"}:
+        issues.append("failure_outcome_without_failure_state")
+    return not issues, issues
+
+
 def evaluate_agent_predictions(
     questions: Sequence[Mapping[str, Any]],
     predictions: Sequence[Mapping[str, Any]],
@@ -177,9 +291,8 @@ def evaluate_agent_predictions(
             )
         )
         trace = harness.get("trace") if isinstance(harness.get("trace"), list) else []
-        trace_status_ok = all(
-            not isinstance(value, Mapping) or value.get("status") not in {"failed", "error"}
-            for value in trace
+        trace_status_ok, trace_issues = _trace_contract_validation(
+            prediction, harness, trace
         )
         generation_failed = str(
             _nested(prediction, "outcome", "code") or ""
@@ -208,6 +321,7 @@ def evaluate_agent_predictions(
             "required_tool_coverage": tool_coverage,
             "trajectory_budget_compliance": float(tool_budget and round_budget and policy_budget),
             "trajectory_trace_validity": float(trace_status_ok),
+            "trajectory_trace_issues": trace_issues,
             "evidence_preserved_on_generation_failure": evidence_preserved_on_failure,
             "citation_completeness": citation_complete,
             "tool_call_count": len(tool_names),
@@ -231,6 +345,24 @@ def evaluate_agent_predictions(
         "question_count": len(rows),
         "metrics": {name: _mean(rows, name) for name in numeric_names},
         "per_question": rows,
+        "trace_contract": {
+            "valid_question_count": sum(
+                row["trajectory_trace_validity"] == 1.0 for row in rows
+            ),
+            "failure_cases": [
+                {
+                    "question_id": row["question_id"],
+                    "outcome_code": row["outcome_code"],
+                    "issues": row["trajectory_trace_issues"],
+                }
+                for row in rows
+                if row["trajectory_trace_issues"]
+            ],
+            "known_limitations": [
+                "ResearchRunHarness 的 atomic tool trace 记录一次成功调用；只有显式 TOOL_STARTED/TOOL_COMPLETED 事件才执行成对顺序校验。",
+                "该评测验证 Research Harness 轨迹，不代替 Scholar Web Console RunEvent/SSE 的端到端验证。",
+            ],
+        },
         "allowed_tools": sorted(ALLOWED_TOOLS),
     }
     if output_path is not None:

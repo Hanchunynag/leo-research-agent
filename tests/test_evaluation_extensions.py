@@ -63,6 +63,91 @@ def test_agent_evaluator_checks_fixed_tools_budget_and_failure_preservation(tmp_
     assert metrics["retrieval_sufficiency_accuracy"] == 1.0
 
 
+def test_agent_evaluator_accepts_bounded_generation_failure_trace() -> None:
+    report = evaluate_agent_predictions(
+        [
+            {
+                "question_id": "AG1",
+                "query": "What is the method?",
+                "expected_task_type": "direct_qa",
+                "expected_retrieval_sufficient": True,
+                "expected_paper_ids": [],
+                "expected_evidence_ids": [],
+                "required_tools": [],
+            }
+        ],
+        [
+            {
+                "question_id": "AG1",
+                "selected_evidence": [{"evidence_id": "E1"}],
+                "outcome": {"code": "generation_failed"},
+                "diagnostics": {
+                    "langgraph": {"task_type": "direct_qa"},
+                    "harness": {
+                        "state": "refused",
+                        "state_history": [
+                            "created",
+                            "context_preparing",
+                            "planning",
+                            "executing",
+                            "evaluating",
+                            "committing",
+                            "refused",
+                        ],
+                        "trace": [
+                            {"ordinal": 1, "name": "GENERATE", "status": "failed"},
+                            {"ordinal": 2, "name": "COMMIT_SAFE_STATE", "status": "succeeded"},
+                        ],
+                    },
+                },
+            }
+        ],
+    )
+
+    row = report["per_question"][0]
+    assert row["trajectory_trace_validity"] == 1.0
+    assert row["trajectory_trace_issues"] == []
+
+
+def test_agent_evaluator_rejects_tool_completion_before_start() -> None:
+    report = evaluate_agent_predictions(
+        [
+            {
+                "question_id": "AG1",
+                "query": "What is the method?",
+                "expected_task_type": "direct_qa",
+                "expected_paper_ids": [],
+                "expected_evidence_ids": [],
+                "required_tools": [],
+            }
+        ],
+        [
+            {
+                "question_id": "AG1",
+                "outcome": {"code": "answered"},
+                "diagnostics": {
+                    "langgraph": {"task_type": "direct_qa"},
+                    "harness": {
+                        "state": "completed",
+                        "trace": [
+                            {
+                                "ordinal": 1,
+                                "name": "TOOL_COMPLETED",
+                                "tool_name": "knowledge.retrieve",
+                                "status": "succeeded",
+                            }
+                        ],
+                    },
+                },
+            }
+        ],
+    )
+
+    row = report["per_question"][0]
+    assert row["trajectory_trace_validity"] == 0.0
+    assert "tool_completed_before_started:knowledge.retrieve" in row["trajectory_trace_issues"]
+
+
 def test_hierarchical_evaluator_reports_cascade_and_scope(monkeypatch, tmp_path: Path) -> None:
     questions_path = tmp_path / "questions.jsonl"
     questions_path.write_text(
@@ -141,3 +226,68 @@ def test_generation_evaluator_separates_citation_contract_from_ragas() -> None:
     assert report["metrics"]["citation_recall"] == 1.0
     assert report["metrics"]["answerable_accuracy"] == 1.0
     assert "faithfulness" in report["ragas_metrics_available"]
+
+
+def test_generation_scope_excludes_refusals_but_reports_claim_binding_failures() -> None:
+    report = evaluate_grounded_generation(
+        [
+            {
+                "question_id": "REFUSED",
+                "answerable": False,
+                "outcome": {"code": "insufficient_evidence"},
+                "selected_evidence": [],
+                "claims": [],
+                "citations": [],
+            },
+            {
+                "question_id": "BROKEN",
+                "answerable": True,
+                "selected_evidence": [{"evidence_id": "E1"}],
+                "claims": [
+                    {
+                        "claim_id": "C1",
+                        "text": "The evidence supports the claim.",
+                        "evidence_ids": ["E1"],
+                    }
+                ],
+                "citations": [],
+            },
+        ]
+    )
+
+    assert report["metrics"]["citation_scope_precision"] == 0.0
+    assert report["metrics"]["citation_binding_coverage"] == 0.0
+    assert report["citation_scope"]["evaluated_question_count"] == 1
+    assert report["citation_scope"]["not_applicable_question_count"] == 1
+    assert report["citation_scope"]["failure_cases"][0]["question_id"] == "BROKEN"
+    assert report["per_question"][0]["citation_scope_precision"] is None
+
+
+def test_generation_scope_rejects_citation_outside_claim_and_selected_scope() -> None:
+    report = evaluate_grounded_generation(
+        [
+            {
+                "question_id": "G1",
+                "selected_evidence": [{"evidence_id": "E1"}],
+                "claims": [
+                    {
+                        "claim_id": "C1",
+                        "text": "Atomic supported claim.",
+                        "evidence_ids": ["E1"],
+                    }
+                ],
+                "citations": [
+                    {
+                        "claim_id": "C1",
+                        "evidence_id": "E2",
+                        "page_start": 1,
+                        "page_end": 1,
+                    }
+                ],
+            }
+        ]
+    )
+
+    binding = report["per_question"][0]["citation_scope_analysis"]["bindings"][0]
+    assert report["metrics"]["citation_scope_precision"] == 0.0
+    assert binding["issues"] == ["evidence_outside_selected_scope"]
