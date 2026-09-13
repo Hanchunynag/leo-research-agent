@@ -15,11 +15,12 @@ from qdrant_client import QdrantClient, models
 
 from app.embeddings.base import EmbeddingProvider
 from app.indexing.bm25 import chunks_digest
+from app.indexing.tokenization import TOKENIZER_VERSION
 from app.retrieval.search import load_chunks
 from app.storage import write_json_atomic
 
 
-DENSE_INDEX_SCHEMA_VERSION = "1.0"
+DENSE_INDEX_SCHEMA_VERSION = "1.1"
 DENSE_TEXT_POLICY_VERSION = "1.0"
 DEFAULT_DENSE_COLLECTION = "leo_paper_chunks_dense"
 VECTOR_NAME = "dense"
@@ -38,6 +39,7 @@ class DenseBuildReport:
     chunks_digest: str
     model_name: str
     model_revision: str | None
+    model_artifact_fingerprint: str | None
     normalized: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -101,17 +103,28 @@ def load_dense_manifest(project_root: Path) -> dict[str, Any]:
     return value
 
 
-def _provider_metadata(provider: EmbeddingProvider) -> tuple[str, str | None, bool]:
+def _provider_metadata(
+    provider: EmbeddingProvider,
+) -> tuple[str, str | None, str | None, bool]:
     model_name = getattr(provider, "model_name", None)
     revision = getattr(provider, "revision", None)
+    artifact_fingerprint = getattr(provider, "artifact_fingerprint", None)
     normalized = getattr(provider, "normalized", True)
     if not isinstance(model_name, str) or not model_name:
         raise ValueError("EmbeddingProvider 必须暴露非空 model_name。")
     if revision is not None and not isinstance(revision, str):
         raise ValueError("EmbeddingProvider revision 必须是字符串或 None。")
+    if artifact_fingerprint is not None and not isinstance(artifact_fingerprint, str):
+        raise ValueError(
+            "EmbeddingProvider artifact_fingerprint 必须是字符串或 None。"
+        )
+    if revision is None and not artifact_fingerprint:
+        raise ValueError(
+            "EmbeddingProvider 必须提供精确 revision 或稳定 artifact_fingerprint。"
+        )
     if not isinstance(normalized, bool):
         raise ValueError("EmbeddingProvider normalized 必须是布尔值。")
-    return model_name, revision, normalized
+    return model_name, revision, artifact_fingerprint, normalized
 
 
 def _manifest_matches(
@@ -119,6 +132,7 @@ def _manifest_matches(
     digest: str,
     model_name: str,
     revision: str | None,
+    artifact_fingerprint: str | None,
     normalized: bool,
     collection_name: str,
 ) -> bool:
@@ -129,6 +143,7 @@ def _manifest_matches(
             manifest.get("chunks_digest") == digest,
             manifest.get("model_name") == model_name,
             manifest.get("model_revision") == revision,
+            manifest.get("model_artifact_fingerprint") == artifact_fingerprint,
             manifest.get("normalized") is normalized,
             manifest.get("collection_name") == collection_name,
         )
@@ -153,7 +168,7 @@ def build_dense_index(
     if not chunks:
         raise ValueError("chunks.jsonl 为空，无法建立 Dense 索引。")
     digest = chunks_digest(chunks)
-    model_name, revision, normalized = _provider_metadata(provider)
+    model_name, revision, artifact_fingerprint, normalized = _provider_metadata(provider)
     index_path = dense_index_path(root)
     manifest_path = dense_manifest_path(root)
     if not force and index_path.is_dir() and manifest_path.is_file():
@@ -163,6 +178,7 @@ def build_dense_index(
             digest,
             model_name,
             revision,
+            artifact_fingerprint,
             normalized,
             collection_name,
         ):
@@ -177,6 +193,7 @@ def build_dense_index(
                 chunks_digest=digest,
                 model_name=model_name,
                 model_revision=revision,
+                model_artifact_fingerprint=artifact_fingerprint,
                 normalized=normalized,
             )
 
@@ -245,13 +262,14 @@ def build_dense_index(
         "distance": "Cosine",
         "model_name": model_name,
         "model_revision": revision,
+        "model_artifact_fingerprint": artifact_fingerprint,
         "normalized": normalized,
         "vector_dimension": dimension,
         "chunk_count": len(chunks),
         "chunks_digest": digest,
         "point_id_policy": "uuid5(chunk_id)",
         "index_epoch": f"CH_{digest[:16]}",
-        "tokenizer_version": "app.indexing.tokenization.v1",
+        "tokenizer_version": TOKENIZER_VERSION,
         "chunker_version": "app.chunking.chunker.v2.2",
     }
 
@@ -284,5 +302,6 @@ def build_dense_index(
         chunks_digest=digest,
         model_name=model_name,
         model_revision=revision,
+        model_artifact_fingerprint=artifact_fingerprint,
         normalized=normalized,
     )

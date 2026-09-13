@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.model_cache import resolve_local_model_path
+
 
 DEFAULT_BGE_M3_MODEL = "BAAI/bge-m3"
 
@@ -50,14 +52,34 @@ class BGEM3EmbeddingProvider:
         return self.config.revision
 
     @property
+    def artifact_fingerprint(self) -> str | None:
+        """Return a stable local snapshot identity when revision is omitted."""
+
+        if self.config.revision:
+            return f"hf-revision:{self.config.revision}"
+        if self.config.cache_folder is None:
+            return None
+        try:
+            snapshot = Path(
+                resolve_local_model_path(
+                    self.config.model_name,
+                    self.config.cache_folder,
+                    required_files=("config.json", "modules.json"),
+                )
+            )
+        except (FileNotFoundError, OSError):
+            return None
+        if not snapshot.is_dir() or not snapshot.name:
+            return None
+        return f"hf-local-snapshot:{snapshot.name}"
+
+    @property
     def normalized(self) -> bool:
         return self.config.normalize_embeddings
 
     def _load_model(self) -> Any:
         if self._model is None:
             from sentence_transformers import SentenceTransformer
-            from app.model_cache import resolve_local_model_path
-
             model_name = self.config.model_name
             if self.config.local_files_only:
                 model_name = resolve_local_model_path(

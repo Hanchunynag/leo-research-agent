@@ -19,6 +19,7 @@ from app.retrieval.hybrid import (
 
 
 RERANKER_TEXT_POLICY_VERSION = "1.0"
+DEFAULT_RRF_RANK_WEIGHT = 0.35
 
 
 def reranker_document_text(candidate: dict[str, Any]) -> str:
@@ -38,6 +39,7 @@ def search_reranked_evidence(
     max_chunks_per_work: int = 2,
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
     rrf_k: int = DEFAULT_RRF_K,
+    rrf_rank_weight: float = DEFAULT_RRF_RANK_WEIGHT,
 ) -> dict[str, Any]:
     cleaned_query = query.strip()
     if not cleaned_query:
@@ -45,6 +47,8 @@ def search_reranked_evidence(
     output_limit = _positive_integer(limit, "limit")
     per_work = _positive_integer(max_chunks_per_work, "max_chunks_per_work", 20)
     candidates_per_source = _positive_integer(candidate_limit, "candidate_limit")
+    if not 0.0 <= rrf_rank_weight <= 1.0:
+        raise ValueError("rrf_rank_weight 必须在 0 到 1 之间。")
 
     total_started = perf_counter()
     candidate_started = perf_counter()
@@ -87,8 +91,32 @@ def search_reranked_evidence(
             }
         )
         reranked.append(result)
+    # Reranker logits are useful for semantic ordering, but they can also
+    # overrule a strong lexical/dense consensus.  Blend ordinal ranks rather
+    # than raw scores because the two score spaces are not calibrated:
+    # RRF remains the floor while the Cross-Encoder remains the main signal.
+    reranker_order = sorted(
+        range(len(reranked)),
+        key=lambda index: (
+            -float(reranked[index]["reranker_score"]),
+            int(reranked[index].get("rrf_rank") or 10**9),
+            str(reranked[index].get("chunk_id") or ""),
+        ),
+    )
+    reranker_ranks = {
+        index: rank for rank, index in enumerate(reranker_order, 1)
+    }
+    for index, value in enumerate(reranked):
+        rrf_rank = int(value.get("rrf_rank") or 10**9)
+        value["reranker_rank"] = reranker_ranks[index]
+        value["blended_rank"] = round(
+            (1.0 - rrf_rank_weight) * reranker_ranks[index]
+            + rrf_rank_weight * rrf_rank,
+            6,
+        )
     reranked.sort(
         key=lambda value: (
+            float(value["blended_rank"]),
             -float(value["reranker_score"]),
             int(value.get("rrf_rank") or 10**9),
             str(value.get("chunk_id") or ""),
@@ -117,6 +145,7 @@ def search_reranked_evidence(
         "candidate_count": len(candidates),
         "candidate_limit_per_source": candidates_per_source,
         "rrf_k": hybrid.get("rrf_k"),
+        "rrf_rank_weight": rrf_rank_weight,
         "reranker_model": getattr(reranker_provider, "model_name", None),
         "reranker_revision": getattr(reranker_provider, "revision", None),
         "reranker_text_policy_version": RERANKER_TEXT_POLICY_VERSION,

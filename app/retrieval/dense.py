@@ -78,6 +78,7 @@ def search_dense_evidence(
         raise RuntimeError("Dense manifest 与 chunks.jsonl 不一致，请重新构建索引。")
     model_name = getattr(provider, "model_name", None)
     revision = getattr(provider, "revision", None)
+    artifact_fingerprint = getattr(provider, "artifact_fingerprint", None)
     provider_mismatches: list[str] = []
     if manifest.get("model_name") != model_name:
         provider_mismatches.append(
@@ -88,6 +89,12 @@ def search_dense_evidence(
         provider_mismatches.append(
             "model_revision "
             f"manifest={manifest.get('model_revision')!r} provider={revision!r}"
+        )
+    if manifest.get("model_artifact_fingerprint") != artifact_fingerprint:
+        provider_mismatches.append(
+            "model_artifact_fingerprint "
+            f"manifest={manifest.get('model_artifact_fingerprint')!r} "
+            f"provider={artifact_fingerprint!r}"
         )
     if provider_mismatches:
         raise RuntimeError(

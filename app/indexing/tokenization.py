@@ -6,6 +6,9 @@ import re
 import unicodedata
 
 
+TOKENIZER_VERSION = "app.indexing.tokenization.v2"
+
+
 WORD_PATTERN = re.compile(
     r"[a-z0-9]+(?:[-'][a-z0-9]+)*|[\u3400-\u4dbf\u4e00-\u9fff]",
     flags=re.IGNORECASE,
@@ -41,6 +44,22 @@ def tokenize(value: str) -> list[str]:
             tokens.append(token)
     flush_chinese()
     return tokens
+
+
+def tokenize_bm25(value: str) -> list[str]:
+    """为词法检索保留复合词，并额外发出连字符组成词。
+
+    该扩展只影响 BM25/Paper lexical indexes，不改变通用 token_count、
+    研究工作流或证据选择器的 token 语义。
+    """
+
+    tokens = tokenize(value)
+    expanded: list[str] = []
+    for token in tokens:
+        expanded.append(token)
+        if "-" in token:
+            expanded.extend(part for part in token.split("-") if part)
+    return expanded
 
 
 def token_count(value: str) -> int:

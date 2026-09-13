@@ -14,7 +14,7 @@ from app.indexing.bm25 import (
     chunks_digest,
     searchable_chunk_text,
 )
-from app.indexing.tokenization import normalize_search_text, tokenize
+from app.indexing.tokenization import normalize_search_text, tokenize_bm25
 
 
 def load_json_object(path: Path) -> dict[str, Any]:
@@ -113,7 +113,7 @@ def search_evidence(
     if not isinstance(documents, list) or not isinstance(postings, dict):
         raise ValueError("BM25 索引结构无效。")
 
-    query_tokens = list(dict.fromkeys(tokenize(cleaned_query)))
+    query_tokens = list(dict.fromkeys(tokenize_bm25(cleaned_query)))
     scores: defaultdict[int, float] = defaultdict(float)
     document_count = int(index.get("document_count", 0))
     average_length = float(index.get("average_document_length", 0.0)) or 1.0

@@ -563,7 +563,10 @@ def evaluate_reranked(
 ) -> dict[str, Any]:
     """在同一 qrels 上评测 RRF Top-N 的 Cross-Encoder 精排。"""
 
-    from app.retrieval.reranked import search_reranked_evidence
+    from app.retrieval.reranked import (
+        DEFAULT_RRF_RANK_WEIGHT,
+        search_reranked_evidence,
+    )
 
     root = project_root.expanduser().resolve()
     questions = load_retrieval_questions(questions_path)
@@ -678,6 +681,7 @@ def evaluate_reranked(
             "reranker_max_length": getattr(reranker_provider, "max_length", None),
             "candidate_limit": candidate_limit,
             "rrf_k": rrf_k,
+            "rrf_rank_weight": DEFAULT_RRF_RANK_WEIGHT,
             "performance": {
                 "embedding_warmup_ms": round(embedding_warmup_ms, 3),
                 "reranker_warmup_ms": round(reranker_warmup_ms, 3),

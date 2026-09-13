@@ -18,10 +18,11 @@ from qdrant_client import QdrantClient, models
 
 from app.embeddings.base import EmbeddingProvider
 from app.indexing.paper import load_paper_records, papers_digest, paper_retrieval_text
+from app.indexing.tokenization import TOKENIZER_VERSION
 from app.storage import write_json_atomic
 
 
-PAPER_DENSE_SCHEMA_VERSION = "1.0"
+PAPER_DENSE_SCHEMA_VERSION = "1.1"
 PAPER_DENSE_TEXT_POLICY_VERSION = "1.0"
 DEFAULT_PAPER_DENSE_COLLECTION = "leo_papers_dense"
 PAPER_VECTOR_NAME = "dense"
@@ -40,6 +41,7 @@ class PaperDenseBuildReport:
     papers_digest: str
     model_name: str
     model_revision: str | None
+    model_artifact_fingerprint: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -81,8 +83,19 @@ def build_paper_dense_index(
     digest = papers_digest(papers)
     model_name = getattr(provider, "model_name", None)
     revision = getattr(provider, "revision", None)
+    artifact_fingerprint = getattr(provider, "artifact_fingerprint", None)
     if not isinstance(model_name, str) or not model_name:
         raise ValueError("EmbeddingProvider 必须暴露非空 model_name。")
+    if revision is not None and not isinstance(revision, str):
+        raise ValueError("EmbeddingProvider revision 必须是字符串或 None。")
+    if artifact_fingerprint is not None and not isinstance(artifact_fingerprint, str):
+        raise ValueError(
+            "EmbeddingProvider artifact_fingerprint 必须是字符串或 None。"
+        )
+    if revision is None and not artifact_fingerprint:
+        raise ValueError(
+            "EmbeddingProvider 必须提供精确 revision 或稳定 artifact_fingerprint。"
+        )
     index_path = paper_dense_index_path(root)
     manifest_path = paper_dense_manifest_path(root)
     if not force and index_path.is_dir() and manifest_path.is_file():
@@ -94,13 +107,14 @@ def build_paper_dense_index(
                 manifest.get("papers_digest") == digest,
                 manifest.get("model_name") == model_name,
                 manifest.get("model_revision") == revision,
+                manifest.get("model_artifact_fingerprint") == artifact_fingerprint,
                 manifest.get("collection_name") == collection_name,
             )
         ):
             return PaperDenseBuildReport(
                 "reused", collection_name, str(index_path), str(manifest_path),
                 len(papers), 0, int(manifest.get("vector_dimension", 0)), digest,
-                model_name, revision,
+                model_name, revision, artifact_fingerprint,
             )
 
     vectors = provider.embed_documents([paper_retrieval_text(value) for value in papers])
@@ -152,12 +166,13 @@ def build_paper_dense_index(
         "distance": "Cosine",
         "model_name": model_name,
         "model_revision": revision,
+        "model_artifact_fingerprint": artifact_fingerprint,
         "vector_dimension": dimension,
         "paper_count": len(papers),
         "papers_digest": digest,
         "point_id_policy": "uuid5(paper_id)",
         "index_epoch": f"PA_{digest[:16]}",
-        "tokenizer_version": "app.indexing.tokenization.v1",
+        "tokenizer_version": TOKENIZER_VERSION,
         "chunker_version": "app.chunking.chunker.v2.2",
     }
     swapped = False
@@ -180,5 +195,5 @@ def build_paper_dense_index(
         shutil.rmtree(backup_path)
     return PaperDenseBuildReport(
         "built", collection_name, str(index_path), str(manifest_path), len(papers),
-        len(papers), dimension, digest, model_name, revision,
+        len(papers), dimension, digest, model_name, revision, artifact_fingerprint,
     )

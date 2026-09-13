@@ -24,6 +24,7 @@ class FakeEmbeddingProvider:
     model_name = "fixture/dense"
     revision = "0123456789abcdef"
     normalized = True
+    artifact_fingerprint = None
 
     def __init__(self) -> None:
         self.document_calls = 0
@@ -211,6 +212,26 @@ def test_qdrant_manifest_reuse_search_filters_and_stale_rejection(
     write_chunks(tmp_path, chunks)
     with pytest.raises(RuntimeError, match="manifest.*不一致"):
         search_dense_evidence(tmp_path, provider, "alpha")
+
+
+def test_dense_manifest_accepts_artifact_fingerprint_without_remote_revision(
+    tmp_path: Path,
+) -> None:
+    class ArtifactOnlyProvider(FakeEmbeddingProvider):
+        revision = None
+        artifact_fingerprint = "local-artifact:fixture-v1"
+
+    values = [chunk("C_alpha", "W_alpha", "D_alpha", "B_alpha", "alpha evidence")]
+    write_chunks(tmp_path, values)
+    provider = ArtifactOnlyProvider()
+
+    report = build_dense_index(tmp_path, provider)
+
+    assert report.model_revision is None
+    assert report.model_artifact_fingerprint == "local-artifact:fixture-v1"
+    assert load_dense_manifest(tmp_path)["model_artifact_fingerprint"] == (
+        "local-artifact:fixture-v1"
+    )
 
 
 def test_hybrid_search_fuses_local_bm25_and_dense(tmp_path: Path) -> None:

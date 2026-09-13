@@ -8,11 +8,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from app.indexing.tokenization import tokenize
+from app.indexing.tokenization import tokenize_bm25
 from app.storage import write_json_atomic
 
 
-BM25_SCHEMA_VERSION = "2.1"
+BM25_SCHEMA_VERSION = "2.3"
 
 
 def chunks_digest(chunks: list[dict[str, Any]]) -> str:
@@ -69,9 +69,23 @@ def searchable_chunk_text(chunk: dict[str, Any]) -> str:
         if isinstance(overlap_context, dict)
         else ""
     )
-    # 标题和章节名称重复一次，给予论文/章节级术语适度权重。
+    # 标题和章节名称重复多次，提升方法名、算法名和结果章节等结构信号
+    # 的权重，避免同一论文中大量通用的 receiver/satellite/state 词淹没
+    # 真正包含答案的章节。
     return "\n".join(
-        (title, title, section, section, *parent_parts, overlap_content, content)
+        (
+            title,
+            title,
+            title,
+            title,
+            section,
+            section,
+            section,
+            section,
+            *parent_parts,
+            overlap_content,
+            content,
+        )
     )
 
 
@@ -80,7 +94,7 @@ def build_bm25_index(chunks: list[dict[str, Any]]) -> dict[str, Any]:
     documents: list[dict[str, Any]] = []
     total_length = 0
     for index, chunk in enumerate(chunks):
-        tokens = tokenize(searchable_chunk_text(chunk))
+        tokens = tokenize_bm25(searchable_chunk_text(chunk))
         frequencies = Counter(tokens)
         total_length += len(tokens)
         documents.append(

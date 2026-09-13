@@ -14,11 +14,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from app.indexing.tokenization import tokenize
+from app.indexing.tokenization import tokenize_bm25
 from app.storage import write_json_atomic, write_jsonl_atomic
 
 
-PAPER_BM25_SCHEMA_VERSION = "1.1"
+PAPER_BM25_SCHEMA_VERSION = "1.2"
 
 
 @dataclass(frozen=True)
@@ -281,7 +281,7 @@ def build_paper_bm25_index(
     documents: list[dict[str, Any]] = []
     total_length = 0
     for paper_index, paper in enumerate(values):
-        tokens = tokenize(paper_retrieval_text(paper))
+        tokens = tokenize_bm25(paper_retrieval_text(paper))
         frequencies = Counter(tokens)
         total_length += len(tokens)
         documents.append({**paper, "length": len(tokens)})
@@ -291,7 +291,7 @@ def build_paper_bm25_index(
         "paper_bm25_schema_version": PAPER_BM25_SCHEMA_VERSION,
         "papers_digest": digest,
         "index_epoch": f"PA_{digest[:16]}",
-        "tokenizer_version": "app.indexing.tokenization.v1",
+        "tokenizer_version": "app.indexing.tokenization.v2",
         "document_count": len(documents),
         "average_document_length": total_length / len(documents) if documents else 0.0,
         "documents": documents,

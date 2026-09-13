@@ -10,6 +10,7 @@ from app.embeddings.base import EmbeddingProvider
 from app.indexing.dense import build_dense_index
 from app.indexing.paper import load_paper_records, papers_digest
 from app.indexing.paper_dense import build_paper_dense_index
+from app.indexing.tokenization import TOKENIZER_VERSION
 
 
 def build_hierarchical_indexes(
@@ -49,7 +50,7 @@ def build_hierarchical_indexes(
                 "source_fingerprint": f"{paper_dense.papers_digest}:{chunk_dense.chunks_digest}",
                 "embedding_model": chunk_dense.model_name,
                 "embedding_revision": chunk_dense.model_revision,
-                "tokenizer_version": "app.indexing.tokenization.v1",
+                "tokenizer_version": TOKENIZER_VERSION,
                 "chunker_version": knowledge.chunk_policy_version,
                 "status": "active",
             })

@@ -23,7 +23,7 @@ from app.indexing.paper_dense import (
     load_paper_dense_manifest,
     paper_dense_index_path,
 )
-from app.indexing.tokenization import normalize_search_text, tokenize
+from app.indexing.tokenization import normalize_search_text, tokenize_bm25
 
 
 def _validate_limit(value: int, field: str, maximum: int = 100) -> int:
@@ -103,7 +103,7 @@ def search_paper_bm25(
     current_papers = load_paper_records(project_root)
     if index.get("papers_digest") != papers_digest(current_papers):
         raise RuntimeError("Paper BM25 索引与 Paper metadata 不一致，请重新构建索引。")
-    query_tokens = list(dict.fromkeys(tokenize(cleaned)))
+    query_tokens = list(dict.fromkeys(tokenize_bm25(cleaned)))
     count = int(index.get("document_count", len(documents)))
     average = float(index.get("average_document_length", 0.0)) or 1.0
     scores: defaultdict[int, float] = defaultdict(float)
@@ -175,7 +175,14 @@ def search_paper_dense(
     papers = load_paper_records(root)
     if manifest.get("papers_digest") != papers_digest(papers):
         raise RuntimeError("Paper Dense manifest 与 Paper metadata 不一致，请重新构建索引。")
-    if manifest.get("model_name") != getattr(provider, "model_name", None) or manifest.get("model_revision") != getattr(provider, "revision", None):
+    provider_model = getattr(provider, "model_name", None)
+    provider_revision = getattr(provider, "revision", None)
+    provider_artifact = getattr(provider, "artifact_fingerprint", None)
+    if (
+        manifest.get("model_name") != provider_model
+        or manifest.get("model_revision") != provider_revision
+        or manifest.get("model_artifact_fingerprint") != provider_artifact
+    ):
         raise RuntimeError("Paper Dense manifest 与当前 EmbeddingProvider 不一致。")
     vector = provider.embed_query(cleaned)
     if len(vector) != int(manifest.get("vector_dimension", 0)):
