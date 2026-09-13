@@ -166,6 +166,18 @@ Phase 4: End-to-End Validation, Release Hardening & Project Finalization
 - Made Patch and Writing Runtime review identifiers deterministic per request so a
   resumed Domain execution cannot create a duplicate immutable proposal.
 
+## Phase 4R Console finalization
+
+- Added the read-only Scholar Web Console at `/scholar`, reusing the existing
+  ScholarHarnessService, Session/Project stores, Harness diagnostics and
+  Evaluation suite.
+- Added Run snapshot and deterministic Run Event projection plus SSE replay with an
+  `after` cursor; no second workflow state or unrestricted file/data access was added.
+- Added Evidence/Citation, Manuscript State, DraftPatch, Runtime and Evaluation
+  panels, with a clearly labelled fixture-only `/scholar?demo=1` mode.
+- Added Console contract tests, React production build coverage and browser checks;
+  the Console remains usable while the real external Provider is unavailable.
+
 ## V1 release status
 
 The implementation scope is frozen for V1 validation. V1 is not yet released:

@@ -39,6 +39,7 @@ from app.web.models import (
     ScholarTaskRequest,
 )
 from app.web.runtime import EmitProgress, LocalRAGWebRuntime
+from app.scholar.console import ScholarConsoleProjection, demo_console_payload
 
 
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
@@ -141,6 +142,11 @@ def create_app(
                 bundle = production_factory.build()
                 app.state.scholar_runtime = bundle
                 app.state.scholar_harness = bundle.harness
+                app.state.scholar_console = ScholarConsoleProjection(
+                    root,
+                    project_store=bundle.project_store,
+                    session_manager=bundle.session_manager,
+                )
             yield
         finally:
             if production_factory is not None:
@@ -163,6 +169,7 @@ def create_app(
     app.state.scholar_harness = scholar_harness or getattr(web_runtime, "scholar_harness", None)
     app.state.scholar_runtime = None
     app.state.scholar_runtime_factory = production_factory
+    app.state.scholar_console = ScholarConsoleProjection(root, project_store=project_store)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -226,6 +233,59 @@ def create_app(
             return result.to_dict() if callable(getattr(result, "to_dict", None)) else dict(result)
         except Exception as error:
             raise _http_error(error) from error
+
+    @app.get("/api/scholar/runs/{run_id}")
+    def scholar_run_snapshot(run_id: str) -> dict[str, Any]:
+        try:
+            return app.state.scholar_console.run_snapshot(run_id)
+        except Exception as error:
+            raise _http_error(error) from error
+
+    @app.get("/api/scholar/runs/{run_id}/events")
+    async def scholar_run_events(run_id: str, after: int = 0) -> StreamingResponse:
+        try:
+            app.state.scholar_console.run_snapshot(run_id)
+        except Exception as error:
+            raise _http_error(error) from error
+
+        async def stream() -> AsyncIterator[str]:
+            events = app.state.scholar_console.run_events(run_id)
+            for index, event in enumerate(events):
+                if index < after:
+                    continue
+                payload = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                yield f"id: {index + 1}\nevent: scholar_run\ndata: {payload}\n\n"
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/api/scholar/projects/{project_id}/state")
+    def scholar_project_state(project_id: str) -> dict[str, Any]:
+        try:
+            return app.state.scholar_console.project_state(project_id)
+        except Exception as error:
+            raise _http_error(error) from error
+
+    @app.get("/api/scholar/projects/{project_id}/evidence")
+    def scholar_project_evidence(project_id: str, run_id: str | None = None) -> dict[str, Any]:
+        try:
+            return app.state.scholar_console.evidence_view(project_id, run_id=run_id)
+        except Exception as error:
+            raise _http_error(error) from error
+
+    @app.get("/api/scholar/runs/{run_id}/evaluation")
+    def scholar_run_evaluation(run_id: str) -> dict[str, Any]:
+        try:
+            return app.state.scholar_console.evaluation(run_id)
+        except Exception as error:
+            raise _http_error(error) from error
+
+    @app.get("/api/scholar/demo")
+    def scholar_demo() -> dict[str, Any]:
+        return demo_console_payload()
 
     @app.post("/api/scholar/patches/{patch_id}/accept")
     def accept_patch(patch_id: str, request: PatchDecisionRequest) -> Response:
@@ -301,6 +361,24 @@ def create_app(
     @app.get("/api/system/status")
     def system_status() -> dict[str, Any]:
         return web_runtime.public_status()
+
+    @app.get("/api/scholar/runtime/status")
+    def scholar_runtime_status() -> dict[str, Any]:
+        bundle = app.state.scholar_runtime
+        if bundle is None:
+            return {
+                "status": "NOT_STARTED",
+                "mode": None,
+                "checkpoint": None,
+                "persistent": False,
+            }
+        return {
+            "status": "CLOSED" if bundle._closed else "READY",
+            "mode": bundle.mode,
+            "checkpoint": type(bundle.checkpointer).__name__,
+            "persistent": type(bundle.checkpointer).__name__ != "InMemorySaver",
+            "project_id": bundle.project_store.project_id,
+        }
 
     @app.get("/api/papers")
     def papers() -> dict[str, Any]:

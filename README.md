@@ -62,6 +62,22 @@ Scholar 请求和恢复使用同一个入口：
 `scholar patch accept PATCH_ID ...`。Agent 永远不能直接修改 `.tex`、`.bib` 或
 执行 Approval。
 
+### Scholar Web Console
+
+启动 Web API 后访问 [`http://127.0.0.1:8000/scholar`](http://127.0.0.1:8000/scholar)。
+Console 通过同一个 `ScholarHarnessService` 发起或恢复 Scholar Request，并读取
+真实 Run Event、Evidence/Citation、Manuscript State、DraftPatch、Checkpoint 和
+Evaluation。它是 Agent/Research observability surface，不是 LaTeX IDE；VS Code
++ LaTeX Workshop 继续负责正文编辑、Diff、人工 Accept/Reject、Build 和 PDF
+Preview。
+
+无 Provider 时可访问 `/scholar?demo=1` 查看固定演示界面。页面会明确显示
+`DEMO / FIXTURE DATA`，Demo 不连接 LLM、不能替代 Production E2E，也不会把
+fixture 结果写入 Project。
+
+Console 的后端读模型、Run Event/SSE replay、Evidence/Citation 和 Demo 边界见
+[`docs/architecture/scholar-console.md`](docs/architecture/scholar-console.md)。
+
 ### 可复现 Demo 与 Evaluation
 
 `examples/scholar-demo/` 是一个小型但真实主题的 LEO LaTeX Project。使用现有

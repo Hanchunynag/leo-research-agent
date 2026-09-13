@@ -1,5 +1,6 @@
 import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
 import { AgenticResult, api, Evidence, PaperRecord, SessionRecord, watchJob } from "./api";
+import ScholarConsole from "./ScholarConsole";
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -27,7 +28,7 @@ function formatAuthors(authors: string[]) {
   return authors.length > 2 ? `${authors.slice(0, 2).join(", ")} 等` : authors.join(", ");
 }
 
-function App() {
+function LegacyApp() {
   const [papers, setPapers] = useState<PaperRecord[]>([]);
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -408,4 +409,6 @@ function Diagnostics({ result, system }: { result: AgenticResult | null; system:
   );
 }
 
-export default App;
+export default function App() {
+  return window.location.pathname.startsWith("/scholar") ? <ScholarConsole /> : <LegacyApp />;
+}

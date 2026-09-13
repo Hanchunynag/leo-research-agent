@@ -481,6 +481,16 @@ class ScholarProjectStore:
             raise KeyError(f"Patch 不存在：{patch_id}")
         return _stored_patch_from_row(row)
 
+    def list_patches(self) -> list[object]:
+        """Read-only Project patch projection for Console/approval views."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM patches WHERE project_id=? ORDER BY created_at, patch_id",
+                (self.project_id,),
+            ).fetchall()
+        return [_stored_patch_from_row(row) for row in rows]
+
     def transition_patch(
         self,
         patch_id: str,

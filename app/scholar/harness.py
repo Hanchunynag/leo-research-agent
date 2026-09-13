@@ -536,6 +536,36 @@ class ScholarHarnessService:
             return
 
     @staticmethod
+    def _session_run_metadata(
+        harness: ResearchRunHarness,
+        *,
+        task_type: str | None = None,
+        selected_skill: str | None = None,
+        resumed: bool = False,
+        termination_reason: str | None = None,
+        result_type: str | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist the bounded Harness projection used by the Console.
+
+        Session Runtime remains the owner of run metadata.  The projection is
+        intentionally the already-redacted Harness diagnostics, not Domain
+        state or a second trace store; the Console can therefore reopen a
+        completed run without relying on an in-process object.
+        """
+
+        value: dict[str, Any] = {
+            "task_type": task_type,
+            "selected_skill": selected_skill,
+            "resumed": resumed,
+            "termination_reason": termination_reason or harness.termination_reason,
+            "result_type": result_type,
+            "harness": harness.diagnostics(),
+        }
+        value.update(dict(extra or {}))
+        return value
+
+    @staticmethod
     def _failure_reason(error: Exception) -> str:
         code = str(getattr(error, "code", ""))
         message = str(error)
@@ -1087,7 +1117,14 @@ class ScholarHarnessService:
                 session_id=session,
                 run_id=run_id,
                 status="FAILED",
-                metadata={"error_type": type(error).__name__, "error": str(error), "termination_reason": reason},
+                metadata=self._session_run_metadata(
+                    run_harness,
+                    task_type=decision.task_type,
+                    selected_skill=definition.name,
+                    resumed=resume_value is not _NO_RESUME,
+                    termination_reason=reason,
+                    extra={"error_type": type(error).__name__, "error": str(error)},
+                ),
             )
             return ScholarHarnessResult(
                 decision.task_type,
@@ -1210,7 +1247,14 @@ class ScholarHarnessService:
                     session_id=session,
                     run_id=run_id,
                     status="INTERRUPTED",
-                    metadata=interrupt_metadata,
+                    metadata=self._session_run_metadata(
+                        run_harness,
+                        task_type=decision.task_type,
+                        selected_skill=definition.name,
+                        resumed=resume_value is not _NO_RESUME,
+                        termination_reason="checkpoint_interrupt",
+                        extra=interrupt_metadata,
+                    ),
                 )
                 return ScholarHarnessResult(
                     decision.task_type,
@@ -1244,7 +1288,14 @@ class ScholarHarnessService:
                 session_id=session,
                 run_id=run_id,
                 status="FAILED",
-                metadata={"error_type": type(error).__name__, "error": str(error), "termination_reason": reason},
+                metadata=self._session_run_metadata(
+                    run_harness,
+                    task_type=decision.task_type,
+                    selected_skill=definition.name,
+                    resumed=resume_value is not _NO_RESUME,
+                    termination_reason=reason,
+                    extra={"error_type": type(error).__name__, "error": str(error)},
+                ),
             )
             return ScholarHarnessResult(
                 decision.task_type,
@@ -1341,10 +1392,21 @@ class ScholarHarnessService:
             run_id=run_id,
             status="COMPLETED" if str(skill_status) != "FAILED" else "FAILED",
             value=value,
-            metadata={
-                "termination_reason": run_harness.termination_reason,
-                "result_type": type(value).__name__ if value is not None else None,
-            },
+            metadata=self._session_run_metadata(
+                run_harness,
+                task_type=decision.task_type,
+                selected_skill=definition.name,
+                resumed=resume_value is not _NO_RESUME,
+                result_type=type(value).__name__ if value is not None else None,
+                extra={
+                    "visible_capabilities": metadata["visible_capabilities"],
+                    "visible_tools": metadata["visible_tools"],
+                    "unexpected_tool_calls": metadata["unexpected_tool_calls"],
+                    "capability_violations": metadata["capability_violations"],
+                    "context_budget": metadata["context_budget"],
+                    "skill_metadata_loaded_progressively": True,
+                },
+            ),
         )
         return ScholarHarnessResult(
             decision.task_type,
