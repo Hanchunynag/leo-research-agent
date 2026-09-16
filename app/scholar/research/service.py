@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import re
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime
-from threading import RLock
+from threading import BoundedSemaphore, RLock
 from time import perf_counter
 from typing import Any
 
@@ -46,6 +47,9 @@ from app.scholar.research.web import WebLiteratureAdapter, canonical_identity
 from app.workspaces import WorkspaceService
 
 
+ResearchProgressCallback = Callable[[str, str, Mapping[str, Any]], None]
+
+
 def _strings(value: Any) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
@@ -73,6 +77,7 @@ class ResearchCapabilityService:
         workspace_id: str | None = None,
         scope_version: int | None = None,
         web: WebLiteratureAdapter | None = None,
+        max_parallel_retrievals: int = 3,
     ) -> None:
         self.knowledge = knowledge
         inferred_evidence = evidence or getattr(knowledge, "evidence", None)
@@ -91,11 +96,19 @@ class ResearchCapabilityService:
         self.scope_version = int(scope_version or getattr(knowledge, "scope_version", 1))
         self.last_diagnostics: dict[str, Any] = {}
         self.web = web
-        # Qdrant local mode is a single-process resource and the embedding
-        # provider may lazily initialize a model. LangGraph's ToolNode can
-        # invoke multiple Research tools concurrently, so serialize the
-        # existing local retrieval boundary without changing Domain contracts.
+        if isinstance(max_parallel_retrievals, bool) or not 1 <= max_parallel_retrievals <= 8:
+            raise ValueError("max_parallel_retrievals 必须在 1 到 8 之间。")
+        self.max_parallel_retrievals = max_parallel_retrievals
+        # Direct capability calls retain the legacy serialized boundary. The
+        # explicit ``parallel=True`` path below uses a bounded semaphore for
+        # independent ResearchNeeds and per-paper coverage backfills. This is
+        # important for local Qdrant/BGE resources: concurrency is deliberate
+        # and bounded, never an unbounded thread fan-out.
         self._retrieval_lock = RLock()
+        self._retrieval_slots = BoundedSemaphore(max_parallel_retrievals)
+        self._evidence_lock = RLock()
+        self._diagnostics_lock = RLock()
+        self._request_diagnostics: dict[str, dict[str, Any]] = {}
         if web is not None and hasattr(self.evidence, "external_resolver"):
             self.evidence.external_resolver = web.resolve
 
@@ -192,8 +205,10 @@ class ResearchCapabilityService:
         *,
         limit: int,
         paper_filters: Mapping[str, Any] | None = None,
+        parallel: bool = False,
     ) -> dict[str, Any]:
-        with self._retrieval_lock:
+        boundary = self._retrieval_slots if parallel else self._retrieval_lock
+        with boundary:
             started = perf_counter()
             response = self.knowledge.retrieve(
                 request.query,
@@ -208,12 +223,15 @@ class ResearchCapabilityService:
             )
             if not isinstance(response, Mapping):
                 raise RuntimeError("UnifiedKnowledgeService 返回了非对象结果。")
-            self.last_diagnostics = {
+            diagnostics = {
                 "request_id": request.request_id,
                 "query": request.query[:160],
                 "elapsed_ms": round((perf_counter() - started) * 1000, 3),
                 "retriever": response.get("retriever"),
             }
+            with self._diagnostics_lock:
+                self.last_diagnostics = diagnostics
+                self._request_diagnostics.setdefault(request.request_id, {}).update(diagnostics)
             return dict(response)
 
     def search_papers(
@@ -226,6 +244,7 @@ class ResearchCapabilityService:
         document_ids: Sequence[str] | None = None,
         paper_ids: Sequence[str] | None = None,
         filters: Mapping[str, Any] | None = None,
+        parallel: bool = False,
     ) -> PaperSearchResult:
         normalized = self._request(request, top_k=top_k, paper_ids=paper_ids)
         if year_from is not None or year_to is not None or document_ids is not None:
@@ -236,7 +255,12 @@ class ResearchCapabilityService:
                 document_ids=tuple(document_ids) if document_ids is not None else normalized.document_ids,
             )
         limit = self._limit(normalized, top_k, "max_papers")
-        response = self._retrieve(normalized, limit=limit, paper_filters={**self._filters(normalized), **dict(filters or {})})
+        response = self._retrieve(
+            normalized,
+            limit=limit,
+            paper_filters={**self._filters(normalized), **dict(filters or {})},
+            parallel=parallel,
+        )
         raw = response.get("candidate_papers")
         if not isinstance(raw, list):
             paper_stage = response.get("paper_retrieval")
@@ -316,6 +340,7 @@ class ResearchCapabilityService:
         paper_ids: Sequence[str] | None = None,
         section_types: Sequence[str] | None = None,
         top_k: int | None = None,
+        parallel: bool = False,
     ) -> SectionSearchResult:
         normalized = self._request(
             request,
@@ -328,6 +353,7 @@ class ResearchCapabilityService:
             normalized,
             limit=min(max(limit * 5, limit), 100),
             paper_filters=self._filters(normalized),
+            parallel=parallel,
         )
         raw = response.get("results")
         sections: list[SectionCandidate] = []
@@ -477,12 +503,17 @@ class ResearchCapabilityService:
                 raise EvidenceValidationError("EvidenceCandidate work/chunk 归属不一致。")
             if candidate.block_ids and not set(candidate.block_ids).issubset(set(locator.block_ids)):
                 raise EvidenceValidationError("EvidenceCandidate block/chunk 归属不一致。")
-            if candidate.retrieval_source not in {"lightrag_entity", "lightrag_relation"} and not _same_text(candidate.content, locator.content):
+            if not _same_text(candidate.content, locator.content):
                 raise EvidenceValidationError(f"EvidenceCandidate source text 不匹配：{candidate.candidate_id}")
-        bundle = self.evidence.verify(evidence_request, candidates)
-        if bundle.rejected_candidate_ids:
-            raise EvidenceValidationError(f"EvidenceCandidate 未通过 canonical/workspace 校验：{list(bundle.rejected_candidate_ids)}")
-        return bundle
+        # EvidenceIntelligencePipeline keeps diagnostics on the instance. A
+        # parallel ResearchNeeds batch may validate multiple packs at once,
+        # so serialize only this shared mutable governance boundary; retrieval
+        # itself remains parallel.
+        with self._evidence_lock:
+            bundle = self.evidence.verify(evidence_request, candidates)
+            if bundle.rejected_candidate_ids:
+                raise EvidenceValidationError(f"EvidenceCandidate 未通过 canonical/workspace 校验：{list(bundle.rejected_candidate_ids)}")
+            return bundle
 
     def validate_candidates(self, request: ResearchRequest, candidates: Sequence[EvidenceCandidate]) -> tuple[VerifiedEvidence, ...]:
         return tuple(self._validated_bundle(request, candidates).evidence)
@@ -545,7 +576,7 @@ class ResearchCapabilityService:
             "publication_date": value.publication_date.isoformat() if value.publication_date else None,
             "retrieved_at": value.retrieved_at.isoformat() if value.retrieved_at else None,
             "provider": value.provider,
-            "validation_status": value.validation_status,
+            "validation_status": value.validation_status or "canonical_locator_verified",
             "metadata": metadata,
         }
 
@@ -558,9 +589,11 @@ class ResearchCapabilityService:
         freshness: FreshnessDecision | None = None,
     ) -> EvidencePack:
         evidence_request = self._evidence_request(request, request.budget.max_evidence_items)
-        bundle = self._validated_bundle(request, candidates)
-        verified = tuple(bundle.evidence)
-        selected = self.evidence.select(evidence_request, bundle)
+        with self._evidence_lock:
+            bundle = self._validated_bundle(request, candidates)
+            verified = tuple(bundle.evidence)
+            selected = self.evidence.select(evidence_request, bundle)
+            pipeline_conflicts = tuple(self.evidence.last_diagnostics.get("conflicts", ()))
         selected_by_id = {item.evidence.evidence_id for item in selected}
         final_evidence = tuple(value for value in verified if value.evidence_id in selected_by_id)
         evidence_maps = tuple(self._evidence_mapping(value) for value in final_evidence)
@@ -607,7 +640,7 @@ class ResearchCapabilityService:
             "evidence_count": len(evidence_maps),
             "local_only": not web_used,
             "source_types": sorted({value.source_type for value in final_evidence}),
-            "conflicts": tuple(self.evidence.last_diagnostics.get("conflicts", ())),
+            "conflicts": pipeline_conflicts,
         }
         if freshness is not None:
             metadata["freshness_decision"] = freshness.to_dict()
@@ -624,11 +657,204 @@ class ResearchCapabilityService:
             metadata=metadata,
         )
 
-    def _local_candidates(self, request: ResearchRequest) -> tuple[EvidenceCandidate, ...]:
+    def _local_candidates(
+        self,
+        request: ResearchRequest,
+        *,
+        parallel: bool = False,
+        progress_callback: ResearchProgressCallback | None = None,
+        cancellation_checker: Callable[[], None] | None = None,
+    ) -> tuple[EvidenceCandidate, ...]:
         """小型组合入口；三个 capability 仍可独立调用和测试。"""
-        papers = self.search_papers(request, top_k=request.budget.max_papers)
+        def check_cancelled() -> None:
+            if cancellation_checker is not None:
+                cancellation_checker()
+
+        def notify(name: str, status: str, details: Mapping[str, Any] | None = None) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(name, status, details or {})
+            except Exception:
+                # Progress is an observability side effect. A broken event
+                # sink must never make a valid research request fail.
+                return
+
+        check_cancelled()
+        notify(
+            "research_stage",
+            "RUNNING",
+            {"phase": "paper_search", "progress": 0.05},
+        )
+        papers = self.search_papers(
+            request,
+            top_k=request.budget.max_papers,
+            parallel=parallel,
+        )
+        check_cancelled()
+        notify(
+            "research_stage",
+            "COMPLETED",
+            {
+                "phase": "paper_search",
+                "progress": 0.25,
+                "paper_candidate_count": len(papers.papers),
+            },
+        )
         paper_ids = request.paper_ids or tuple(value.paper_id for value in papers.papers)
-        sections = self.search_sections(request, paper_ids=paper_ids, top_k=request.budget.max_sections)
+        notify(
+            "research_stage",
+            "RUNNING",
+            {
+                "phase": "section_search",
+                "progress": 0.30,
+                "paper_count": len(paper_ids),
+            },
+        )
+        sections = self.search_sections(
+            request,
+            paper_ids=paper_ids,
+            top_k=request.budget.max_sections,
+            parallel=parallel,
+        )
+        check_cancelled()
+        notify(
+            "research_stage",
+            "COMPLETED",
+            {
+                "phase": "section_search",
+                "progress": 0.55,
+                "section_count": len(sections.sections),
+                "content_candidate_paper_count": len({value.paper_id for value in sections.sections}),
+            },
+        )
+        if bool(request.metadata.get("ensure_paper_coverage")) and paper_ids:
+            # Keep the global Paper-Level result as the sole source of the
+            # candidate set. If global content Top-K is concentrated in a few
+            # papers, fill only the missing papers with a paper-filtered
+            # second-stage request. This remains BM25 + Dense + RRF inside the
+            # Paper-Level shortlist; it never performs a global Chunk-first
+            # retrieval and never changes any index.
+            seen_papers = {value.paper_id for value in sections.sections}
+            section_values = list(sections.sections)
+            raw_target = request.metadata.get("minimum_unique_papers")
+            target_papers = request.budget.max_papers
+            if isinstance(raw_target, int) and not isinstance(raw_target, bool) and raw_target >= 1:
+                target_papers = min(request.budget.max_papers, raw_target)
+            missing_papers = [
+                paper for paper in papers.papers
+                if paper.paper_id not in seen_papers
+            ][: max(0, target_papers - len(seen_papers))]
+
+            notify(
+                "research_stage",
+                "RUNNING" if missing_papers else "COMPLETED",
+                {
+                    "phase": "coverage_backfill",
+                    "progress": 0.60 if missing_papers else 0.75,
+                    "target_paper_count": target_papers,
+                    "existing_paper_count": len(seen_papers),
+                    "backfill_count": len(missing_papers),
+                },
+            )
+
+            def focused_search(paper: PaperCandidate) -> SectionSearchResult:
+                check_cancelled()
+                focused_request = replace(
+                    request,
+                    query=f"{request.query} {paper.title}".strip(),
+                    paper_ids=(paper.paper_id,),
+                )
+                return self.search_sections(
+                    focused_request,
+                    paper_ids=(paper.paper_id,),
+                    top_k=1,
+                    parallel=parallel,
+                )
+
+            # Every backfill query is independent. ``executor.map`` retains
+            # Paper-Level rank order even when the individual searches finish
+            # out of order, so evidence/citation output remains deterministic.
+            def focused_search_with_progress(
+                index: int, paper: PaperCandidate
+            ) -> SectionSearchResult:
+                notify(
+                    "research_coverage_item",
+                    "RUNNING",
+                    {
+                        "phase": "coverage_backfill",
+                        "coverage_index": index,
+                        "coverage_total": len(missing_papers),
+                        "paper_rank": paper.rank,
+                    },
+                )
+                try:
+                    check_cancelled()
+                    result = focused_search(paper)
+                except Exception:
+                    notify(
+                        "research_coverage_item",
+                        "FAILED",
+                        {
+                            "phase": "coverage_backfill",
+                            "coverage_index": index,
+                            "coverage_total": len(missing_papers),
+                            "paper_rank": paper.rank,
+                        },
+                    )
+                    raise
+                notify(
+                    "research_coverage_item",
+                    "COMPLETED",
+                    {
+                        "phase": "coverage_backfill",
+                        "coverage_index": index,
+                        "coverage_total": len(missing_papers),
+                        "paper_rank": paper.rank,
+                        "found": bool(result.sections),
+                    },
+                )
+                return result
+
+            indexed_missing = tuple(enumerate(missing_papers, 1))
+            if parallel and len(missing_papers) > 1:
+                with ThreadPoolExecutor(
+                    max_workers=min(self.max_parallel_retrievals, len(missing_papers)),
+                    thread_name_prefix="paper-coverage",
+                ) as executor:
+                    focused_results = executor.map(
+                        lambda value: focused_search_with_progress(*value), indexed_missing
+                    )
+                    for (_, paper), focused in zip(indexed_missing, focused_results, strict=True):
+                        if focused.sections:
+                            section_values.append(focused.sections[0])
+                            seen_papers.add(paper.paper_id)
+            else:
+                for index, paper in indexed_missing:
+                    focused = focused_search_with_progress(index, paper)
+                    if focused.sections:
+                        section_values.append(focused.sections[0])
+                        seen_papers.add(paper.paper_id)
+            sections = replace(sections, sections=tuple(section_values))
+            check_cancelled()
+            notify(
+                "research_stage",
+                "COMPLETED",
+                {
+                    "phase": "coverage_backfill",
+                    "progress": 0.75,
+                    "target_paper_count": target_papers,
+                    "content_candidate_paper_count": len(seen_papers),
+                },
+            )
+        request_diagnostics = {
+            "paper_candidate_count": len(papers.papers),
+            "paper_candidate_ids": [value.paper_id for value in papers.papers],
+            "content_candidate_paper_count": len({value.paper_id for value in sections.sections}),
+        }
+        with self._diagnostics_lock:
+            self.last_diagnostics.update(request_diagnostics)
+            self._request_diagnostics.setdefault(request.request_id, {}).update(request_diagnostics)
         refs = tuple(
             EvidenceRef(
                 paper_id=value.paper_id,
@@ -638,7 +864,18 @@ class ResearchCapabilityService:
             )
             for value in sections.sections
         )
+        check_cancelled()
         sources = self.read_evidence(refs)
+        check_cancelled()
+        notify(
+            "research_stage",
+            "COMPLETED",
+            {
+                "phase": "evidence_read",
+                "progress": 1.0,
+                "evidence_count": len(sources),
+            },
+        )
         source_by_chunk = {value.chunk_id: value for value in sources}
         candidates: list[CandidateEvidence] = []
         for value in sections.sections:
@@ -703,14 +940,35 @@ class ResearchCapabilityService:
         *,
         allow_web: bool = False,
         harness: Any | None = None,
+        parallel: bool = False,
+        progress_callback: ResearchProgressCallback | None = None,
+        cancellation_checker: Callable[[], None] | None = None,
     ) -> EvidencePack:
         def step(name: str, details: dict[str, Any] | None = None):
             return harness.step(name, details=details) if harness is not None else _NullStep(details)
 
         with step("LOCAL_RESEARCH") as trace:
-            local_candidates = self._local_candidates(request)
+            local_candidates = self._local_candidates(
+                request,
+                parallel=parallel,
+                progress_callback=progress_callback,
+                cancellation_checker=cancellation_checker,
+            )
             trace["candidate_count"] = len(local_candidates)
+        with self._diagnostics_lock:
+            request_diagnostics = dict(self._request_diagnostics.pop(request.request_id, {}))
         local_pack = self.build_evidence_pack(request, local_candidates)
+        local_pack = replace(
+            local_pack,
+            metadata={
+                **local_pack.metadata,
+                "paper_candidate_count": request_diagnostics.get("paper_candidate_count", 0),
+                "paper_candidate_ids": request_diagnostics.get("paper_candidate_ids", []),
+                "content_candidate_paper_count": request_diagnostics.get("content_candidate_paper_count", 0),
+                "parallel_retrieval": parallel,
+                "parallel_retrieval_limit": self.max_parallel_retrievals,
+            },
+        )
         local_time_satisfied: bool | None = None
         if request.requested_from or request.requested_to or request.year_from or request.year_to:
             local_dates = [

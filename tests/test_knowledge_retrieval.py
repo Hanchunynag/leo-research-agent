@@ -209,6 +209,33 @@ def test_verified_abstract_aligns_split_pdf_blocks_without_including_front_matte
     assert by_id["P_test_p001_b004"]["searchable"] is True
 
 
+def test_headingless_body_falls_back_to_main_body_until_references() -> None:
+    document = canonical_document(
+        blocks=[
+            block(0, "title", "LEO Evidence Paper", title_level_raw=1),
+            block(1, "paragraph", "Author and journal front matter."),
+            block(
+                2,
+                "paragraph",
+                "A headingless body paragraph contains enough extracted text to "
+                "activate the main-body fallback for this document.",
+                page=2,
+            ),
+            block(3, "paragraph", "Short body continuation.", page=2),
+            block(4, "title", "(References)", page=3, title_level_raw=2),
+            block(5, "paragraph", "Reference-only phrase.", page=3),
+        ]
+    )
+
+    structure = build_structure(document)
+    by_id = {value["block_id"]: value for value in structure["blocks"]}
+
+    assert by_id["P_test_p002_b002"]["content_zone"] == "main_body"
+    assert by_id["P_test_p002_b002"]["searchable"] is True
+    assert by_id["P_test_p002_b003"]["searchable"] is True
+    assert by_id["P_test_p003_b005"]["exclusion_reason"] == "zone:references"
+
+
 def test_chunks_are_deterministic_bounded_and_do_not_cross_sections() -> None:
     structure = build_structure(canonical_document())
     first = build_chunks(

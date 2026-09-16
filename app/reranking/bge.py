@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 
@@ -43,6 +44,11 @@ class BGERerankerProvider:
     ) -> None:
         self.config = config or BGERerankerConfig()
         self._model = model
+        self._model_load_lock = Lock()
+        # CrossEncoder.predict shares tokenizer/model state. Keep the
+        # ResearchNeed scheduler concurrent while making this process-local
+        # inference boundary deterministic and thread-safe.
+        self._inference_lock = Lock()
 
     @property
     def model_name(self) -> str:
@@ -58,30 +64,32 @@ class BGERerankerProvider:
 
     def _load_model(self) -> Any:
         if self._model is None:
-            from sentence_transformers import CrossEncoder
-            from torch.nn import Identity
-            from app.model_cache import resolve_local_model_path
+            with self._model_load_lock:
+                if self._model is None:
+                    from sentence_transformers import CrossEncoder
+                    from torch.nn import Identity
+                    from app.model_cache import resolve_local_model_path
 
-            model_name = self.config.model_name
-            if self.config.local_files_only:
-                model_name = resolve_local_model_path(
-                    model_name,
-                    self.config.cache_folder,
-                    required_files=("config.json", "tokenizer_config.json"),
-                )
-            self._model = CrossEncoder(  # type: ignore[call-arg]
-                model_name,
-                device=self.config.device,
-                cache_dir=(
-                    str(self.config.cache_folder)
-                    if self.config.cache_folder is not None
-                    else None
-                ),
-                revision=self.config.revision,
-                local_files_only=self.config.local_files_only,
-                max_length=self.config.max_length,
-                default_activation_function=Identity(),
-            )
+                    model_name = self.config.model_name
+                    if self.config.local_files_only:
+                        model_name = resolve_local_model_path(
+                            model_name,
+                            self.config.cache_folder,
+                            required_files=("config.json", "tokenizer_config.json"),
+                        )
+                    self._model = CrossEncoder(  # type: ignore[call-arg]
+                        model_name,
+                        device=self.config.device,
+                        cache_dir=(
+                            str(self.config.cache_folder)
+                            if self.config.cache_folder is not None
+                            else None
+                        ),
+                        revision=self.config.revision,
+                        local_files_only=self.config.local_files_only,
+                        max_length=self.config.max_length,
+                        default_activation_function=Identity(),
+                    )
         return self._model
 
     def score(self, query: str, documents: list[str]) -> list[float]:
@@ -93,12 +101,13 @@ class BGERerankerProvider:
         if any(not isinstance(value, str) or not value.strip() for value in documents):
             raise ValueError("候选文档必须是非空字符串。")
         pairs = [(cleaned_query, document) for document in documents]
-        values = self._load_model().predict(
-            pairs,
-            batch_size=self.config.batch_size,
-            show_progress_bar=self.config.show_progress_bar,
-            convert_to_numpy=True,
-        )
+        with self._inference_lock:
+            values = self._load_model().predict(
+                pairs,
+                batch_size=self.config.batch_size,
+                show_progress_bar=self.config.show_progress_bar,
+                convert_to_numpy=True,
+            )
         raw_scores = values.tolist() if hasattr(values, "tolist") else values
         if not isinstance(raw_scores, list) or len(raw_scores) != len(documents):
             raise RuntimeError("BGE Reranker 返回的分数数量与候选文档不一致。")

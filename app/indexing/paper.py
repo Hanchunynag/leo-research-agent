@@ -29,11 +29,14 @@ class PaperRecord:
     authors: list[str]
     year: int | None
     keywords: list[str]
+    publication_date: str | None = None
+    venue: str | None = None
     doi: str | None = None
     work_id: str | None = None
     document_id: str | None = None
     status: str = "indexed"
     metadata_source: str | None = None
+    level: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -75,6 +78,13 @@ def _optional_year(value: Any) -> int | None:
     return year if 1000 <= year <= 9999 else None
 
 
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _canonical_metadata(project_root: Path, value: dict[str, Any]) -> dict[str, Any]:
     """Best-effort enrichment from the existing canonical document."""
 
@@ -101,6 +111,17 @@ def _record_from_mapping(project_root: Path, value: dict[str, Any]) -> PaperReco
     authors = _string_list(value.get("authors")) or _string_list(metadata.get("authors"))
     keywords = _string_list(value.get("keywords")) or _string_list(metadata.get("keywords"))
     abstract = str(value.get("abstract") or metadata.get("abstract") or "").strip()
+    publication_date = _optional_text(
+        value.get("publication_date")
+        or metadata.get("publication_date")
+        or metadata.get("published_date")
+    )
+    venue = _optional_text(
+        value.get("venue")
+        or metadata.get("venue")
+        or metadata.get("journal")
+        or metadata.get("booktitle")
+    )
     document_id = str(value.get("document_id") or "").strip() or None
     work_id = str(value.get("work_id") or "").strip() or None
     return PaperRecord(
@@ -110,6 +131,8 @@ def _record_from_mapping(project_root: Path, value: dict[str, Any]) -> PaperReco
         authors=authors,
         year=_optional_year(value.get("year", metadata.get("year"))),
         keywords=keywords,
+        publication_date=publication_date,
+        venue=venue,
         doi=str(value.get("doi") or metadata.get("doi") or "").strip() or None,
         work_id=work_id,
         document_id=document_id,
@@ -204,9 +227,10 @@ def paper_retrieval_text(paper: dict[str, Any]) -> str:
     return "\n".join(
         (
             f"Title: {paper.get('title') or ''}",
-            f"Abstract: {paper.get('abstract') or ''}",
             f"Authors: {' '.join(str(value) for value in authors)}",
-            f"Year: {paper.get('year') or ''}",
+            f"Publication date: {paper.get('publication_date') or ''}",
+            f"Venue: {paper.get('venue') or ''}",
+            f"Abstract: {paper.get('abstract') or ''}",
             f"Keywords: {' '.join(str(value) for value in keywords)}",
         )
     )
@@ -219,6 +243,8 @@ _PAPER_DIGEST_FIELDS = (
     "authors",
     "year",
     "keywords",
+    "publication_date",
+    "venue",
     "doi",
     "work_id",
     "document_id",
@@ -262,7 +288,19 @@ def build_paper_bm25_index(
         for record in [_record_from_mapping(root, value)]
         if record is not None and record.status not in {"deleted", "superseded"}
     ]
-    values = normalized_values
+    values = [
+        {
+            **record,
+            "chunk_id": f"{record['paper_id']}_metadata",
+            "level": 1,
+            "section_path": [],
+            "content": paper_retrieval_text(record),
+            "content_hash": hashlib.sha256(
+                paper_retrieval_text(record).encode("utf-8")
+            ).hexdigest(),
+        }
+        for record in normalized_values
+    ]
     write_paper_records(root, values)
     digest = papers_digest(values)
     output = paper_bm25_index_path(root)

@@ -190,6 +190,39 @@ class RetryHTTPClient(FakeHTTPClient):
         return self.response
 
 
+def test_openai_compatible_provider_supports_raw_gateway_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = FakeHTTPResponse(
+        {
+            "choices": [{"message": {"content": "{\"ok\":true}"}}],
+        }
+    )
+    captured: dict[str, Any] = {}
+
+    class CapturingHTTPClient(FakeHTTPClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(response)
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "app.generation.openai_compatible.httpx.Client",
+        CapturingHTTPClient,
+    )
+    provider = OpenAICompatibleAnswerProvider(
+        OpenAICompatibleConfig(
+            "https://gateway.example/v1",
+            "qwen3.5:9b",
+            api_key="test-gateway-token",
+            auth_scheme="raw",
+        )
+    )
+
+    provider.chat_completion([{"role": "user", "content": "ping"}])
+
+    assert captured["headers"] == {"Authorization": "test-gateway-token"}
+
+
 def test_openai_compatible_provider_retries_transport_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -399,6 +432,25 @@ def test_answer_provider_reports_missing_local_configuration(
 
     with pytest.raises(ValueError, match="复制 .env.example 为 .env"):
         cli.answer_provider_from_args(args)
+
+
+def test_chat_completion_can_disable_gateway_hidden_reasoning() -> None:
+    response = FakeHTTPResponse(
+        {"choices": [{"message": {"content": "{}"}}]}
+    )
+    client = FakeHTTPClient(response)
+    provider = OpenAICompatibleAnswerProvider(
+        OpenAICompatibleConfig("http://127.0.0.1:11434", "local-model"),
+        client=client,
+    )
+
+    provider.chat_completion(
+        [{"role": "user", "content": "Return JSON."}],
+        max_tokens=128,
+        reasoning_effort="none",
+    )
+
+    assert client.calls[0][1]["reasoning_effort"] == "none"
 
 
 def test_context_session_round_trip_and_integrity_check(tmp_path: Path) -> None:

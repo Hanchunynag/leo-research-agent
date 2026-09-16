@@ -193,6 +193,14 @@ class ResearchApplicationFacade:
                     for item in claims
                     if isinstance(item, Mapping) and item.get("text")
                 )
+        # A refusal or provider failure legitimately has no claims, but the
+        # Session Runtime still requires a non-empty assistant message so the
+        # failed/refused turn can be persisted and inspected from the UI.
+        # Keep the user-facing reason as the normalized answer instead of
+        # allowing the persistence layer to mask the original failure with a
+        # secondary ``Message role/content 不能为空`` error.
+        if not answer:
+            answer = str(result.get("refusal_reason") or "当前证据不足以回答。")
         answerable = bool(result.get("answerable", bool(answer)))
         diagnostics = result.get("diagnostics")
         diagnostics_mapping = diagnostics if isinstance(diagnostics, Mapping) else {}

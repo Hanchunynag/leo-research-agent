@@ -53,6 +53,33 @@ def test_facade_keeps_application_ids_distinct_and_passes_thread_config(
     assert facade.sessions.get("s1").active_run_id is None
 
 
+def test_facade_persists_refusal_reason_when_answer_has_no_claims(
+    tmp_path: Path,
+) -> None:
+    class RefusingAgentService:
+        def answer(self, query: str, **kwargs: object) -> dict[str, object]:
+            return {
+                "answerable": False,
+                "answer": "",
+                "claims": [],
+                "refusal_reason": "回答模型不可用，暂时无法生成带引用答案。",
+                "citations": [],
+                "selected_evidence": [],
+                "diagnostics": {},
+            }
+
+    facade = ResearchApplicationFacade(RefusingAgentService(), SessionManager(tmp_path))
+
+    result = facade.research_topic("测试拒答持久化", session_id="refusal")
+
+    assert result["answerable"] is False
+    assert result["answer"] == "回答模型不可用，暂时无法生成带引用答案。"
+    messages = facade.sessions.open("refusal").list_messages()
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"] == result["answer"]
+    assert facade.sessions.open("refusal").list_runs()[0].status == "COMPLETED"
+
+
 def test_project_id_can_be_shared_but_cannot_cross_attach_session(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     first = manager.resolve("s1", title="one", project_id="PROJECT_1")

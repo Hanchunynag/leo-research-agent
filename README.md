@@ -5,6 +5,29 @@
 ## ScholarHarness V1
 
 ScholarHarness 是建立在本地论文证据层之上的生产级 Scholar Agent Harness。
+
+## Current Release Status
+
+| Item | Current status |
+| --- | --- |
+| Release Status | `CREWAI_PRODUCTION_READY` |
+| Orchestration Backend | `crewai` (Production default; `legacy` is explicit fallback only) |
+| Deployment | Docker Compose: API / Worker / MySQL / Redis / Qdrant / Frontend / Nginx |
+| Knowledge Index | `ready`; Paper BM25/Dense 27/27, Content BM25/Dense 283/283 |
+| Embedding | `BAAI/bge-m3`, revision `5617a9f61b028005a4858fdac845db406aefb181` |
+| Local Production Gate | PASS |
+| External Provider E2E | PASS; real DeepSeek/CrewAI Production E2E verified |
+
+Query the live projection with `uv run python main.py knowledge status`; the
+status command is read-only. Docker startup does not implicitly rebuild the
+Knowledge Index.
+
+顶层编排现在提供 CrewAI + Flow backend。Production 默认使用
+`ORCHESTRATION_BACKEND=crewai`，由四角色 Supervisor/Research/Writer/Reviewer
+编排；`legacy` 保留为显式 fallback，测试模式仍可使用旧的 Deep Agents/LangGraph
+路径。两者共享现有
+Research、Evidence、Writing、Review、DraftPatch、Approval、Session 和 Console
+能力。详见 [CrewAI + Flow Orchestration](docs/architecture/crewai-orchestration.md)。
 它解决的不只是“从长上下文生成一段文字”：普通 RAG 或直接让 LLM 改稿无法
 可靠地区分 Manuscript Facts、用户确认的 Contributions、文献证据和待确认
 结论，也无法安全处理引用、并发编辑、恢复和人工审批。
@@ -64,8 +87,10 @@ Scholar 请求和恢复使用同一个入口：
 
 ### Scholar Web Console
 
-启动 Web API 后访问 [`http://127.0.0.1:8000/scholar`](http://127.0.0.1:8000/scholar)。
-Console 通过同一个 `ScholarHarnessService` 发起或恢复 Scholar Request，并读取
+Docker Compose 启动后，旧版服务访问 [`http://127.0.0.1:8000/`](http://127.0.0.1:8000/)，
+独立 Scholar Console 访问 [`http://127.0.0.1:8001/`](http://127.0.0.1:8001/)。
+Scholar 端口只承载 Scholar Console 的入口，但通过同一个后端 API/Worker 使用
+`ScholarHarnessService` 发起或恢复 Scholar Request，并读取
 真实 Run Event、Evidence/Citation、Manuscript State、DraftPatch、Checkpoint 和
 Evaluation。它是 Agent/Research observability surface，不是 LaTeX IDE；VS Code
 + LaTeX Workshop 继续负责正文编辑、Diff、人工 Accept/Reject、Build 和 PDF
@@ -81,9 +106,10 @@ Run Event 使用 Run-local 单调 cursor；断线后的订阅从最后 cursor �
 去重。Evidence 展开项包含 Claim、source locator、identity、日期、验证状态、证据
 span 和 CitationBinding/BibKey；未解决 CitationRequirement 会明确显示为待人工审核。
 
-当前 V1 Release Status：`NOT RELEASED — EXTERNAL_PROVIDER_UNAVAILABLE`。真实
-DeepSeek Provider 恢复后，必须重新通过四类 Production E2E、Human Approval Apply、
-LaTeX 更新和 Restart Resume，才可更新为 `V1 COMPLETE`。
+当前 Release Status 由 `uv run python main.py scholar release-check` 唯一决定。
+本次 Release Closure 已完成真实 Provider Production E2E；如果后续环境尚未重新
+显式验证 Provider，Gate 会安全回退为 `CREWAI_PRODUCTION_EXTERNAL_BLOCKED`，而
+不是把代码问题伪装成外部阻塞。
 
 ### Corpus Statistics 与 Index Provenance
 
@@ -106,17 +132,27 @@ Dense 各覆盖 283 chunks；Paper BM25 和 Paper Dense 各覆盖 27 条 metadat
 local artifact fingerprint、向量维度、距离度量、归一化、chunk/tokenizer policy
 和 index schema；Provider 与 manifest 不一致时会拒绝查询并要求重建索引。
 
-### Production Retrieval Path 与 LightRAG 定位
+### Production Retrieval Path
 
-当前 Production Retrieval Path 固定为：`UnifiedKnowledgeService` → Legacy
-BM25 + BGE-M3 Dense → RRF → 可选 Reranker → Evidence Verification/Selection。
-这是正式回答、Citation 和离线评测使用的链路。
+当前 Production Retrieval Path 固定为两层知识库：
 
-LightRAG 是 `EXPERIMENTAL / OPTIONAL / SHADOW` 路径，默认关闭；它只通过显式
-Generation Pin 和 `configure_shadow` 进入影子比较，不参与正式回答，也不是本地
-Release Gate 的 blocker。只有未来独立 Shadow Acceptance 在质量、关系真值、成本、
-增量更新和回滚方面全部通过，才允许通过已有 `EngineCutoverService` 进行显式切换。
-当前结论是保持 Legacy Official，不为了增加技术栈数量切换正式链路。
+```text
+Paper metadata BM25 + Paper BGE-M3
+  → Paper RRF
+  → Top-K paper_id
+  → Per-Paper Content BM25 + Content BGE-M3
+  → Content RRF
+  → BGE Cross-Encoder
+  → Evidence Verification / Citation Validation
+```
+
+第一层是全局 Paper-Level Knowledge Base。每篇论文的
+`title + authors + publication_date + venue + abstract + keywords` 构成一个
+Paper Chunk，每篇对应一个 BGE-M3 vector。Paper metadata corpus 新增、删除或
+metadata 变化时，第一层会对当前全部 Paper Chunk 重新 Embedding；第二层是按
+`paper_id` 独立维护的 Per-Paper Content Knowledge Base，新增论文只构建该论文的
+Content chunks 和 vectors。默认不会在全库全部细粒度 Chunk 上直接执行第一阶段
+Dense Retrieval。
 
 ### 可复现 Demo 与 Evaluation
 
@@ -1510,8 +1546,9 @@ Dense 业务层只依赖 `EmbeddingProvider` 协议，不直接导入具体模�
 | taxonomy 变化 | 重新分类，不需要重新 MinerU |
 | 单个 PDF 删除 | 按 `document_id` 删除文档、Chunk 和索引记录，再更新对应 `work_id` |
 
-未来批量命令应该遍历 `papers.jsonl`，逐篇判断状态，而不是无条件重新处理全部
-PDF。
+未来批量命令应该遍历 `papers.jsonl`，逐篇判断 Level-2 Content 状态；Paper
+metadata corpus 发生变化时允许且必须重新 Embedding 全部 Level-1 Paper Chunk，
+但仍不应无条件重新处理全部 PDF 或 Level-2 Content。
 
 ## 当前完成度
 
@@ -1628,19 +1665,28 @@ v0.2 的批量验收会自动生成 5 份独立 PDF 测试夹具和 1 份损坏 
 
 项目代码使用 [MIT License](LICENSE)。该许可证不覆盖用户导入的论文、论文
 图片、MinerU 解析出的论文内容、第三方模型或第三方依赖。
-> The default answer path is now incremental Agentic Scientific GraphRAG. The original
-> BM25+dense path remains available with `--retrieval-mode legacy` for regression and ablation.
 
-The GraphRAG architecture, schemas, constraints, collection layout, state machine, migration,
-and operational commands are documented in
-[`docs/graphrag_architecture.md`](docs/graphrag_architecture.md).
+## CrewAI Production Runtime
 
-Quick start:
+Scholar 的正式异步入口是 `POST /api/scholar/runs`。API 只创建持久化
+Run/Job 并返回 `202`，由独立 Worker 执行 CrewAI Flow；旧的
+`/api/scholar/requests` 保留为兼容入口。
 
 ```bash
-cp .env.example .env                # set Neo4j and local LLM credentials
-docker compose -f docker-compose.graph.yml up -d
-uv sync --group dev
-uv run python main.py knowledge migrate-to-graphrag
-uv run python main.py answer "伪距率与速度状态有什么关系？"
+uv run python scripts/run_scholar_worker.py
+uv run python main.py scholar release-check
+docker compose up --build
 ```
+
+Compose 的 API/Worker 是无宿主机源码依赖的部署模式：主应用、MinerU、独立
+PaddleOCR 3.7.0（含 `paddlex[ocr]`）、表格 worker 和公式 worker 全部打包在
+Linux 镜像中。运行时不挂载宿主机源码、`.venv*`、`data/` 或 `.env`；论文、解析
+结果、索引、模型缓存和 Scholar 状态使用 Docker named volume 持久化。宿主机只
+通过 Compose 环境变量提供部署配置/密钥，并通过网页上传论文。已有本地 `data/`
+需要迁移时，应在首次启动新 API/Worker 前复制到 `leo_data` volume，原目录保留
+作为备份。
+
+RunEventStore 提供先落库后推送的 Live + Replay SSE；Session/Run、Project、
+DraftPatch 和 Approval 仍由现有持久化 Runtime 管理。完整边界与恢复策略见
+`docs/architecture/production_architecture.md`、`run_lifecycle.md`、
+`recovery.md`、`web_console.md`、`deployment.md` 和 `release_gate.md`。

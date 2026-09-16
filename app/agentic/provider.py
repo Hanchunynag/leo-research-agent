@@ -17,7 +17,10 @@ from app.agentic.models import (
     SemanticValidationReport,
 )
 from app.generation.openai_compatible import OpenAICompatibleAnswerProvider
-from app.generation.openai_compatible import parse_json_object
+from app.generation.openai_compatible import (
+    parse_json_object,
+    structured_chat_completion,
+)
 
 
 ROUTER_SYSTEM_PROMPT = """You are a deterministic scientific conversation topic router.
@@ -238,6 +241,29 @@ class OpenAIAgenticReasoningProvider:
         self.max_structure_repairs = max_structure_repairs
         self.last_stage_diagnostics: dict[str, dict[str, Any]] = {}
 
+    def _chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None,
+    ) -> dict[str, Any]:
+        """Call structured stages with gateway hidden reasoning disabled.
+
+        The production Qwen-compatible gateway can spend the entire completion
+        budget on hidden reasoning and return an empty JSON message.  Agentic
+        stages already have a strict machine-readable contract, so disabling
+        hidden reasoning makes those calls bounded and leaves the configured
+        budget for the actual contract.  Keep injected legacy test providers
+        compatible by only sending the optional control to the concrete
+        OpenAI-compatible adapter.
+        """
+
+        return structured_chat_completion(
+            self.provider,
+            messages,
+            max_tokens=max_tokens,
+        )
+
     def _complete(
         self,
         stage: str,
@@ -257,13 +283,9 @@ class OpenAIAgenticReasoningProvider:
         )
         initial_max_tokens = max_tokens or int(configured_max_tokens)
         for attempt in range(self.max_structure_repairs + 1):
-            payload = (
-                self.provider.chat_completion(working)
-                if requested_max_tokens is None
-                else self.provider.chat_completion(
-                    working,
-                    max_tokens=requested_max_tokens,
-                )
+            payload = self._chat_completion(
+                working,
+                max_tokens=requested_max_tokens,
             )
             response_diagnostics = self._response_diagnostics(payload)
             try:

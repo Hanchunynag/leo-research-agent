@@ -14,8 +14,10 @@ User
   → LaTeX Project
 ```
 
-The Deep Agent is an in-process Harness, not a replacement for the Research
-Engine or the Project Runtime. The Domain stores remain authoritative:
+The CrewAI Flow is executed by an independent Worker; the API only creates a
+durable Run/Job and returns `202`. The Deep Agent/LangGraph path remains a
+fallback, not a replacement for the Research Engine or the Project Runtime.
+The Domain stores remain authoritative:
 
 | State | Authority |
 | --- | --- |
@@ -25,6 +27,8 @@ Engine or the Project Runtime. The Domain stores remain authoritative:
 | Evidence/Citation | Existing governed services and Project projections |
 | Proposed changes | Immutable DraftPatch |
 | File mutation | Human-approved PatchApprovalService |
+| Async queue | Persistent Job Repository |
+| Product trace | RunEventStore (persist before live publish) |
 
 ## Release validation
 
@@ -43,10 +47,10 @@ result.
 
 ## Reproducibility
 
-Production requires configured LLM settings and a persistent
-`LEO_AGENTIC_SCHOLAR_CHECKPOINT_PATH`. Test/local-fast modes may explicitly use
-`InMemorySaver`. Web/CLI requests use the same `ScholarRuntimeFactory` and
-`ScholarHarnessService`.
+Production requires configured LLM settings, a persistent
+`LEO_AGENTIC_SCHOLAR_CHECKPOINT_PATH`, and the external Worker process.
+Test/local-fast modes may explicitly use `InMemorySaver`. The async Web API and
+Worker use the same `ScholarRuntimeFactory` and `ScholarRunManager`.
 
 ## Known limitations and future work
 
@@ -63,10 +67,9 @@ Production requires configured LLM settings and a persistent
 
 ## Current validation status
 
-The repository regression suite is green. A real Production E2E startup was also
-verified with `SqliteSaver`, local retrieval configuration and managed shutdown,
-but the configured DeepSeek endpoint currently returns HTTP 402
-`Insufficient Balance`. Consequently the four Domain flows and Human Approval
-release gate remain pending an available external LLM account.
-
-**Release Status:** `NOT RELEASED — EXTERNAL_PROVIDER_UNAVAILABLE`
+The repository regression suite, static checks, lockfile check and frontend build
+are green. The final closure also verified the real Provider path through
+Support Claim, Introduction, Conclusion and Abstract; Introduction completed
+Reviewer PASS, Human Approval and Safe Apply, while a deliberately unavailable
+Provider returned `FAILED` without a fabricated result. The current release
+result is `CREWAI_PRODUCTION_READY`.

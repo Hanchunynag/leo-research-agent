@@ -239,7 +239,123 @@ class WritingContext:
     citation_bindings: tuple[CitationBinding, ...] = ()
     bibliography_changes: tuple[Any, ...] = ()
     bibliography_base_hash: str | None = None
+    citation_coverage: Mapping[str, Any] = field(default_factory=dict)
     review_report: ReviewReport | None = None
+
+    def writer_mapping(self) -> dict[str, Any]:
+        """Return a bounded, citation-preserving payload for the LLM Writer.
+
+        ``public_mapping`` is the domain-facing projection and intentionally
+        retains complete evidence metadata for deterministic validation.  It
+        is not a safe wire payload: three research packs can contain repeated
+        chunks, full abstracts and pipeline diagnostics, easily exceeding the
+        provider context window.  The Writer only needs a representative
+        excerpt plus stable IDs/identity metadata to draft and cite prose;
+        the full objects remain in the Writing Runtime as the authority.
+        """
+
+        raw_evidence: list[dict[str, Any]] = []
+        for pack in self.evidence_packs:
+            raw_evidence.extend(
+                dict(value) for value in pack.evidence if isinstance(value, Mapping)
+            )
+
+        def identity(value: Mapping[str, Any]) -> str:
+            metadata = value.get("metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            for key in ("paper_id", "canonical_id", "doi", "arxiv_id", "work_id", "document_id"):
+                candidate = value.get(key) or metadata.get(key)
+                if candidate not in (None, "", ()):
+                    return f"{key}:{candidate}"
+            return str(value.get("evidence_id") or "unknown")
+
+        # First keep one excerpt per paper so the 5-paper contract is visible
+        # to the model even when retrieval returned many chunks from one work.
+        selected: list[dict[str, Any]] = []
+        selected_identities: set[str] = set()
+        for value in raw_evidence:
+            key = identity(value)
+            if key in selected_identities:
+                continue
+            selected_identities.add(key)
+            selected.append(value)
+            if len(selected) >= 12:
+                break
+        # Add a small number of supporting excerpts after paper coverage has
+        # been established.  This helps the model bind different claims while
+        # keeping the request comfortably below common gateway limits.
+        selected_ids = {str(value.get("evidence_id") or "") for value in selected}
+        for value in raw_evidence:
+            evidence_id = str(value.get("evidence_id") or "")
+            if evidence_id in selected_ids:
+                continue
+            selected.append(value)
+            selected_ids.add(evidence_id)
+            if len(selected) >= 18:
+                break
+
+        compact_evidence: list[dict[str, Any]] = []
+        for value in selected:
+            metadata = value.get("metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            compact_metadata = {
+                key: metadata[key]
+                for key in (
+                    "title",
+                    "authors",
+                    "year",
+                    "doi",
+                    "arxiv_id",
+                    "venue",
+                    "verification",
+                )
+                if metadata.get(key) is not None
+            }
+            excerpt = value.get("content") or value.get("text") or ""
+            compact_evidence.append(
+                {
+                    key: value[key]
+                    for key in (
+                        "evidence_id",
+                        "paper_id",
+                        "canonical_id",
+                        "source_locator",
+                        "bibkey",
+                        "citation_key",
+                        "page_start",
+                        "page_end",
+                    )
+                    if value.get(key) is not None
+                }
+                | {
+                    "content": str(excerpt)[:1800],
+                    "metadata": compact_metadata,
+                }
+            )
+
+        return {
+            "request": self.request,
+            "current_introduction": self.current_introduction[:6000],
+            "current_hash": self.current_hash,
+            "facts": self.facts,
+            "confirmed_contributions": self.contributions,
+            "claim_plan": self.claim_plan,
+            "evidence": compact_evidence,
+            "citation_catalog": dict(self.citation_catalog),
+            "citation_requirements": self.citation_requirements,
+            "citation_bindings": self.citation_bindings,
+            "bibliography_changes": self.bibliography_changes,
+            "bibliography_base_hash": self.bibliography_base_hash,
+            "citation_coverage": dict(self.citation_coverage),
+            "skill_text": self.skill_text[:6000],
+            "capabilities": self.capabilities,
+            "review_report": self.review_report,
+            "writer_payload_limits": {
+                "evidence_items": len(compact_evidence),
+                "excerpt_chars": 1800,
+                "source": "bounded_writer_projection",
+            },
+        }
 
     def public_mapping(self) -> dict[str, Any]:
         """限制 Writer 可见内容；不暴露 Service、Store 或底层 RAG 对象。"""
@@ -260,6 +376,7 @@ class WritingContext:
             "citation_bindings": self.citation_bindings,
             "bibliography_changes": self.bibliography_changes,
             "bibliography_base_hash": self.bibliography_base_hash,
+            "citation_coverage": dict(self.citation_coverage),
             "skill_text": self.skill_text,
             "capabilities": self.capabilities,
             "review_report": self.review_report,

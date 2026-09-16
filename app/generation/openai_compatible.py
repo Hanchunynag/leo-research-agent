@@ -28,6 +28,7 @@ present in the evidence. Never put citation markers in claim text; the applicati
 """
 
 PromptLayout = Literal["query_first", "context_first"]
+AuthScheme = Literal["bearer", "raw"]
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class OpenAICompatibleConfig:
     base_url: str
     model: str
     api_key: str | None = field(default=None, repr=False)
+    auth_scheme: AuthScheme = "bearer"
     timeout_seconds: float = 120.0
     max_tokens: int = 8192
     temperature: float = 0.0
@@ -47,6 +49,8 @@ class OpenAICompatibleConfig:
             raise ValueError("base_url 必须是有效的 http(s) URL。")
         if not self.model.strip():
             raise ValueError("model 不能为空。")
+        if self.auth_scheme not in {"bearer", "raw"}:
+            raise ValueError("auth_scheme 必须是 bearer 或 raw。")
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds 必须大于 0。")
         if self.max_tokens < 1:
@@ -166,11 +170,14 @@ class OpenAICompatibleAnswerProvider:
         self.config = config
         self.model_name = config.model
         self.endpoint = _chat_completions_url(config.base_url)
-        headers = (
-            {"Authorization": f"Bearer {config.api_key}"}
-            if config.api_key
-            else None
-        )
+        headers = None
+        if config.api_key:
+            authorization = (
+                config.api_key
+                if config.auth_scheme == "raw"
+                else f"Bearer {config.api_key}"
+            )
+            headers = {"Authorization": authorization}
         self._client = client or httpx.Client(
             timeout=config.timeout_seconds,
             headers=headers,
@@ -190,6 +197,7 @@ class OpenAICompatibleAnswerProvider:
         max_tokens: int | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         """供结构化 Agentic 阶段复用同一安全 HTTP 客户端。
 
@@ -213,6 +221,14 @@ class OpenAICompatibleAnswerProvider:
             request_payload["tools"] = tools
         if tool_choice is not None:
             request_payload["tool_choice"] = tool_choice
+        # The local Qwen gateway exposes hidden reasoning in a separate
+        # ``message.reasoning`` field.  With a small structured CrewAI
+        # contract, that hidden trace can consume the whole completion budget
+        # and leave ``message.content`` empty.  Callers that require a
+        # machine-readable contract can explicitly disable that mode while
+        # ordinary answer generation keeps the provider's existing behavior.
+        if reasoning_effort is not None:
+            request_payload["reasoning_effort"] = reasoning_effort
         response = None
         for attempt in range(self._MAX_TRANSPORT_ATTEMPTS):
             try:
@@ -340,3 +356,25 @@ class OpenAICompatibleAnswerProvider:
             _parse_answer_draft(content),
             provider_metadata=metadata,
         )
+
+
+def structured_chat_completion(
+    provider: Any,
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Run a bounded machine-readable call with hidden reasoning disabled.
+
+    Translation, routing, expansion and validation all consume strict JSON
+    contracts.  The production Qwen gateway can otherwise spend a small
+    structured budget on hidden reasoning and leave no usable content.  The
+    concrete-type check keeps older injected test providers unchanged.
+    """
+
+    kwargs: dict[str, Any] = {}
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    if isinstance(provider, OpenAICompatibleAnswerProvider):
+        kwargs["reasoning_effort"] = "none"
+    return provider.chat_completion(messages, **kwargs)

@@ -34,6 +34,10 @@ from app.agentic.service import AgenticRAGService
 from app.agentic.store import AgenticSessionStore, stable_json
 from app.context.assembly import assemble_context_bundle
 from app.generation.security import redact_sensitive_text
+from app.generation.openai_compatible import (
+    OpenAICompatibleAnswerProvider,
+    OpenAICompatibleConfig,
+)
 from app.generation.settings import load_local_llm_settings
 
 
@@ -785,6 +789,55 @@ def test_agentic_provider_repairs_empty_choices_once() -> None:
     assert result.relation == "same_topic"
     assert diagnostics["structure_repair_attempts"] == 1
     assert inner.calls == 2
+
+
+def test_openai_agentic_structured_stages_disable_hidden_reasoning() -> None:
+    class Response:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+            self.text = json.dumps(payload)
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return self._payload
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def post(self, endpoint: str, *, json: dict[str, Any]) -> Response:
+            self.calls.append({"endpoint": endpoint, "json": json})
+            content = RoutingLLMDecision(
+                relation="same_topic",
+                confidence=0.9,
+                reason="fixture",
+                context_dependent=False,
+                standalone_query="standalone",
+                reuse_previous_evidence=False,
+                requires_new_retrieval=True,
+            ).model_dump_json()
+            return Response({
+                "model": "fixture/model",
+                "choices": [{"finish_reason": "stop", "message": {"content": content}}],
+            })
+
+    client = Client()
+    transport = OpenAICompatibleAnswerProvider(
+        OpenAICompatibleConfig("http://127.0.0.1:11434", "fixture/model"),
+        client=client,
+    )
+    provider = OpenAIAgenticReasoningProvider(transport)
+
+    result, _ = provider._complete(  # noqa: SLF001
+        "router_test",
+        [{"role": "user", "content": "route"}],
+        RoutingLLMDecision,
+    )
+
+    assert result.relation == "same_topic"
+    assert client.calls[0]["json"]["reasoning_effort"] == "none"
 
 
 def test_agentic_provider_can_disable_structure_repair() -> None:

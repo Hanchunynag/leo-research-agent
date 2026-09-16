@@ -17,11 +17,17 @@ from app.scholar.research import (
     EvidenceRef,
     EvidenceValidationError,
     InvalidEvidenceLocator,
+    PaperCandidate,
+    PaperSearchResult,
     ResearchBudget,
     ResearchCapabilityService,
     ResearchRequest,
+    SectionCandidate,
+    SectionSearchResult,
     SourceNotFound,
 )
+from app.scholar.writing.models import ResearchNeed
+from app.scholar.writing.service import ResearchDelegate
 from app.workspaces import WorkspaceService
 from tests.test_stage2_corpus_workspace import write_fixture
 
@@ -144,6 +150,151 @@ def test_local_retrieval_serializes_concurrent_tool_calls(tmp_path: Path) -> Non
             assert future.result().papers
 
     assert maximum == 1
+
+
+def test_research_delegate_runs_independent_needs_in_parallel() -> None:
+    active = 0
+    maximum = 0
+    state_lock = Lock()
+    from threading import Barrier
+
+    barrier = Barrier(3)
+
+    class ParallelCapability:
+        workspace_id = "default"
+        scope_version = 1
+
+        def research(self, request: object, *, allow_web: bool = False, parallel: bool = False) -> EvidencePack:
+            nonlocal active, maximum
+            with state_lock:
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                barrier.wait(timeout=1)
+                return EvidencePack(
+                    request_id=str(getattr(request, "request_id")),
+                    query=str(getattr(request, "query")),
+                    claims=(),
+                    evidence=(),
+                )
+            finally:
+                with state_lock:
+                    active -= 1
+
+    delegate = ResearchDelegate(ParallelCapability(), max_parallelism=3)  # type: ignore[arg-type]
+    needs = tuple(
+        ResearchNeed(
+            need_id=f"need-{index}",
+            rhetorical_move="background",
+            query=f"query-{index}",
+            target_claims=(f"claim-{index}",),
+        )
+        for index in range(3)
+    )
+
+    packs = delegate.research_needs("REQ-PARALLEL", needs)
+
+    assert maximum == 3
+    assert [pack.query for pack in packs] == ["query-0", "query-1", "query-2"]
+    assert {pack.metadata["research_need_id"] for pack in packs} == {
+        "need-0",
+        "need-1",
+        "need-2",
+    }
+    assert {pack.metadata["parallel_worker"] for pack in packs} >= {
+        "research-need_0",
+        "research-need_1",
+    }
+
+
+def test_introduction_coverage_fans_out_fifteen_papers_with_bounded_parallelism(
+    tmp_path: Path,
+) -> None:
+    service = capability(tmp_path)
+    paper_ids = tuple(f"P_{index:03d}" for index in range(1, 16))
+    papers = PaperSearchResult(
+        "REQ-15",
+        "coverage",
+        tuple(
+            PaperCandidate(
+                paper_id=paper_id,
+                title=f"Paper {paper_id}",
+                rank=index,
+            )
+            for index, paper_id in enumerate(paper_ids, 1)
+        ),
+    )
+    request = ResearchRequest(
+        "REQ-15",
+        "coverage",
+        budget=ResearchBudget(
+            max_papers=15,
+            max_sections=15,
+            max_evidence_items=15,
+        ),
+        metadata={"ensure_paper_coverage": True},
+    )
+    active = 0
+    maximum = 0
+    calls: list[tuple[str, ...]] = []
+    state_lock = Lock()
+    from threading import Barrier
+
+    barrier = Barrier(3)
+
+    def fake_search_papers(
+        _request: ResearchRequest,
+        *,
+        top_k: int,
+        parallel: bool,
+    ) -> PaperSearchResult:
+        assert top_k == 15
+        assert parallel is True
+        return papers
+
+    def fake_search_sections(
+        _request: ResearchRequest,
+        *,
+        paper_ids: tuple[str, ...],
+        top_k: int,
+        parallel: bool,
+    ) -> SectionSearchResult:
+        nonlocal active, maximum
+        calls.append(tuple(paper_ids))
+        if len(paper_ids) != 1:
+            return SectionSearchResult("REQ-15", "coverage", ())
+        assert top_k == 1
+        assert parallel is True
+        with state_lock:
+            active += 1
+            maximum = max(maximum, active)
+        try:
+            barrier.wait(timeout=1)
+            return SectionSearchResult(
+                "REQ-15",
+                "coverage",
+                (
+                    SectionCandidate(
+                        paper_id=paper_ids[0],
+                        section_id=f"{paper_ids[0]}-section",
+                        chunk_ids=(f"{paper_ids[0]}-chunk",),
+                    ),
+                ),
+            )
+        finally:
+            with state_lock:
+                active -= 1
+
+    service.search_papers = fake_search_papers  # type: ignore[method-assign]
+    service.search_sections = fake_search_sections  # type: ignore[method-assign]
+    service.read_evidence = lambda _refs: ()  # type: ignore[method-assign]
+
+    service._local_candidates(request, parallel=True)
+
+    assert maximum == 3
+    assert len(calls) == 16
+    assert calls[0] == paper_ids
+    assert {call[0] for call in calls[1:]} == set(paper_ids)
 
 
 def test_read_evidence_checks_locator_ownership_and_provenance(tmp_path: Path) -> None:

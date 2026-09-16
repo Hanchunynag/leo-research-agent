@@ -15,7 +15,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-from app.generation.openai_compatible import parse_json_object
+from app.generation.openai_compatible import (
+    parse_json_object,
+    structured_chat_completion,
+)
 from app.langchain_agent.planning import (
     ResearchTaskType,
     build_research_plan,
@@ -105,7 +108,8 @@ class LLMActionDecider:
         ):
             return {"type": "final"}
         try:
-            response = self.provider.chat_completion(
+            response = structured_chat_completion(
+                self.provider,
                 [
                     {"role": "system", "content": (
                         "You are the LangGraph research Agent controller. Return one JSON action only: "

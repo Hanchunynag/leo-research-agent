@@ -198,10 +198,13 @@ class JobManager:
             return
         finally:
             _CURRENT_JOB_ID.reset(token)
+        self._emit(job_id, "completed", "任务执行完成。", 1.0)
+        # Append the terminal progress event before exposing SUCCEEDED. This
+        # keeps polling clients from observing a successful Job with a
+        # truncated event stream between the two writes.
         self.repository.set_status(
             job_id, "SUCCEEDED", result_reference=reference
         )
-        self._emit(job_id, "completed", "任务执行完成。", 1.0)
 
     def cancel(self, job_id: str) -> JobSnapshot:
         record = self.repository.request_cancel(job_id)

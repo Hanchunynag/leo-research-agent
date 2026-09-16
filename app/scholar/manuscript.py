@@ -19,13 +19,46 @@ class PatchConflict(RuntimeError):
 
 
 class ManuscriptSynchronizer:
-    """只读取 LaTeX Project；不会启动编译器或修改文件。"""
+    """读取 LaTeX Project，并提供只创建空模板的幂等初始化能力。
+
+    ``scan``/``read_section``/``apply_patch`` 仍然遵守原有职责边界：扫描
+    和读取不产生副作用，正文只能经由 PatchApprovalService 应用。唯一的
+    例外是 ``ensure_initialized``，它只创建缺失的空项目骨架，不写入任何
+    Agent 生成的正文。
+    """
 
     DEPENDENTS = {
         "method": {"conclusion", "abstract"},
         "experiment": {"results", "conclusion", "abstract"},
         "results": {"conclusion", "abstract"},
         "conclusion": {"abstract"},
+    }
+
+    TEMPLATE_FILES = {
+        "main.tex": (
+            "\\documentclass[11pt]{article}\n"
+            "\\usepackage[utf8]{inputenc}\n"
+            "\\usepackage{geometry}\n"
+            "\\geometry{a4paper,margin=1in}\n"
+            "\\usepackage{hyperref}\n"
+            "\\begin{document}\n"
+            "\\input{sections/abstract}\n"
+            "\\input{sections/introduction}\n"
+            "\\input{sections/method}\n"
+            "\\input{sections/experiment}\n"
+            "\\input{sections/results}\n"
+            "\\input{sections/conclusion}\n"
+            "\\bibliographystyle{plain}\n"
+            "\\bibliography{references}\n"
+            "\\end{document}\n"
+        ),
+        "sections/abstract.tex": "% Abstract\n",
+        "sections/introduction.tex": "% Introduction\n",
+        "sections/method.tex": "% Method\n",
+        "sections/experiment.tex": "% Experiment\n",
+        "sections/results.tex": "% Results\n",
+        "sections/conclusion.tex": "% Conclusion\n",
+        "references.bib": "% Bibliography entries are added only through the approved citation lifecycle.\n",
     }
 
     def __init__(self, project_root: Path) -> None:
@@ -86,6 +119,35 @@ class ManuscriptSynchronizer:
             sections=sections,
             stale_sections=stale,
         )
+
+    def ensure_initialized(self) -> ManuscriptState:
+        """Create a minimal empty LaTeX project when no root exists.
+
+        The operation is deliberately additive and idempotent. Existing files
+        are opened with exclusive creation, so a user-authored ``main.tex`` or
+        section is never overwritten. A partially completed initialization is
+        safe: the next invocation only creates whatever files are still
+        missing, then returns the normal scanned state.
+        """
+
+        try:
+            return self.scan()
+        except FileNotFoundError:
+            pass
+
+        for relative, content in self.TEMPLATE_FILES.items():
+            path = self._safe_path(relative)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with path.open("x", encoding="utf-8") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except FileExistsError:
+                # Another request or the user created the file first. Never
+                # replace existing manuscript content.
+                continue
+        return self.scan()
 
     def read_section(self, state: ManuscriptState, section: str) -> str:
         item = state.sections.get(section)

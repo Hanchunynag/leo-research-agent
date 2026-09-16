@@ -128,7 +128,7 @@ class LegacyEvidenceMapper:
 
 
 class LegacyKnowledgeEngineAdapter:
-    """包装旧 RetrievalRuntime/GraphRAG runtime，不改变旧对象本身。"""
+    """包装 RetrievalRuntime，不改变旧对象本身。"""
 
     def __init__(self, runtime: Any, mapper: LegacyEvidenceMapper | None = None) -> None:
         self.runtime = runtime

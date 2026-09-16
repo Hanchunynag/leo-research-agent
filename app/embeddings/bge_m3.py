@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from app.model_cache import resolve_local_model_path
@@ -42,6 +43,12 @@ class BGEM3EmbeddingProvider:
     ) -> None:
         self.config = config or BGEM3Config()
         self._model = model
+        self._model_load_lock = Lock()
+        # SentenceTransformer inference is not guaranteed to be re-entrant
+        # across the PyTorch/Tokenizer stack. ResearchNeeds still execute in
+        # parallel, but they share one model inference gate so a concurrent
+        # batch cannot corrupt the model or return mismatched vectors.
+        self._inference_lock = Lock()
 
     @property
     def model_name(self) -> str:
@@ -77,25 +84,53 @@ class BGEM3EmbeddingProvider:
     def normalized(self) -> bool:
         return self.config.normalize_embeddings
 
+    @property
+    def effective_device(self) -> str:
+        """Return the device that SentenceTransformers will actually use."""
+
+        if self.config.device:
+            return str(self.config.device).strip().casefold()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return "cuda"
+            if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+                return "mps"
+        except (ImportError, AttributeError, RuntimeError):
+            pass
+        return "cpu"
+
+    @property
+    def accelerated(self) -> bool:
+        """Whether this provider can meet the dense retrieval latency contract."""
+
+        return self.effective_device not in {"", "cpu"}
+
     def _load_model(self) -> Any:
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
-            model_name = self.config.model_name
-            if self.config.local_files_only:
-                model_name = resolve_local_model_path(
-                    model_name,
-                    self.config.cache_folder,
-                    required_files=("config.json", "modules.json"),
-                )
-            kwargs: dict[str, Any] = {
-                "device": self.config.device,
-                "local_files_only": self.config.local_files_only,
-            }
-            if self.config.cache_folder is not None:
-                kwargs["cache_folder"] = str(self.config.cache_folder)
-            if self.config.revision:
-                kwargs["revision"] = self.config.revision
-            self._model = SentenceTransformer(model_name, **kwargs)
+            # Parallel ResearchNeeds can reach the same long-lived provider
+            # concurrently. Guard only lazy construction; inference calls can
+            # then proceed through the shared SentenceTransformer instance.
+            with self._model_load_lock:
+                if self._model is None:
+                    from sentence_transformers import SentenceTransformer
+                    model_name = self.config.model_name
+                    if self.config.local_files_only:
+                        model_name = resolve_local_model_path(
+                            model_name,
+                            self.config.cache_folder,
+                            required_files=("config.json", "modules.json"),
+                        )
+                    kwargs: dict[str, Any] = {
+                        "device": self.config.device,
+                        "local_files_only": self.config.local_files_only,
+                    }
+                    if self.config.cache_folder is not None:
+                        kwargs["cache_folder"] = str(self.config.cache_folder)
+                    if self.config.revision:
+                        kwargs["revision"] = self.config.revision
+                    self._model = SentenceTransformer(model_name, **kwargs)
         return self._model
 
     def _encode(self, texts: list[str]) -> list[list[float]]:
@@ -103,13 +138,14 @@ class BGEM3EmbeddingProvider:
             return []
         if any(not isinstance(text, str) or not text.strip() for text in texts):
             raise ValueError("待编码文本必须是非空字符串。")
-        vectors = self._load_model().encode(
-            texts,
-            batch_size=self.config.batch_size,
-            normalize_embeddings=self.config.normalize_embeddings,
-            convert_to_numpy=True,
-            show_progress_bar=self.config.show_progress_bar,
-        )
+        with self._inference_lock:
+            vectors = self._load_model().encode(
+                texts,
+                batch_size=self.config.batch_size,
+                normalize_embeddings=self.config.normalize_embeddings,
+                convert_to_numpy=True,
+                show_progress_bar=self.config.show_progress_bar,
+            )
         raw_vectors = vectors.tolist() if hasattr(vectors, "tolist") else vectors
         if not isinstance(raw_vectors, list) or len(raw_vectors) != len(texts):
             raise RuntimeError("BGE-M3 返回的向量数量与输入不一致。")

@@ -8,7 +8,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence, cast
 
-from qdrant_client import QdrantClient, models
+from qdrant_client import models
 
 from app.embeddings.base import EmbeddingProvider
 from app.indexing.paper import (
@@ -24,6 +24,7 @@ from app.indexing.paper_dense import (
     paper_dense_index_path,
 )
 from app.indexing.tokenization import normalize_search_text, tokenize_bm25
+from app.qdrant import build_qdrant_client
 
 
 def _validate_limit(value: int, field: str, maximum: int = 100) -> int:
@@ -71,6 +72,8 @@ def _result(paper: dict[str, Any], rank: int, score: float, source: str) -> dict
         "abstract": paper.get("abstract"),
         "authors": paper.get("authors") or [],
         "year": paper.get("year"),
+        "publication_date": paper.get("publication_date"),
+        "venue": paper.get("venue"),
         "keywords": paper.get("keywords") or [],
         "doi": paper.get("doi"),
         "status": paper.get("status"),
@@ -187,7 +190,7 @@ def search_paper_dense(
     vector = provider.embed_query(cleaned)
     if len(vector) != int(manifest.get("vector_dimension", 0)):
         raise RuntimeError("Paper 查询向量维度不一致。")
-    client = QdrantClient(path=str(paper_dense_index_path(root)))
+    client = build_qdrant_client(paper_dense_index_path(root))
     try:
         response = client.query_points(
             collection_name=str(manifest.get("collection_name")),
@@ -250,20 +253,31 @@ def search_papers_hybrid(
     candidate_limit: int = 30,
     rrf_k: int = 60,
     filters: dict[str, Any] | None = None,
+    dense_enabled: bool = True,
 ) -> dict[str, Any]:
     output_limit = _validate_limit(limit, "limit")
     per_source = _validate_limit(candidate_limit, "candidate_limit")
     if rrf_k < 1:
         raise ValueError("rrf_k 必须大于 0。")
     bm25 = search_paper_bm25(project_root, query, limit=per_source, filters=filters)
-    dense = search_paper_dense(project_root, provider, query, limit=per_source, filters=filters)
+    dense = (
+        search_paper_dense(project_root, provider, query, limit=per_source, filters=filters)
+        if dense_enabled
+        else {
+            "query": query.strip(),
+            "retriever": "paper_dense_skipped_cpu_fallback",
+            "result_count": 0,
+            "results": [],
+        }
+    )
     results = _rrf({"bm25": bm25["results"], "dense": dense["results"]}, rrf_k=rrf_k, limit=output_limit)
     return {
         "query": query.strip(),
-        "retriever": "paper_hybrid_rrf",
+        "retriever": "paper_hybrid_rrf" if dense_enabled else "paper_bm25_cpu_fallback",
         "result_count": len(results),
         "candidate_limit_per_source": per_source,
         "rrf_k": rrf_k,
+        "dense_enabled": dense_enabled,
         "results": results,
         "branch_results": {"bm25": bm25["results"], "dense": dense["results"]},
     }

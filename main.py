@@ -277,14 +277,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=80,
         help="同一章节连续 Chunk 的最大重叠上下文词元数，默认 80。",
     )
-    for action, help_text in (
-        ("sync", "按 pending epoch 增量同步 FTS5、Qdrant、Neo4j 和社区。"),
-        ("migrate-to-graphrag", "从现有 chunks.jsonl 一次性迁移，无需重新上传 PDF。"),
-    ):
-        command = knowledge_subparsers.add_parser(action, help=help_text)
-        command.add_argument("--document-id")
-        add_embedding_options(command)
-    knowledge_subparsers.add_parser("status", help="显示 active/pending/failed epoch 与 Outbox。")
+    knowledge_subparsers.add_parser(
+        "status",
+        help="只读显示当前 Paper/Content 两层知识库 readiness 和索引 provenance。",
+    )
     database_command = knowledge_subparsers.add_parser(
         "database",
         help="初始化或检查可选 MySQL 结构化知识库（不存向量）。",
@@ -294,24 +290,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["init", "status"],
         help="init 创建 Schema；status 显示连接与表状态。",
     )
-    retry_command = knowledge_subparsers.add_parser("retry-failed", help="将失败 Epoch 置为可重试。")
-    retry_command.add_argument("--epoch", type=int)
-    cleanup_command = knowledge_subparsers.add_parser("cleanup-epochs", help="清理旧失败 Epoch 的注册记录。")
-    cleanup_command.add_argument("--keep-failed", type=int, default=2)
-
-    graph_command = subparsers.add_parser("graph", help="检查和查询 Neo4j 科学知识图。")
-    graph_subparsers = graph_command.add_subparsers(dest="graph_command", required=True)
-    graph_subparsers.add_parser("status")
-    graph_subparsers.add_parser("validate")
-    entity_command = graph_subparsers.add_parser("entity")
-    entity_command.add_argument("name")
-    relation_command = graph_subparsers.add_parser("relation")
-    relation_command.add_argument("entity_a")
-    relation_command.add_argument("entity_b")
-    community_command = graph_subparsers.add_parser("community")
-    community_subparsers = community_command.add_subparsers(dest="community_command", required=True)
-    community_subparsers.add_parser("list")
-
     search_command = subparsers.add_parser(
         "search",
         help="从本地 BM25 索引检索带页码和 block 来源的论文证据。",
@@ -467,9 +445,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     answer_command.add_argument(
         "--retrieval-mode",
-        choices=["graphrag", "legacy", "agentic", "fast"],
-        default="graphrag",
-        help="graphrag 为默认；legacy 用于回归/消融（agentic/fast 是兼容别名）。",
+        choices=["legacy", "agentic", "fast"],
+        default="legacy",
+        help="legacy 使用 Hybrid RAG；agentic 使用受限 Agent 编排；fast 为轻量兼容模式。",
     )
     answer_command.add_argument("--retrieval-limit", type=int, default=10)
     answer_command.add_argument("--token-budget", type=int, default=6000)
@@ -706,6 +684,10 @@ def build_parser() -> argparse.ArgumentParser:
         dest="scholar_command",
         required=True,
     )
+    scholar_subparsers.add_parser(
+        "release-check",
+        help="执行 CrewAI Production Release Gate（不调用外部 Provider）。",
+    )
     request_command = scholar_subparsers.add_parser(
         "request",
         help="通过 Production Scholar Runtime 执行一个用户级 Scholar Request。",
@@ -842,15 +824,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=PROJECT_ROOT / "data" / "evaluation" / "generation_report.json",
     )
-    graphrag_evaluate_command = evaluate_subparsers.add_parser(
-        "graphrag", help="评测 GraphRAG 实体、关系、路径、拒答、社区、Drift 与跨查询召回。"
-    )
-    graphrag_evaluate_command.add_argument("--predictions", type=Path, required=True)
-    graphrag_evaluate_command.add_argument("--questions", type=Path,
-        default=PROJECT_ROOT / "evaluation" / "graphrag_questions.jsonl")
-    graphrag_evaluate_command.add_argument("--output", type=Path,
-        default=PROJECT_ROOT / "data" / "evaluation" / "graphrag_report.json")
-
     return parser
 
 
@@ -975,6 +948,7 @@ def answer_provider_from_args(args: argparse.Namespace) -> Any:
             base_url=base_url.strip(),
             model=model.strip(),
             api_key=normalized_api_key or None,
+            auth_scheme=settings.auth_scheme,
             timeout_seconds=(
                 args.llm_timeout
                 if args.llm_timeout is not None
@@ -991,45 +965,11 @@ def answer_provider_from_args(args: argparse.Namespace) -> Any:
     )
 
 
-def graph_provider_from_environment() -> Any:
-    """创建索引 Plane 使用的结构化抽取/社区报告 Provider。"""
-
-    from app.generation.openai_compatible import OpenAICompatibleAnswerProvider, OpenAICompatibleConfig
-    from app.generation.settings import load_local_llm_settings
-    from app.graph.config import GraphRAGConfig
-
-    settings = load_local_llm_settings(PROJECT_ROOT)
-    graph_config = GraphRAGConfig.from_environment(PROJECT_ROOT)
-    model = graph_config.graph_extraction_model or settings.model
-    if not settings.base_url or not model:
-        raise ValueError("knowledge sync requires LEO_LLM_BASE_URL and LEO_GRAPH_EXTRACTION_MODEL/LEO_LLM_MODEL")
-    api_key = settings.api_key.get_secret_value() if settings.api_key else None
-    return OpenAICompatibleAnswerProvider(OpenAICompatibleConfig(
-        base_url=settings.base_url, model=model, api_key=api_key,
-        timeout_seconds=settings.timeout_seconds, max_tokens=settings.max_tokens,
-        prompt_layout="context_first", json_mode=True,
-    ))
-
-
-def neo4j_client_from_environment() -> Any:
-    from app.graph.client import Neo4jClient, Neo4jSettings
-    return Neo4jClient(Neo4jSettings.from_environment(PROJECT_ROOT / ".env"))
-
-
 def retrieval_runtime_from_args(
     args: argparse.Namespace,
     *,
     include_reranker: bool,
 ) -> Any:
-    if getattr(args, "retrieval_mode", None) == "graphrag":
-        from app.runtime.graphrag import GraphRAGRetrievalRuntime
-
-        return GraphRAGRetrievalRuntime(
-            project_root=PROJECT_ROOT,
-            embedding_provider=dense_provider_from_args(args),
-            reranker_provider=(reranker_provider_from_args(args) if include_reranker else None),
-        )
-
     from app.runtime.retrieval import RetrievalRuntime
 
     return RetrievalRuntime(
@@ -1189,11 +1129,22 @@ def main(argv: Sequence[str] | None = None) -> None:
         from app.scholar.approval import PatchApprovalRequest, PatchApprovalService
 
         try:
+            if args.scholar_command == "release-check":
+                from app.evaluation.multi_agent import release_gate
+
+                report = release_gate(PROJECT_ROOT)
+                print_json(report)
+                status = report["release_status"]
+                if status == "CREWAI_PRODUCTION_NOT_READY":
+                    raise SystemExit(1)
+                if status == "CREWAI_PRODUCTION_EXTERNAL_BLOCKED":
+                    raise SystemExit(2)
+                return
             if args.scholar_command == "request":
                 from app.scholar.composition import ScholarRuntimeFactory
 
                 with ScholarRuntimeFactory(PROJECT_ROOT).open() as runtime:
-                    result = runtime.harness.scholar_request(
+                    result = runtime.scholar_orchestration.scholar_request(
                         args.instruction,
                         args.project_id,
                         session_id=args.session_id,
@@ -1210,7 +1161,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 except json.JSONDecodeError as error:
                     raise ValueError("--resume-value 必须是合法 JSON。") from error
                 with ScholarRuntimeFactory(PROJECT_ROOT).open() as runtime:
-                    result = runtime.harness.resume(
+                    result = runtime.scholar_orchestration.resume(
                         args.thread_id,
                         resume_value,
                         args.project_id,
@@ -1332,60 +1283,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit(2)
         return
 
-    if args.command == "graph":
-        from app.graph.retrieval import GraphRetriever
-        from app.graph.validation import validate_graph_sources
-        from app.index_registry.store import IndexRegistryStore
-
-        registry = IndexRegistryStore(PROJECT_ROOT)
-        active_epoch = registry.active_epoch()
-        if active_epoch is None:
-            raise SystemExit("没有 active index epoch；请先运行 knowledge sync。")
-        try:
-            with neo4j_client_from_environment() as client:
-                if args.graph_command == "status":
-                    print_json({**client.status(), "active_epoch": active_epoch})
-                    return
-                if args.graph_command == "validate":
-                    report = validate_graph_sources(client.driver, client.settings.database, active_epoch)
-                    print_json(report)
-                    if not report["valid"]:
-                        raise SystemExit(1)
-                    return
-                retriever = GraphRetriever(client.driver, client.settings.database)
-                if args.graph_command == "entity":
-                    print_json({"query": args.name, "entities": retriever.link_entity(args.name)})
-                    return
-                if args.graph_command == "relation":
-                    left = retriever.link_entity(args.entity_a, 1)
-                    right = retriever.link_entity(args.entity_b, 1)
-                    if not left or not right:
-                        print_json({"mode": "none", "candidates": [],
-                            "refusal_reason": "至少一个实体无法链接到当前知识图。"})
-                        raise SystemExit(2)
-                    result = retriever.relationship_search(left[0]["entity_id"],
-                        right[0]["entity_id"], active_epoch)
-                    result["candidates"] = [value.model_dump(mode="json")
-                                             for value in result["candidates"]]
-                    print_json(result)
-                    if result["mode"] == "none":
-                        raise SystemExit(2)
-                    return
-                with client.driver.session(database=client.settings.database) as session:
-                    rows = session.run(
-                        """MATCH (c:Community) WHERE c.valid_from_epoch <= $epoch
-                        AND (c.valid_to_epoch IS NULL OR $epoch < c.valid_to_epoch)
-                        RETURN c{.*} AS community ORDER BY c.level,c.community_id""",
-                        epoch=active_epoch,
-                    ).data()
-                print_json({"active_epoch": active_epoch,
-                            "communities": [dict(value["community"]) for value in rows]})
-                return
-        except (OSError, RuntimeError, ValueError) as error:
-            raise SystemExit(f"Graph 错误：{type(error).__name__}") from error
-
     if args.command == "knowledge":
-        from app.index_registry.store import IndexRegistryStore
 
         if args.knowledge_command == "database":
             from app.persistence import build_knowledge_repository
@@ -1410,47 +1308,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                 repository.close()
             return
 
-        registry = IndexRegistryStore(PROJECT_ROOT)
         if args.knowledge_command == "status":
-            from app.knowledge_engine import knowledge_serving_status
+            from app.knowledge_engine import knowledge_runtime_status
+            from app.knowledge.corpus import knowledge_index_readiness
 
-            status = registry.status()
             print_json(
                 {
-                    **status,
-                    "knowledge_serving": knowledge_serving_status(PROJECT_ROOT),
+                    **knowledge_runtime_status(PROJECT_ROOT),
+                    "knowledge_index": knowledge_index_readiness(PROJECT_ROOT),
+                    "corpus": library_status(PROJECT_ROOT).to_dict(),
                 }
             )
             return
-        if args.knowledge_command == "retry-failed":
-            print_json({"retried_epochs": registry.retry_failed(args.epoch)})
-            return
-        if args.knowledge_command == "cleanup-epochs":
-            print_json(registry.cleanup_epochs(keep_failed=args.keep_failed))
-            return
-        if args.knowledge_command in {"sync", "migrate-to-graphrag"}:
-            from app.graph.config import GraphRAGConfig
-            from app.index_registry.coordinator import KnowledgeSyncService
-            from app.retrieval.search import load_chunks
-
-            graph_config = GraphRAGConfig.from_environment(PROJECT_ROOT)
-            provider = dense_provider_from_args(args)
-            graph_provider = graph_provider_from_environment()
-            try:
-                with neo4j_client_from_environment() as client:
-                    service = KnowledgeSyncService(PROJECT_ROOT, registry, provider,
-                        graph_provider, client.driver, neo4j_database=client.settings.database,
-                        extractor_prompt_version=graph_config.graph_extraction_prompt_version,
-                        ontology_version=graph_config.graph_ontology_version,
-                        community_prompt_version=graph_config.community_prompt_version,
-                        extraction_concurrency=graph_config.graph_extraction_concurrency)
-                    print_json(service.sync(load_chunks(PROJECT_ROOT),
-                                            document_id=args.document_id))
-                return
-            except Exception as error:
-                from app.generation.security import redact_sensitive_text
-                safe = redact_sensitive_text(error)
-                raise SystemExit(f"Knowledge sync 错误：{safe}") from error
 
         from app.chunking.builder import build_knowledge_base
 
@@ -1617,11 +1486,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 known_secrets=(getattr(args, "llm_api_key", None),),
             )
             raise SystemExit(f"LLM 配置错误：{safe_error}") from error
-        use_agentic = args.retrieval_mode in {"graphrag", "agentic"}
-        # Minimal third-party/test AnswerProvider implementations may only expose
-        # generate(); GraphRAG's structured planner requires chat_completion().
-        if args.retrieval_mode == "graphrag" and not hasattr(answer_provider, "chat_completion"):
-            use_agentic = False
+        use_agentic = args.retrieval_mode == "agentic"
         if use_agentic:
             if args.context_session:
                 raise SystemExit(
@@ -1749,13 +1614,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 write_json_atomic(output.expanduser().resolve(), report)
             print_json(report)
 
-        if args.evaluate_command == "graphrag":
-            from app.evaluation.graphrag import evaluate_files
-
-            report = evaluate_files(args.questions, args.predictions, args.output)
-            report["corpus_summary"] = corpus_summary(PROJECT_ROOT).to_dict()
-            finish_evaluation(report, args.output)
-            return
         if args.evaluate_command == "agent":
             from app.evaluation.agent import evaluate_agent_files
 

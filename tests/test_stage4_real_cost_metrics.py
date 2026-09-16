@@ -65,7 +65,7 @@ def _measured_result() -> Mapping[str, Any]:
     )
 
 
-def test_real_cost_metrics_separate_context_provider_cache_and_ingestion() -> None:
+def test_real_cost_metrics_separate_context_provider_and_cache() -> None:
     result = _measured_result()
     metrics = RealCostMetricsCollector().collect(
         result,
@@ -76,8 +76,6 @@ def test_real_cost_metrics_separate_context_provider_cache_and_ingestion() -> No
             output_per_million=2.0,
             cached_input_per_million=0.1,
         ),
-        lightrag_query_tokens=30,
-        lightrag_ingestion_tokens=50_000,
     )
 
     assert metrics.router_context_tokens > 0
@@ -90,8 +88,6 @@ def test_real_cost_metrics_separate_context_provider_cache_and_ingestion() -> No
     assert metrics.first_token_latency_ms == 12.5
     assert metrics.cache_hit_rate == 0.2
     assert metrics.monetary_cost == pytest.approx(0.000182)
-    assert metrics.lightrag_query_tokens == 30
-    assert metrics.lightrag_ingestion_tokens == 50_000
 
 
 @pytest.mark.parametrize(
@@ -119,4 +115,3 @@ def test_missing_provider_usage_cannot_be_silently_estimated() -> None:
             measurement_source="production-run",
             provider_measured=True,
         )
-

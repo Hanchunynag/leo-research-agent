@@ -24,6 +24,7 @@ class LocalLLMSettings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("LEO_LLM_API_KEY", "DEEPSEEK_API_KEY"),
     )
+    auth_scheme: Literal["bearer", "raw"] = "bearer"
     timeout_seconds: float = 120.0
     max_tokens: int = 8192
     prompt_layout: Literal["query_first", "context_first"] | None = None

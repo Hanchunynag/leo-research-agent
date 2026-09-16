@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Protocol
+from threading import current_thread
+from time import perf_counter
+from typing import Any, Callable, Protocol
 
+from app.jobs.worker import JobCancelled
+from app.generation.security import redact_sensitive_text
 from app.scholar.approval.service import PatchApprovalService
 from app.scholar.citation import CitationResolutionService
 from app.scholar.manuscript import ManuscriptSynchronizer
 from app.scholar.models import Contribution, DraftPatch, EvidencePack, ManuscriptFact, ReviewReport
 from app.scholar.project import ScholarProjectStore
-from app.scholar.research import ResearchBudget, ResearchCapabilityService, ResearchRequest
+from app.scholar.research import (
+    ResearchBudget,
+    ResearchCapabilityService,
+    ResearchProgressCallback,
+    ResearchRequest,
+)
 from app.scholar.writing.models import (
     CapabilitySet,
     ClaimPlan,
@@ -25,6 +35,13 @@ from app.scholar.writing.models import (
     WritingResult,
     deterministic_patch_id,
     deterministic_review_report_id,
+)
+from app.scholar.writing.citation_coverage import (
+    INTRODUCTION_MINIMUM_UNIQUE_PAPERS,
+    CitationCoverage,
+    citation_coverage,
+    insufficient_introduction_message,
+    insufficient_research_message,
 )
 from app.scholar.writing.reviewer import IntroductionReviewer
 from app.scholar.writing.skill import IntroductionSkill
@@ -58,9 +75,195 @@ class MetadataCitationResolver:
 class ResearchDelegate:
     """只把 Skill 的 ResearchNeed 转成现有 ResearchRequest。"""
 
-    def __init__(self, capability: ResearchCapabilityService, *, capabilities: CapabilitySet | None = None) -> None:
+    def __init__(
+        self,
+        capability: ResearchCapabilityService,
+        *,
+        capabilities: CapabilitySet | None = None,
+        max_parallelism: int = 3,
+    ) -> None:
+        if isinstance(max_parallelism, bool) or not 1 <= max_parallelism <= 8:
+            raise ValueError("max_parallelism 必须在 1 到 8 之间。")
         self.capability = capability
         self.capabilities = capabilities
+        self.max_parallelism = max_parallelism
+
+    def _research_one(
+        self,
+        request_id: str,
+        need: ResearchNeed,
+        *,
+        workspace_id: str,
+        scope_version: int,
+        request_metadata: Mapping[str, Any] | None,
+        progress_callback: ResearchProgressCallback | None,
+        cancellation_checker: Callable[[], None] | None,
+        need_index: int,
+        need_total: int,
+    ) -> EvidencePack:
+        # The Skill supplies safe defaults (including the 5-paper Introduction
+        # target), while an explicit request may intentionally ask for a
+        # larger survey. Request metadata therefore wins on conflicts.
+        metadata = {**dict(need.metadata), **dict(request_metadata or {})}
+
+        def check_cancelled() -> None:
+            if cancellation_checker is not None:
+                cancellation_checker()
+
+        def notify(name: str, status: str, details: Mapping[str, Any] | None = None) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(
+                    name,
+                    status,
+                    {
+                        "research_need_id": need.need_id,
+                        "research_need_index": need_index,
+                        "research_need_total": need_total,
+                        **dict(details or {}),
+                    },
+                )
+            except Exception:
+                # A progress sink is best-effort telemetry and must not alter
+                # the research result or cancellation lifecycle.
+                return
+
+        freshness_mode = str(metadata.get("freshness_mode") or "LOCAL_ONLY")
+        budget = ResearchBudget()
+        for budget_field, metadata_key in (
+            ("max_papers", "paper_retrieval_limit"),
+            ("max_sections", "section_retrieval_limit"),
+            ("max_evidence_items", "evidence_limit"),
+        ):
+            raw_limit = metadata.get(metadata_key)
+            if (
+                isinstance(raw_limit, int)
+                and not isinstance(raw_limit, bool)
+                and raw_limit >= 1
+            ):
+                budget = replace(budget, **{budget_field: raw_limit})
+        max_web_queries = metadata.get("max_web_queries")
+        if isinstance(max_web_queries, int) and not isinstance(max_web_queries, bool):
+            budget = replace(budget, max_web_queries=max(0, max_web_queries))
+        research_request = ResearchRequest(
+            request_id=f"{request_id}:{need.need_id}",
+            query=need.query,
+            workspace_id=workspace_id,
+            scope_version=scope_version,
+            purpose=need.purpose,  # type: ignore[arg-type]
+            target_claims=need.target_claims,
+            preferred_section_types=need.preferred_section_types,
+            freshness_mode=freshness_mode,  # type: ignore[arg-type]
+            requested_from=metadata.get("requested_from"),
+            requested_to=metadata.get("requested_to"),
+            explicit_latest=bool(metadata.get("explicit_latest", False)),
+            domain_sensitivity=str(metadata.get("domain_sensitivity") or "unknown"),  # type: ignore[arg-type]
+            budget=budget,
+            metadata=metadata,
+        )
+        allow_web = bool(self.capabilities and self.capabilities.allows("WEB_RESEARCH"))
+        started = perf_counter()
+        check_cancelled()
+        notify(
+            "research_need",
+            "RUNNING",
+            {"phase": "retrieval", "progress": 0.0},
+        )
+        call_variants = (
+            {
+                "allow_web": allow_web,
+                "parallel": True,
+                "progress_callback": notify,
+                "cancellation_checker": check_cancelled,
+            },
+            {
+                "allow_web": allow_web,
+                "parallel": True,
+                "progress_callback": notify,
+            },
+            {"allow_web": allow_web, "parallel": True},
+            {"allow_web": allow_web},
+            {},
+        )
+        def invoke() -> EvidencePack:
+            pack: EvidencePack | None = None
+            for variant_index, call_kwargs in enumerate(call_variants):
+                try:
+                    pack = self.capability.research(research_request, **call_kwargs)
+                    break
+                except TypeError as error:
+                    # Phase 2C test doubles and external capability facades
+                    # may expose only an older subset of the optional
+                    # callback contract. Retry only when the exception is
+                    # clearly an unexpected keyword/argument compatibility
+                    # error; a TypeError raised by the capability body remains
+                    # a real failure.
+                    message = str(error)
+                    compatibility_error = any(
+                        name in message
+                        for name in (
+                            "progress_callback",
+                            "cancellation_checker",
+                            "parallel",
+                            "allow_web",
+                            "unexpected keyword",
+                            "positional argument",
+                        )
+                    )
+                    if not compatibility_error or variant_index == len(call_variants) - 1:
+                        raise
+            if pack is None:
+                raise RuntimeError("Research Capability 未返回 EvidencePack。")
+            return pack
+
+        try:
+            pack = invoke()
+        except JobCancelled:
+            notify(
+                "research_need",
+                "CANCELLED",
+                {
+                    "phase": "retrieval",
+                    "progress": 1.0,
+                    "elapsed_ms": round((perf_counter() - started) * 1000, 3),
+                },
+            )
+            raise
+        except Exception:
+            notify(
+                "research_need",
+                "FAILED",
+                {
+                    "phase": "retrieval",
+                    "elapsed_ms": round((perf_counter() - started) * 1000, 3),
+                },
+            )
+            raise
+        check_cancelled()
+        notify(
+            "research_need",
+            "COMPLETED",
+            {
+                "phase": "retrieval",
+                "progress": 1.0,
+                "evidence_count": len(pack.evidence),
+                "elapsed_ms": round((perf_counter() - started) * 1000, 3),
+            },
+        )
+        # Preserve the domain pack while exposing bounded scheduler evidence
+        # for the Console and production diagnostics. This records which
+        # independent ResearchNeed worker ran, without exposing prompt text.
+        return replace(
+            pack,
+            metadata={
+                **dict(pack.metadata),
+                "research_need_id": need.need_id,
+                "parallel_requested": True,
+                "parallel_worker": current_thread().name,
+                "parallel_elapsed_ms": round((perf_counter() - started) * 1000, 3),
+            },
+        )
 
     def research_needs(
         self,
@@ -70,44 +273,48 @@ class ResearchDelegate:
         workspace_id: str | None = None,
         scope_version: int | None = None,
         request_metadata: Mapping[str, Any] | None = None,
+        progress_callback: ResearchProgressCallback | None = None,
+        cancellation_checker: Callable[[], None] | None = None,
     ) -> tuple[EvidencePack, ...]:
-        packs: list[EvidencePack] = []
         resolved_workspace = workspace_id or self.capability.workspace_id
         resolved_scope = scope_version or self.capability.scope_version
-        for need in needs:
-            metadata = {**dict(request_metadata or {}), **dict(need.metadata)}
-            freshness_mode = str(metadata.get("freshness_mode") or "LOCAL_ONLY")
-            budget = ResearchBudget()
-            max_web_queries = metadata.get("max_web_queries")
-            if isinstance(max_web_queries, int) and not isinstance(max_web_queries, bool):
-                budget = replace(budget, max_web_queries=max(0, max_web_queries))
-            research_request = ResearchRequest(
-                request_id=f"{request_id}:{need.need_id}",
-                query=need.query,
+        ordered_needs = tuple(needs)
+        if not ordered_needs:
+            return ()
+        worker_count = min(self.max_parallelism, len(ordered_needs))
+
+        def submit_one(index: int, need: ResearchNeed) -> EvidencePack:
+            if cancellation_checker is not None:
+                cancellation_checker()
+            return self._research_one(
+                request_id,
+                need,
                 workspace_id=resolved_workspace,
                 scope_version=resolved_scope,
-                purpose=need.purpose,  # type: ignore[arg-type]
-                target_claims=need.target_claims,
-                preferred_section_types=need.preferred_section_types,
-                freshness_mode=freshness_mode,  # type: ignore[arg-type]
-                requested_from=metadata.get("requested_from"),
-                requested_to=metadata.get("requested_to"),
-                explicit_latest=bool(metadata.get("explicit_latest", False)),
-                domain_sensitivity=str(metadata.get("domain_sensitivity") or "unknown"),  # type: ignore[arg-type]
-                budget=budget,
-                metadata=metadata,
+                request_metadata=request_metadata,
+                progress_callback=progress_callback,
+                cancellation_checker=cancellation_checker,
+                need_index=index,
+                need_total=len(ordered_needs),
             )
-            allow_web = bool(self.capabilities and self.capabilities.allows("WEB_RESEARCH"))
-            try:
-                pack = self.capability.research(research_request, allow_web=allow_web)
-            except TypeError as error:
-                # Phase 2C test doubles and legacy capability facades expose the
-                # original one-argument contract; preserve that adapter path.
-                if "allow_web" not in str(error):
-                    raise
-                pack = self.capability.research(research_request)
-            packs.append(pack)
-        return tuple(packs)
+
+        # ResearchNeeds are independent evidence requests. Submit them
+        # together and collect in input order; this keeps the final ClaimPlan
+        # deterministic while allowing web/local discovery to overlap.
+        if worker_count == 1:
+            return tuple(
+                submit_one(index, need)
+                for index, need in enumerate(ordered_needs, 1)
+            )
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="research-need",
+        ) as executor:
+            futures = tuple(
+                executor.submit(submit_one, index, need)
+                for index, need in enumerate(ordered_needs, 1)
+            )
+            return tuple(future.result() for future in futures)
 
     def research(self, request: WritingRequest, needs: Sequence[ResearchNeed]) -> tuple[EvidencePack, ...]:
         return self.research_needs(request.request_id, needs, request_metadata=request.metadata)
@@ -280,6 +487,31 @@ class ScholarWritingService:
             if item.get("evidence_id")
         }
 
+    @staticmethod
+    def _minimum_unique_papers(request: WritingRequest) -> int | None:
+        """Read the production Introduction policy carried by the request.
+
+        The production CrewAI/Worker entry points always inject this policy.
+        Keeping it in the request metadata makes the contract visible at the
+        Skill boundary and preserves compatibility for older direct callers
+        that exercise the low-level vertical without a production profile.
+        """
+
+        raw = request.metadata.get("minimum_unique_papers")
+        if raw is None:
+            return None
+        if isinstance(raw, bool):
+            raise ValueError("minimum_unique_papers 必须为正整数。")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as error:
+            raise ValueError("minimum_unique_papers 必须为正整数。") from error
+        return max(INTRODUCTION_MINIMUM_UNIQUE_PAPERS, value)
+
+    @staticmethod
+    def _coverage_metadata(coverage: CitationCoverage) -> dict[str, Any]:
+        return {"citation_coverage": coverage.to_dict()}
+
     def _result(self, request: WritingRequest, status: str, **kwargs: Any) -> WritingResult:
         return WritingResult(status=status, request=request, **kwargs)  # type: ignore[arg-type]
 
@@ -308,7 +540,11 @@ class ScholarWritingService:
         if hasattr(self.delegate, "capabilities"):
             self.delegate.capabilities = self.capabilities
         active_writer = writer or self.writer
-        state = self.synchronizer.scan()
+        # A writing request may be the first operation in a new Scholar
+        # project. Initialize only the empty LaTeX skeleton here; generated
+        # prose still becomes a DraftPatch and cannot touch the manuscript
+        # before human approval.
+        state = self.synchronizer.ensure_initialized()
         section = state.sections.get("introduction")
         if section is None:
             return self._result(request, "FAILED", error_codes=("MANUSCRIPT_CONFLICT",))
@@ -347,6 +583,33 @@ class ScholarWritingService:
             return self._result(request, "FAILED", manuscript_hash=section.content_hash, error_codes=("RESEARCH_FAILED",))
         plan = self._claim_plan(request, needs, packs, contributions)
         catalog, citation_requirements, citation_bindings, bibliography_changes, bibliography_hash = self._citation_catalog(packs)
+        minimum_unique_papers = self._minimum_unique_papers(request)
+        evidence_mapping = self._evidence_mapping(packs)
+        available_coverage = citation_coverage(
+            tuple(catalog),
+            catalog,
+            evidence_mapping,
+            minimum_unique_papers=minimum_unique_papers or INTRODUCTION_MINIMUM_UNIQUE_PAPERS,
+        )
+        if minimum_unique_papers is not None and available_coverage.available_paper_count < minimum_unique_papers:
+            candidate_count = max(
+                (
+                    int(pack.metadata["paper_candidate_count"])
+                    for pack in packs
+                    if isinstance(pack.metadata.get("paper_candidate_count"), int)
+                ),
+                default=None,
+            )
+            return self._result(
+                request,
+                "FAILED",
+                manuscript_hash=section.content_hash,
+                claim_plan=plan,
+                evidence_packs=packs,
+                error_codes=("INSUFFICIENT_INTRODUCTION_SOURCES",),
+                warnings=(insufficient_research_message(available_coverage, candidate_paper_count=candidate_count),),
+                metadata=self._coverage_metadata(available_coverage),
+            )
         context = WritingContext(
             request,
             current,
@@ -362,6 +625,7 @@ class ScholarWritingService:
             citation_bindings=citation_bindings,
             bibliography_changes=bibliography_changes,
             bibliography_base_hash=bibliography_hash,
+            citation_coverage=available_coverage.to_dict(),
         )
         try:
             draft = active_writer.generate(context)
@@ -373,8 +637,20 @@ class ScholarWritingService:
                 return self._result(request, "CONFLICT", manuscript_hash=section.content_hash, draft=draft, claim_plan=plan, evidence_packs=packs, error_codes=("STALE_BASE_HASH",))
             if not draft.original_content:
                 draft = replace(draft, original_content=current)
-        except Exception:
-            return self._result(request, "FAILED", manuscript_hash=section.content_hash, claim_plan=plan, evidence_packs=packs, error_codes=("DRAFT_GENERATION_FAILED",))
+        except Exception as error:
+            detail = redact_sensitive_text(
+                f"{type(error).__name__}: {error}"
+            )[:500]
+            return self._result(
+                request,
+                "FAILED",
+                manuscript_hash=section.content_hash,
+                claim_plan=plan,
+                evidence_packs=packs,
+                error_codes=("DRAFT_GENERATION_FAILED",),
+                warnings=(f"Writer Provider 调用失败：{detail}",),
+                metadata={"writer_error": detail},
+            )
 
         review: ReviewReport | None = None
         for revision_round in range(self.max_revision_rounds + 1):
@@ -392,6 +668,7 @@ class ScholarWritingService:
                         for value in citation_bindings
                         if getattr(value, "bibkey", None)
                     },
+                    minimum_unique_papers=minimum_unique_papers,
                 )
                 review = replace(
                     review,
@@ -414,6 +691,28 @@ class ScholarWritingService:
         if latest_section is None or latest_section.content_hash != section.content_hash:
             return self._result(request, "CONFLICT", manuscript_hash=section.content_hash, draft=draft, claim_plan=plan, evidence_packs=packs, review_report=review, error_codes=("STALE_BASE_HASH",))
         assert review is not None
+        final_coverage = citation_coverage(
+            draft.citation_keys,
+            catalog,
+            evidence_mapping,
+            minimum_unique_papers=minimum_unique_papers or INTRODUCTION_MINIMUM_UNIQUE_PAPERS,
+        )
+        if minimum_unique_papers is not None and not final_coverage.sufficient:
+            # A reviewer report can be useful for diagnostics, but a draft
+            # with fewer than the required distinct papers is not a proposal
+            # that may enter the Patch/Approval lifecycle.
+            return self._result(
+                request,
+                "FAILED",
+                manuscript_hash=section.content_hash,
+                draft=draft,
+                claim_plan=plan,
+                evidence_packs=packs,
+                review_report=review,
+                error_codes=("INSUFFICIENT_INTRODUCTION_CITATIONS",),
+                warnings=(insufficient_introduction_message(final_coverage),),
+                metadata=self._coverage_metadata(final_coverage),
+            )
         patch = DraftPatch(
             patch_id=deterministic_patch_id(
                 request.project_id,
@@ -475,6 +774,7 @@ class ScholarWritingService:
             review_report=review,
             patch=patch,
             warnings=draft.warnings,
+            metadata=self._coverage_metadata(final_coverage),
         )
 
 

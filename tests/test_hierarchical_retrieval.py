@@ -82,3 +82,30 @@ def test_hierarchical_retrieval_scopes_chunk_stage_to_paper_candidates(tmp_path:
     assert [item["paper_id"] for item in result["results"]] == ["P_ALPHA"]
     assert result["chunk_retrieval"]["allowed_paper_ids"] == ["P_ALPHA"]
     assert result["results"][0]["section_path"] == ["Methods"]
+
+
+def test_existing_paper_shortlist_skips_repeated_paper_stage(tmp_path: Path) -> None:
+    chunks = [_chunk("C_ALPHA", "P_ALPHA", "alpha method evidence")]
+    write_jsonl_atomic(tmp_path / "data" / "knowledge" / "chunks.jsonl", chunks)
+    write_bm25_index(tmp_path, build_bm25_index(chunks))
+    papers = [
+        {"paper_id": "P_ALPHA", "title": "Alpha paper", "abstract": "alpha method", "authors": [], "year": 2024, "keywords": []},
+    ]
+    write_paper_records(tmp_path, papers)
+    build_paper_bm25_index(tmp_path, papers)
+    build_paper_dense_index(tmp_path, FakeEmbedding())
+    build_dense_index(tmp_path, FakeEmbedding())
+
+    result = search_hierarchical_evidence(
+        tmp_path,
+        FakeEmbedding(),
+        "alpha method",
+        reranker_provider=FakeReranker(),
+        limit=1,
+        paper_limit=1,
+        paper_filters={"paper_ids": ["P_ALPHA"]},
+    )
+
+    assert result["paper_retrieval"]["retriever"] == "paper_shortlist_input"
+    assert result["paper_retrieval"]["shortlist_source"] == "stage_1_paper_level"
+    assert result["candidate_paper_ids"] == ["P_ALPHA"]

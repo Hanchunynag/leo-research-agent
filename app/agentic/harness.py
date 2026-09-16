@@ -47,8 +47,6 @@ class AgenticStage(StrEnum):
     RETRIEVAL_DISPATCHING = "retrieval_dispatching"
     LEXICAL_RETRIEVING = "lexical_retrieving"
     DENSE_RETRIEVING = "dense_retrieving"
-    GRAPH_RETRIEVING = "graph_retrieving"
-    COMMUNITY_RETRIEVING = "community_retrieving"
     QUERY_FUSING = "query_fusing"
     # Backward-compatible legacy stage used by the ablation path.
     RETRIEVING = "retrieving"
@@ -94,8 +92,6 @@ class AgenticRunPolicy:
 
     max_query_expansion_calls: int = 1
     max_query_variants: int = 5
-    max_graph_hops: int = 2
-    max_graph_paths: int = 20
     max_focused_queries_per_round: int = 2
     max_cross_query_candidates: int = 40
     max_rerank_candidates: int = 20
@@ -111,10 +107,6 @@ class AgenticRunPolicy:
             raise ValueError("max_query_expansion_calls must equal 1")
         if not 1 <= self.max_query_variants <= 5:
             raise ValueError("max_query_variants must be 1..5")
-        if not 1 <= self.max_graph_hops <= 2:
-            raise ValueError("max_graph_hops must be 1..2")
-        if not 1 <= self.max_graph_paths <= 100:
-            raise ValueError("max_graph_paths must be 1..100")
         if not 1 <= self.max_focused_queries_per_round <= 2:
             raise ValueError("max_focused_queries_per_round must be 1..2")
         if not 1 <= self.max_cross_query_candidates <= 100:
@@ -174,21 +166,14 @@ _ALLOWED_TRANSITIONS: dict[AgenticStage, set[AgenticStage]] = {
     AgenticStage.QUERY_VALIDATING: {AgenticStage.RETRIEVAL_DISPATCHING},
     AgenticStage.RETRIEVAL_DISPATCHING: {
         AgenticStage.LEXICAL_RETRIEVING, AgenticStage.DENSE_RETRIEVING,
-        AgenticStage.GRAPH_RETRIEVING, AgenticStage.COMMUNITY_RETRIEVING,
         AgenticStage.QUERY_FUSING,
     },
     AgenticStage.LEXICAL_RETRIEVING: {
-        AgenticStage.DENSE_RETRIEVING, AgenticStage.GRAPH_RETRIEVING,
-        AgenticStage.COMMUNITY_RETRIEVING, AgenticStage.QUERY_FUSING,
+        AgenticStage.DENSE_RETRIEVING, AgenticStage.QUERY_FUSING,
     },
     AgenticStage.DENSE_RETRIEVING: {
-        AgenticStage.GRAPH_RETRIEVING, AgenticStage.COMMUNITY_RETRIEVING,
         AgenticStage.QUERY_FUSING,
     },
-    AgenticStage.GRAPH_RETRIEVING: {
-        AgenticStage.COMMUNITY_RETRIEVING, AgenticStage.QUERY_FUSING,
-    },
-    AgenticStage.COMMUNITY_RETRIEVING: {AgenticStage.QUERY_FUSING},
     AgenticStage.QUERY_FUSING: {AgenticStage.RERANKING},
     AgenticStage.RETRIEVING: {AgenticStage.RERANKING},
     AgenticStage.RERANKING: {AgenticStage.COVERAGE_CHECKING},

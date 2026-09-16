@@ -1,33 +1,17 @@
-"""统一知识引擎、索引代际和唯一索引编排服务。"""
+"""统一 Legacy Hybrid RAG 知识服务与索引编排入口。"""
 
-from app.knowledge_engine.generations import IndexGenerationRepository
 from app.knowledge_engine.index_service import KnowledgeIndexService
-from app.knowledge_engine.lightrag_engine import LightRAGClientConfig, LightRAGKnowledgeEngine
-from app.knowledge_engine.model_bridge import LightRAGUsage, build_lightrag_client_config
-from app.knowledge_engine.serving import (
-    EngineCutoverService,
-    KnowledgeServingConfig,
-    KnowledgeServingConfigRepository,
-    knowledge_serving_status,
-)
 from app.knowledge_engine.unified_service import (
     UnifiedKnowledgeService,
     build_configured_unified_service,
     build_legacy_unified_service,
+    knowledge_runtime_status,
 )
 
 __all__ = [
-    "IndexGenerationRepository",
     "KnowledgeIndexService",
-    "LightRAGClientConfig",
-    "LightRAGKnowledgeEngine",
-    "LightRAGUsage",
-    "EngineCutoverService",
-    "KnowledgeServingConfig",
-    "KnowledgeServingConfigRepository",
-    "knowledge_serving_status",
     "UnifiedKnowledgeService",
     "build_configured_unified_service",
     "build_legacy_unified_service",
-    "build_lightrag_client_config",
+    "knowledge_runtime_status",
 ]

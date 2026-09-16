@@ -36,7 +36,6 @@ class SessionRuntime:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")
         return connection
@@ -173,12 +172,39 @@ class SessionRuntime:
                 """
                 UPDATE agent_runs
                 SET status='RUNNING', started_at=?, worker_id=?
-                WHERE run_id=? AND status='PENDING'
+                WHERE run_id=? AND status IN ('PENDING', 'QUEUED', 'INTERRUPTED')
                 """,
                 (started, worker_id, run_id),
             ).rowcount
         if updated != 1:
             raise ValueError(f"Run 不能进入 RUNNING：{run_id}")
+        return self.get_run(run_id)
+
+    def queue_run(self, run_id: str, *, job_id: str | None = None) -> RunRecord:
+        """Move a persisted run into the queue without executing cognition."""
+
+        with self._connect() as connection:
+            changed = connection.execute(
+                """
+                UPDATE agent_runs SET status='QUEUED', job_id=COALESCE(?, job_id)
+                WHERE run_id=? AND status IN ('PENDING', 'WAITING_USER', 'INTERRUPTED')
+                """,
+                (job_id, run_id),
+            ).rowcount
+        if changed != 1:
+            current = self.get_run(run_id)
+            if current.status not in {"QUEUED", "RUNNING"}:
+                raise ValueError(f"Run 不能进入 QUEUED：{run_id}")
+        return self.get_run(run_id)
+
+    def bind_job(self, run_id: str, job_id: str) -> RunRecord:
+        with self._connect() as connection:
+            changed = connection.execute(
+                "UPDATE agent_runs SET job_id=? WHERE run_id=?",
+                (job_id, run_id),
+            ).rowcount
+        if changed != 1:
+            raise KeyError(f"Run 不存在：{run_id}")
         return self.get_run(run_id)
 
     def set_checkpoint_ref(self, run_id: str, checkpoint_ref: str | None) -> RunRecord:
@@ -262,8 +288,9 @@ class SessionRuntime:
         evidence: list[Mapping[str, Any]],
         metadata: Mapping[str, Any],
     ) -> RunRecord:
-        if status not in {"COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED", "WAITING_USER"}:
+        if status not in {"COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED", "WAITING_USER", "WAITING_HUMAN_APPROVAL"}:
             raise ValueError(f"非法最终 Run 状态：{status}")
+        storage_status = "WAITING_USER" if status == "WAITING_HUMAN_APPROVAL" else status
         finished = _now()
         with self._connect() as connection:
             connection.execute(
@@ -272,7 +299,7 @@ class SessionRuntime:
                 SET status=?, completed_at=?
                 WHERE run_id=?
                 """,
-                (status, finished, run_id),
+                (storage_status, finished, run_id),
             )
             connection.execute(
                 """
@@ -290,7 +317,7 @@ class SessionRuntime:
                 """,
                 (
                     run_id,
-                    status,
+                    storage_status,
                     answer,
                     _json(citations),
                     _json(evidence),

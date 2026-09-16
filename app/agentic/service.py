@@ -64,8 +64,6 @@ class AgentKnowledgeRuntime(Protocol):
     """Agent 所需的后端无关知识能力；具体存储/runtime 由组装层隐藏。"""
 
     embedding_provider: Any
-    supports_advanced_retrieval: bool
-
     def retrieve(self, query: str, **kwargs: Any) -> dict[str, Any]: ...
 
     def retrieve_multi(
@@ -163,14 +161,7 @@ class AgenticRAGService:
         config: AgenticRAGConfig,
     ) -> None:
         self.runtime = retrieval_runtime
-        from app.knowledge_engine.unified_service import legacy_advanced_capability
-
-        capability = getattr(retrieval_runtime, "supports_advanced_retrieval", None)
-        self._advanced_retrieval = (
-            bool(capability)
-            if capability is not None
-            else legacy_advanced_capability(retrieval_runtime)
-        )
+        self._advanced_retrieval = False
         self.reasoning_provider = reasoning_provider
         self.store = session_store
         self.reranker = reranker
@@ -856,8 +847,6 @@ class AgenticRAGService:
                 for stage, route_name in (
                     (AgenticStage.LEXICAL_RETRIEVING, "lexical"),
                     (AgenticStage.DENSE_RETRIEVING, "dense"),
-                    (AgenticStage.GRAPH_RETRIEVING, "graph_direct"),
-                    (AgenticStage.COMMUNITY_RETRIEVING, "community"),
                 ):
                     with harness.stage(stage, attempt=round_number, details={
                         "candidate_count": route_diagnostics.get(

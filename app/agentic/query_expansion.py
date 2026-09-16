@@ -7,19 +7,22 @@ from collections.abc import Sequence
 from typing import Any, Literal, Protocol
 
 from app.agentic.models import QueryExpansionResult, QueryPlan, RetrievalQuery
-from app.generation.openai_compatible import parse_json_object
+from app.generation.openai_compatible import (
+    parse_json_object,
+    structured_chat_completion,
+)
 
 
-QUERY_EXPANSION_PROMPT = """Generate bounded retrieval queries for scientific GraphRAG.
+QUERY_EXPANSION_PROMPT = """Generate bounded retrieval queries for scientific literature search.
 RQ0 must be the original query unchanged. Preserve every entity, category, satellite,
 constellation, method, dataset, time, and scenario constraint. Add no unsupported entity.
-Use at most five total queries. Relationship questions require a relationship_probe; global
-questions use community_probe. Return strict JSON matching the schema and no markdown."""
+Use at most five total queries. Relationship questions may use a relationship_probe.
+Return strict JSON matching the schema and no markdown."""
 
 PURPOSE_WEIGHTS = {
     "original": 1.0, "focused_followup": 1.0, "subquestion": 0.9,
     "relationship_probe": 0.9, "terminology_expansion": 0.8,
-    "community_probe": 0.8, "paraphrase": 0.7,
+    "paraphrase": 0.7,
 }
 
 QueryComplexity = Literal["simple", "compound", "multi_hop", "global"]
@@ -31,7 +34,6 @@ RetrievalPurpose = Literal[
     "subquestion",
     "relationship_probe",
     "focused_followup",
-    "community_probe",
 ]
 
 
@@ -76,11 +78,15 @@ class AdaptiveQueryExpander:
         if self.provider is None or self.max_variants == 1:
             return fallback
         try:
-            payload = self.provider.chat_completion([
-                {"role": "system", "content": QUERY_EXPANSION_PROMPT},
-                {"role": "user", "content": "Schema:\n" + str(QueryExpansionResult.model_json_schema()) +
-                 "\nPlan:\n" + plan.model_dump_json() + "\nOriginal query:\n" + cleaned},
-            ], max_tokens=2400)
+            payload = structured_chat_completion(
+                self.provider,
+                [
+                    {"role": "system", "content": QUERY_EXPANSION_PROMPT},
+                    {"role": "user", "content": "Schema:\n" + str(QueryExpansionResult.model_json_schema()) +
+                     "\nPlan:\n" + plan.model_dump_json() + "\nOriginal query:\n" + cleaned},
+                ],
+                max_tokens=2400,
+            )
             content = payload["choices"][0]["message"]["content"]
             result = QueryExpansionResult.model_validate(parse_json_object(str(content)))
             return self._normalize(result, cleaned, plan, complexity, retrieval_mode)
@@ -109,8 +115,7 @@ class AdaptiveQueryExpander:
     def _deterministic(self, query: str, plan: QueryPlan, complexity: QueryComplexity,
                        mode: RetrievalMode) -> QueryExpansionResult:
         queries = [_original(query, plan)]
-        purpose: RetrievalPurpose = "community_probe" if mode == "global" else (
-            "relationship_probe" if mode == "relationship" else "subquestion")
+        purpose: RetrievalPurpose = "relationship_probe" if mode == "relationship" else "subquestion"
         budget = {"simple": 1, "compound": 3, "multi_hop": 4, "global": 4}[complexity]
         for subquestion in plan.subquestions:
             if len(queries) >= min(self.max_variants, budget + 1):

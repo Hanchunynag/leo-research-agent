@@ -8,7 +8,7 @@ from time import perf_counter
 from typing import Any
 
 from app.embeddings.base import EmbeddingProvider
-from app.indexing.paper import paper_retrieval_text
+from app.indexing.paper import load_paper_records, paper_retrieval_text
 from app.reranking.base import RerankerProvider
 from app.retrieval.dense import search_dense_evidence
 from app.retrieval.hybrid import reciprocal_rank_fusion
@@ -148,6 +148,7 @@ def search_hierarchical_evidence(
     max_chunks_per_work: int = 2,
     rrf_k: int = 60,
     paper_filters: dict[str, Any] | None = None,
+    dense_enabled: bool = True,
 ) -> dict[str, Any]:
     cleaned = query.strip()
     if not cleaned:
@@ -161,18 +162,65 @@ def search_hierarchical_evidence(
         raise ValueError("rrf_k 必须大于 0。")
 
     started = perf_counter()
-    paper_stage = search_papers_hybrid(
-        project_root,
-        embedding_provider,
-        cleaned,
-        limit=paper_output_limit,
-        candidate_limit=paper_candidates,
-        rrf_k=rrf_k,
-        filters=paper_filters,
+    requested_paper_ids = tuple(
+        dict.fromkeys(
+            str(value)
+            for value in (paper_filters or {}).get("paper_ids") or []
+            if str(value)
+        )
     )
-    candidate_papers = [value for value in paper_stage.get("results", []) if isinstance(value, dict)]
-    paper_relevant, gate_diagnostics = _paper_relevance_gate(cleaned, paper_stage)
-    paper_stage["relevance_gate"] = gate_diagnostics
+    if requested_paper_ids:
+        # ``ResearchCapabilityService.search_sections`` already received the
+        # Paper-level shortlist from Stage 1. Re-running Paper BM25+BGE for
+        # every section/backfill query would turn coverage into a serial
+        # first-stage loop. Treat these IDs as the immutable Stage-1 handoff
+        # and execute only the Level-2 BM25+BGE search below.
+        records = {
+            str(value.get("paper_id")): value
+            for value in load_paper_records(project_root)
+            if isinstance(value, dict) and value.get("paper_id")
+        }
+        candidate_papers = [
+            {
+                **dict(records[paper_id]),
+                "rank": rank,
+                "score": 0.0,
+                "retrieval_source": "paper_shortlist_input",
+            }
+            for rank, paper_id in enumerate(requested_paper_ids, 1)
+            if paper_id in records
+        ][:paper_output_limit]
+        candidate_paper_ids = [
+            str(value["paper_id"]) for value in candidate_papers if value.get("paper_id")
+        ]
+        paper_stage = {
+            "query": cleaned,
+            "retriever": "paper_shortlist_input",
+            "result_count": len(candidate_papers),
+            "results": candidate_papers,
+            "branch_results": {"bm25": [], "dense": []},
+            "shortlist_source": "stage_1_paper_level",
+            "relevance_gate": {
+                "applied": False,
+                "rejected": False,
+                "reason": "paper_ids_are_existing_stage_1_shortlist",
+            },
+        }
+        paper_relevant = bool(candidate_paper_ids)
+    else:
+        paper_stage = search_papers_hybrid(
+            project_root,
+            embedding_provider,
+            cleaned,
+            limit=paper_output_limit,
+            candidate_limit=paper_candidates,
+            rrf_k=rrf_k,
+            filters=paper_filters,
+            dense_enabled=dense_enabled,
+        )
+        candidate_papers = [value for value in paper_stage.get("results", []) if isinstance(value, dict)]
+        paper_relevant, gate_diagnostics = _paper_relevance_gate(cleaned, paper_stage)
+        paper_stage["relevance_gate"] = gate_diagnostics
     if not paper_relevant:
         return {
             "query": cleaned,
@@ -187,14 +235,19 @@ def search_hierarchical_evidence(
                 "rrf_count": 0,
                 "allowed_paper_ids": [],
             },
-            "no_hit_reason": gate_diagnostics["reason"],
+            "no_hit_reason": str(
+                (paper_stage.get("relevance_gate") or {}).get(
+                    "reason", "paper_filter_no_match_or_empty_paper_index"
+                )
+            ),
             "coverage": {"paper_count": 0, "evidence_count": 0},
         }
-    candidate_paper_ids = [
-        str(value.get("paper_id"))
-        for value in candidate_papers
-        if value.get("paper_id")
-    ]
+    if not requested_paper_ids:
+        candidate_paper_ids = [
+            str(value.get("paper_id"))
+            for value in candidate_papers
+            if value.get("paper_id")
+        ]
     if not candidate_paper_ids:
         return {
             "query": cleaned,
@@ -230,7 +283,7 @@ def search_hierarchical_evidence(
         limit=chunk_candidates,
         max_chunks_per_work=20,
         paper_ids=candidate_paper_ids,
-    )
+    ) if dense_enabled else {"results": [], "retriever": "dense_skipped_cpu_fallback"}
     fused = reciprocal_rank_fusion(
         {"bm25": bm25.get("results", []), "dense": dense.get("results", [])},
         rrf_k=rrf_k,
@@ -239,7 +292,13 @@ def search_hierarchical_evidence(
     results = _rerank(cleaned, fused, reranker_provider, output_limit, per_work)
     return {
         "query": cleaned,
-        "retriever": "hierarchical_rrf_reranked" if reranker_provider else "hierarchical_rrf",
+        "retriever": (
+            "hierarchical_rrf_reranked"
+            if dense_enabled and reranker_provider
+            else "hierarchical_rrf"
+            if dense_enabled
+            else "hierarchical_bm25_cpu_fallback"
+        ),
         "result_count": len(results),
         "candidate_papers": candidate_papers,
         "candidate_paper_ids": candidate_paper_ids,
@@ -252,6 +311,8 @@ def search_hierarchical_evidence(
         },
         "reranker_model": getattr(reranker_provider, "model_name", None),
         "rrf_k": rrf_k,
+        "dense_enabled": dense_enabled,
+        "reranker_enabled": bool(dense_enabled and reranker_provider),
         "results": results,
         "coverage": {
             "paper_count": len({str(value.get("paper_id")) for value in results}),

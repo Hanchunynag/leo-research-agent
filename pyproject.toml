@@ -3,15 +3,13 @@ name = "leo-research-agent"
 version = "0.2.0"
 description = "Local paper parsing and RAG knowledge base for LEO signals-of-opportunity research"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "fastapi>=0.116,<1",
     "filelock>=3.20.0",
     "gradio==5.49.1",
     "httpx>=0.28.1",
     "mcp>=1.26,<2",
-    "neo4j==5.28.2",
-    "neo4j-graphrag[qdrant,sentence-transformers,fuzzy-matching]==1.18.0",
     "orjson>=3.11.9",
     "pydantic==2.11.10",
     "pydantic-settings>=2.14.2",
@@ -24,9 +22,6 @@ dependencies = [
     "rapidfuzz==3.14.3",
     "rich>=13.9,<15",
     "sentence-transformers==3.4.1",
-    "python-igraph==0.11.9",
-    "leidenalg==0.10.2",
-    "lightrag-hku==1.5.6",
     "langchain>=1,<2",
     "langchain-core>=1,<2",
     "typer>=0.27.0",
@@ -35,6 +30,7 @@ dependencies = [
     "langgraph-checkpoint-sqlite>=3,<4",
     "deepagents>=0.7,<1",
     "bibtexparser>=1.4,<2",
+    "crewai==1.15.21",
 ]
 
 [dependency-groups]
@@ -46,7 +42,4 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-markers = [
-    "neo4j: requires a running Neo4j 5.26 integration service",
-    "qdrant: exercises local or remote Qdrant integration",
-]
+markers = ["qdrant: exercises local or remote Qdrant integration"]

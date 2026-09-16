@@ -616,14 +616,14 @@ def test_no_evidence_never_generates_deterministic_claim(tmp_path: Path) -> None
     assert generator.calls == 0
 
 
-def test_claim_validator_rejects_graph_inference_as_direct_fact() -> None:
+def test_claim_validator_rejects_inferred_evidence_as_direct_fact() -> None:
     validator = ClaimEvidenceValidator()
     report = validator.validate(
         {"answerable": True, "claims": [{"claim_id": "C1", "text": "A proves B.", "evidence_ids": ["G1"]}]},
-        [evidence("G1", directness="inferred", grade="graph_inference")],
+        [evidence("G1", directness="inferred", grade="inferred")],
     )
     assert report.valid is False
-    assert report.issues[0].code == "graph_inference_as_fact"
+    assert report.issues[0].code == "inferred_as_fact"
     assert validator.deterministic_repair({"claims": [{"claim_id": "C1"}]}, report)["answerable"] is False
 
 
@@ -662,14 +662,7 @@ def test_harness_agent_service_preserves_external_answer_and_session_shape(
 
 
 def test_research_agent_modules_have_no_concrete_backend_dependency() -> None:
-    forbidden = (
-        "is_" + "graphrag",
-        "light" + "rag",
-        "qdrant",
-        "neo4j",
-        "canonical" + "corpus",
-        "data/index",
-    )
+    forbidden = ("qdrant", "data/index")
     root = Path(__file__).parents[1] / "app" / "research"
     source = "\n".join(
         path.read_text(encoding="utf-8")

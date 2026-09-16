@@ -37,6 +37,114 @@ SOURCE_TYPE_MAPPING = {
     "page_footnote": "page_metadata",
 }
 
+NATIVE_TEXT_FALLBACK_POLICY_VERSION = "1.0"
+NATIVE_TEXT_FALLBACK_MIN_CHARS = 1200
+NATIVE_TEXT_FALLBACK_PAGE_MIN_CHARS = 120
+NATIVE_TEXT_FALLBACK_COVERAGE_RATIO = 1.5
+OCR_RETRY_POLICY_VERSION = "1.0"
+
+
+def _visible_text_length(value: Any) -> int:
+    """Count visible characters without MinerU's inline markup."""
+
+    if not isinstance(value, str):
+        return 0
+    without_tags = re.sub(r"<[^>]+>", "", value)
+    return len(re.sub(r"\s+", "", without_tags))
+
+
+def _cjk_character_count(value: str) -> int:
+    return len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", value))
+
+
+def _retrieval_text(document: dict[str, Any]) -> str:
+    blocks = document.get("blocks")
+    if not isinstance(blocks, list):
+        return ""
+    values: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        quality = block.get("quality")
+        if isinstance(quality, dict) and quality.get("retrieval_enabled") is False:
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text.strip():
+            values.append(text)
+    return "\n".join(values)
+
+
+def filename_title_fallback(original_filename: str) -> str | None:
+    """Extract a conservative human title from a user-provided PDF name.
+
+    Chinese paper files commonly use ``标题_作者.pdf``.  Keep the title part
+    when it is unambiguously CJK so a bad OCR title cannot poison Paper-level
+    retrieval.  English filenames are left intact because underscores may be
+    meaningful in their citation/export names.
+    """
+
+    stem = Path(original_filename).stem.strip()
+    if not stem:
+        return None
+    parts = [part.strip() for part in re.split(r"_+", stem) if part.strip()]
+    if len(parts) > 1 and _cjk_character_count(parts[0]) >= 2:
+        stem = parts[0]
+    stem = re.sub(r"\s+", " ", stem.replace("_", " ")).strip(" ._-（()[]【】")
+    return stem or None
+
+
+def should_retry_with_ocr(
+    document: dict[str, Any],
+    original_filename: str,
+    *,
+    pdf_type: str | None = None,
+) -> dict[str, Any]:
+    """Detect a misleading OCR/text-layer result that needs a second pass.
+
+    A scanned Chinese PDF can contain an OCR text layer that makes PyMuPDF
+    report it as ``native_text`` while MinerU has actually extracted mostly
+    Latin fragments and ``<sub>/<sup>`` artifacts.  Those documents look
+    successful to a page-count check but are not searchable.  Return a
+    structured diagnostic so the parse pipeline can run MinerU's explicit OCR
+    method and retain the decision in ``paper.json``.
+    """
+
+    text = _retrieval_text(document)
+    title = str((document.get("metadata") or {}).get("title") or "")
+    filename_cjk = _cjk_character_count(original_filename)
+    text_cjk = _cjk_character_count(text)
+    visible_chars = _visible_text_length(text)
+    markup_count = len(re.findall(r"</?(?:sub|sup|span)\b", text, re.IGNORECASE))
+    explicit_scanned = pdf_type in {"scanned_image", "scanned_with_ocr"}
+    cjk_filename_with_weak_text = (
+        filename_cjk >= 2
+        and visible_chars >= 200
+        and text_cjk < max(12, int(visible_chars * 0.03))
+    )
+    malformed_title = bool(re.search(r"<[^>]+>", title))
+    retry = explicit_scanned or cjk_filename_with_weak_text or (
+        filename_cjk >= 2 and malformed_title and text_cjk < max(20, int(visible_chars * 0.08))
+    )
+    if explicit_scanned:
+        reason = "pdf_precheck_requires_ocr"
+    elif cjk_filename_with_weak_text:
+        reason = "cjk_filename_but_weak_cjk_text_layer"
+    elif retry:
+        reason = "malformed_title_and_weak_cjk_text_layer"
+    else:
+        reason = "text_layer_quality_sufficient"
+    return {
+        "policy_version": OCR_RETRY_POLICY_VERSION,
+        "retry": retry,
+        "reason": reason,
+        "pdf_type": pdf_type,
+        "filename_cjk_count": filename_cjk,
+        "text_cjk_count": text_cjk,
+        "visible_char_count": visible_chars,
+        "markup_count": markup_count,
+        "parser_title": title,
+    }
+
 
 def load_json(path: Path) -> Any:
     """读取 JSON 文件。"""
@@ -581,3 +689,139 @@ def build_canonical_document(
     }
 
     return canonical_document, report
+
+
+def augment_native_pdf_text(
+    document: dict[str, Any],
+    pdf_path: Path,
+) -> dict[str, Any]:
+    """补回 MinerU 漏掉的原生 PDF 文本。
+
+    少数期刊版式会被 MinerU 的版面模型识别成大块图片：公式和图仍能
+    输出，但正文文本覆盖率很低。此时 PDF 本身通常仍保留可复制文本，
+    PyMuPDF 可以提供一个可检索的保底投影。只有在全篇和单页覆盖率都明显
+    不足时才追加，避免正常 MinerU 结果出现重复内容。
+    """
+
+    report = {
+        "policy_version": NATIVE_TEXT_FALLBACK_POLICY_VERSION,
+        "status": "not_needed",
+        "native_char_count": 0,
+        "canonical_char_count": 0,
+        "fallback_page_count": 0,
+        "fallback_block_ids": [],
+    }
+    try:
+        import pymupdf
+
+        pdf = pymupdf.open(pdf_path)
+    except (OSError, RuntimeError, ValueError) as error:
+        report["status"] = "unavailable"
+        report["error"] = f"{type(error).__name__}: {error}"
+        return report
+
+    try:
+        blocks = document.get("blocks")
+        if not isinstance(blocks, list):
+            report["status"] = "invalid_document"
+            return report
+
+        def visible_length(value: Any) -> int:
+            if not isinstance(value, str):
+                return 0
+            without_tags = re.sub(r"<[^>]+>", "", value)
+            return len(re.sub(r"\s+", "", without_tags))
+
+        canonical_by_page: dict[int, int] = {}
+        maximum_order_by_page: dict[int, int] = {}
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            page = block.get("page_number")
+            if not isinstance(page, int) or page < 1:
+                continue
+            maximum_order_by_page[page] = max(
+                maximum_order_by_page.get(page, -1),
+                int(block.get("reading_order", 0)),
+            )
+            if block.get("type") in {"title", "paragraph", "list", "algorithm"}:
+                canonical_by_page[page] = canonical_by_page.get(page, 0) + visible_length(
+                    block.get("text")
+                )
+
+        native_pages: list[tuple[int, str, float, float]] = []
+        for page_number, page in enumerate(pdf, start=1):
+            text = page.get_text("text", sort=True)
+            if not isinstance(text, str):
+                continue
+            text = text.strip()
+            if not text:
+                continue
+            native_pages.append(
+                (page_number, text, float(page.rect.width), float(page.rect.height))
+            )
+
+        native_char_count = sum(visible_length(text) for _, text, _, _ in native_pages)
+        canonical_char_count = sum(canonical_by_page.values())
+        report["native_char_count"] = native_char_count
+        report["canonical_char_count"] = canonical_char_count
+        if native_char_count < NATIVE_TEXT_FALLBACK_MIN_CHARS or native_char_count <= max(
+            canonical_char_count * NATIVE_TEXT_FALLBACK_COVERAGE_RATIO,
+            NATIVE_TEXT_FALLBACK_MIN_CHARS,
+        ):
+            return report
+
+        next_order = dict(maximum_order_by_page)
+        for page_number, text, width, height in native_pages:
+            native_length = visible_length(text)
+            existing_length = canonical_by_page.get(page_number, 0)
+            if native_length < NATIVE_TEXT_FALLBACK_PAGE_MIN_CHARS:
+                continue
+            if native_length <= max(
+                existing_length * NATIVE_TEXT_FALLBACK_COVERAGE_RATIO,
+                NATIVE_TEXT_FALLBACK_PAGE_MIN_CHARS,
+            ):
+                continue
+            order = next_order.get(page_number, -1) + 1
+            next_order[page_number] = order
+            block_id = f"{document.get('paper_id')}_p{page_number:03d}_b{order:03d}"
+            blocks.append(
+                {
+                    "block_id": block_id,
+                    "paper_id": document.get("paper_id"),
+                    "page_number": page_number,
+                    "reading_order": order,
+                    "type": "paragraph",
+                    "source_type": "native_pdf_text",
+                    "bbox": [0, 0, width, height],
+                    "bbox_source": "pymupdf_native_text",
+                    "text": text,
+                    "caption": None,
+                    "title_level_raw": None,
+                    "latex": None,
+                    "latex_raw": None,
+                    "table_html": None,
+                    "table_html_raw": None,
+                    "image_path": None,
+                    "quality": {
+                        "status": "fallback",
+                        "issues": ["mineru_text_coverage_low"],
+                        "retrieval_enabled": True,
+                        "validation_passed": True,
+                    },
+                    "raw_block": {
+                        "type": "native_pdf_text",
+                        "text": text,
+                        "page_number": page_number,
+                    },
+                }
+            )
+            report["fallback_block_ids"].append(block_id)
+
+        report["fallback_page_count"] = len(report["fallback_block_ids"])
+        report["status"] = (
+            "applied" if report["fallback_block_ids"] else "not_needed"
+        )
+        return report
+    finally:
+        pdf.close()

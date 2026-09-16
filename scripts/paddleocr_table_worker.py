@@ -40,6 +40,10 @@ def main() -> None:
     args.cache_home.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(args.cache_home.resolve()))
 
+    from paddleocr_compat import enable_headless_opencv_compat
+
+    enable_headless_opencv_compat()
+
     from paddleocr import TableRecognitionPipelineV2, __version__
 
     pipeline = TableRecognitionPipelineV2(

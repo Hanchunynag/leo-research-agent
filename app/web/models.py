@@ -66,6 +66,7 @@ class JobCreated(WebModel):
 
 class PatchDecisionRequest(WebModel):
     project_id: str = Field(min_length=1, max_length=128)
+    session_id: str | None = Field(default=None, max_length=128)
     expected_base_hash: str = Field(min_length=1, max_length=128)
     actor: str = Field(min_length=1, max_length=256)
 
@@ -76,10 +77,12 @@ class ScholarTaskRequest(WebModel):
     instruction: str = Field(min_length=1, max_length=16_000)
     project_id: str = Field(min_length=1, max_length=128)
     task_type: Literal[
+        "RESEARCH",
         "WRITE_INTRODUCTION",
         "SUPPORT_CLAIM",
         "WRITE_CONCLUSION",
         "WRITE_ABSTRACT",
+        "REVIEW",
     ] | None = None
     session_id: str | None = Field(default=None, max_length=128)
     thread_id: str | None = Field(default=None, max_length=128)
@@ -93,12 +96,40 @@ class ScholarResumeRequest(WebModel):
     instruction: str = Field(min_length=1, max_length=16_000)
     resume_value: Any
     task_type: Literal[
+        "RESEARCH",
         "WRITE_INTRODUCTION",
         "SUPPORT_CLAIM",
         "WRITE_CONCLUSION",
         "WRITE_ABSTRACT",
+        "REVIEW",
     ] | None = None
     session_id: str | None = Field(default=None, max_length=128)
+
+
+class ScholarRunCreateRequest(WebModel):
+    """Asynchronous Scholar Run request; the body contains no secrets."""
+
+    instruction: str = Field(min_length=1, max_length=16_000)
+    project_id: str = Field(min_length=1, max_length=128)
+    task_type: Literal[
+        "RESEARCH",
+        "WRITE_INTRODUCTION",
+        "SUPPORT_CLAIM",
+        "WRITE_CONCLUSION",
+        "WRITE_ABSTRACT",
+        "REVIEW",
+    ] | None = None
+    session_id: str | None = Field(default=None, max_length=128)
+    thread_id: str | None = Field(default=None, max_length=128)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = Field(default=None, max_length=256)
+
+
+class ScholarRunResumeRequest(WebModel):
+    """Queue a durable approval/checkpoint reconciliation."""
+
+    resume_value: Any = None
+    idempotency_key: str | None = Field(default=None, max_length=256)
 
 
 class BuildReportRequest(WebModel):

@@ -164,46 +164,17 @@ class EvidenceIntelligencePipeline:
                     validation_status=resolved.validation_status,
                 )
             )
-        backfilled_graph = 0
-        graph_total = 0
         for ((candidate, locator), rerank_score) in ranked:
-            candidate_type = candidate.metadata.get("candidate_type")
-            is_graph = (
-                candidate.retrieval_source in {"lightrag_entity", "lightrag_relation"}
-                or candidate_type in {"relation_claim", "graph_path", "community_report"}
-            )
-            if is_graph:
-                graph_total += 1
-
-            # 6. 图关系原文回填：最终 content 永远取 Canonical Corpus。
+            # 6. Canonical Corpus is the only local source of truth.
             canonical_content = locator.content
-            verified_content = (
-                candidate.content
-                if candidate.retrieval_source.startswith("graphrag")
-                and canonical_content in candidate.content
-                else canonical_content
-            )
-            if is_graph and canonical_content:
-                backfilled_graph += 1
+            verified_content = canonical_content
 
-            # 7. 直接性分类。
-            graph_statement = candidate.content.strip()
-            directness = "direct"
-            if is_graph:
-                normalized_statement = re.sub(r"\s+", " ", graph_statement).casefold()
-                normalized_source = re.sub(r"\s+", " ", canonical_content).casefold()
-                if normalized_statement and normalized_statement in normalized_source:
-                    directness = "direct"
-                elif candidate.relation_path and all(value.casefold() in normalized_source for value in candidate.relation_path):
-                    directness = "indirect"
-                else:
-                    directness = "inferred"
+            # 7. Local candidates must directly map to the canonical chunk.
+            directness = candidate.directness or "direct"
 
             # 8. 证据等级分类；analogy 永不提升为 primary。
             grade = self.workspaces.evidence_grade(request.workspace_id, request.scope_version, locator.document_id)
-            if directness == "inferred":
-                grade = "graph_inference"
-            elif grade == "primary" and candidate.evidence_grade in {"candidate", "analogy"}:
+            if grade == "primary" and candidate.evidence_grade in {"candidate", "analogy"}:
                 grade = candidate.evidence_grade
 
             states = ("retrieved", "filtered", "ranked", "backfilled", "verified")
@@ -212,12 +183,6 @@ class EvidenceIntelligencePipeline:
                 "pipeline_states": states,
                 "retrieval_source": candidate.retrieval_source,
                 "rerank_score": float(rerank_score),
-                "graph_statement": graph_statement if is_graph else None,
-                "graph_inference_disclaimer": (
-                    "该关系未找到可直接或间接支持的原文，只能作为图推断，不能表述为论文已证明。"
-                    if grade == "graph_inference"
-                    else None
-                ),
             }
             verified.append(
                 VerifiedEvidence(
@@ -233,16 +198,11 @@ class EvidenceIntelligencePipeline:
                     page_start=locator.page_start,
                     page_end=locator.page_end,
                     block_ids=locator.block_ids,
-                    verification_method="canonical_chunk_backfill" if is_graph else "canonical_chunk_match",
+                    verification_method="canonical_chunk_match",
                     content_hash=hashlib.sha256(canonical_content.encode("utf-8")).hexdigest(),
                     relation_path=candidate.relation_path,
                     evidence_grade=grade,
                     directness=directness,  # type: ignore[arg-type]
-                    # Candidate retrieval provenance may be lightrag_chunk,
-                    # lightrag_entity, etc.  The verified Evidence source
-                    # contract intentionally collapses all such local
-                    # retrievals to LOCAL_CORPUS; the original provenance is
-                    # retained in metadata above.
                     source_type="LOCAL_CORPUS",
                     canonical_id=candidate.canonical_id,
                     source_locator=candidate.source_locator,
@@ -281,12 +241,9 @@ class EvidenceIntelligencePipeline:
             "workspace_scope_pass_count": len(scoped),
             "verified_count": len(verified),
             "rejected_count": len(set(rejected)),
-            "graph_candidate_count": graph_total,
-            "graph_backfilled_count": backfilled_graph,
-            "graph_backfill_rate": backfilled_graph / graph_total if graph_total else None,
             "coverage": coverage,
             "conflicts": conflicts,
-            "stage_order": ["workspace_scope_filter", "source_validation", "deduplication", "document_diversity", "reranking", "graph_backfill", "directness", "evidence_grade", "coverage", "conflict_detection"],
+            "stage_order": ["workspace_scope_filter", "source_validation", "deduplication", "document_diversity", "reranking", "canonical_verification", "directness", "evidence_grade", "coverage", "conflict_detection"],
         }
         issues = tuple(f"conflict:{left}:{right}" for left, right in conflicts)
         return VerifiedEvidenceBundle(request.request_id, request.workspace_id, request.scope_version, tuple(verified), tuple(dict.fromkeys(rejected)), issues)
@@ -299,37 +256,13 @@ class EvidenceIntelligencePipeline:
         used = 0
         document_counts: Counter[str] = Counter()
         selected: list[SelectedEvidence] = []
-        ranked = sorted(
+        ordered = sorted(
             bundle.evidence,
             key=lambda value: (
-                value.evidence_grade == "graph_inference",
                 -float(value.metadata.get("rerank_score", 0.0)),
                 value.evidence_id,
             ),
         )
-        direct_sources = {
-            value.evidence_id
-            for value in ranked
-            if value.metadata.get("retrieval_source") not in {
-                "lightrag_entity",
-                "lightrag_relation",
-            }
-        }
-        direct = [value for value in ranked if value.evidence_id in direct_sources]
-        graph = [value for value in ranked if value.evidence_id not in direct_sources]
-        if direct and graph:
-            # Context 先保留可直接引用的 canonical Chunk，同时为关系证据预留席位。
-            # 60/40 是候选来源配额，不改变任一后端的原始分数。
-            direct_limit = max(1, (request.top_k * 3 + 4) // 5)
-            graph_limit = max(1, request.top_k - direct_limit)
-            ordered = (
-                direct[:direct_limit]
-                + graph[:graph_limit]
-                + direct[direct_limit:]
-                + graph[graph_limit:]
-            )
-        else:
-            ordered = ranked
         for value in ordered:
             if len(selected) >= request.top_k:
                 break

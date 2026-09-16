@@ -53,6 +53,20 @@ locator、paper/work/block 归属和非图候选的 source text；随后由 Work
 去重、多样性、排序和 token budget 规则继续治理。没有真实 locator 的候选不能成为
 Verified Evidence。
 
+## 并发检索边界
+
+Paper-Level 检索不是对每篇论文逐一发送请求：一次 hierarchical retrieval 会在统一的
+Paper-Level 索引中返回最多 20 篇候选，随后在这些 `paper_id` 范围内执行 Level-2 混合检索。
+Introduction 的多个独立 `ResearchNeed`（背景、已有工作、局限性）现在由
+`ResearchDelegate` 以受控并发执行；当 Content Top-K 集中在少数论文时，5 篇以内的
+`paper_id` 覆盖补齐查询也会一次性提交到并发池，而不是按论文逐篇等待。默认最多 3
+路；生产部署可通过 `LEO_SCHOLAR_RESEARCH_MAX_CONCURRENCY` 调整并发度，范围为 1 到 8。
+
+并发只改变独立请求的调度，不改变 EvidencePack 和 ClaimPlan 的顺序：结果按原始
+ResearchNeed/Paper-Level rank 恢复，因此引用绑定、证据校验和失败语义保持确定性。
+本地 Qdrant/BGE 访问由有界信号量保护，Evidence Governance 的共享诊断边界单独串行化；
+这不是把 5 篇论文重新向量化，而是让 5 个独立的 Level-2 检索请求并行使用已有索引。
+
 ## 搜索语义与预算
 
 `search_papers()` 调用 `UnifiedKnowledgeService` 的既有 hierarchical 入口，只投影论文元数据，

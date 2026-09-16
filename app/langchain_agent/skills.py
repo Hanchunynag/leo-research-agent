@@ -22,7 +22,10 @@ from app.langchain_agent.tools import (
 )
 from app.research.context import PhaseContextPack
 from app.research.validation import TieredClaimEvidenceValidator
-from app.generation.openai_compatible import parse_json_object
+from app.generation.openai_compatible import (
+    parse_json_object,
+    structured_chat_completion,
+)
 
 
 class ChatCompletionHighRiskJudge:
@@ -71,7 +74,11 @@ class ChatCompletionHighRiskJudge:
             },
         ]
         configured = int(getattr(getattr(self.provider, "config", None), "max_tokens", 800))
-        response = self.provider.chat_completion(messages, max_tokens=min(configured, 800))
+        response = structured_chat_completion(
+            self.provider,
+            messages,
+            max_tokens=min(configured, 800),
+        )
         choices = response.get("choices") if isinstance(response, Mapping) else None
         first = choices[0] if isinstance(choices, list) and choices else {}
         message = first.get("message") if isinstance(first, Mapping) else {}

@@ -78,6 +78,7 @@ class KnowledgeBuildReport:
     documents: list[KnowledgeDocumentResult]
     paper_bm25_index: str | None = None
     structured_store: dict[str, Any] = field(default_factory=dict)
+    changed_paper_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -297,6 +298,11 @@ def build_knowledge_base(
         documents=document_results,
         paper_bm25_index=project_relative(Path(paper_bm25.index_path), root),
         structured_store=structured_store,
+        changed_paper_ids=sorted(
+            result.paper_id
+            for result in document_results
+            if result.structure_status == "built" or result.chunk_status == "built"
+        ),
     )
     write_json_atomic(
         root / "data" / "knowledge" / "last_knowledge_build.json",

@@ -36,8 +36,19 @@ def build_hierarchical_indexes(
         minimum_chunk_tokens=minimum_chunk_tokens,
         overlap_tokens=overlap_tokens,
     )
-    chunk_dense = build_dense_index(project_root, embedding_provider, force=force)
-    paper_dense = build_paper_dense_index(project_root, embedding_provider, force=force)
+    changed_paper_ids = set(knowledge.changed_paper_ids)
+    chunk_dense = build_dense_index(
+        project_root,
+        embedding_provider,
+        force=force,
+        changed_paper_ids=changed_paper_ids,
+    )
+    paper_dense = build_paper_dense_index(
+        project_root,
+        embedding_provider,
+        force=force,
+        changed_paper_ids=changed_paper_ids,
+    )
     epoch_id = f"HE_{papers_digest(load_paper_records(project_root))[:16]}_{chunk_dense.chunks_digest[:16]}"
     try:
         from app.persistence import build_knowledge_repository

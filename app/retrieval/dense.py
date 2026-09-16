@@ -6,7 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, cast
 
-from qdrant_client import QdrantClient, models
+from qdrant_client import models
 
 from app.embeddings.base import EmbeddingProvider
 from app.indexing.bm25 import chunks_digest
@@ -16,6 +16,7 @@ from app.indexing.dense import (
     load_dense_manifest,
 )
 from app.retrieval.search import load_chunks
+from app.qdrant import build_qdrant_client
 
 
 def _validate_limit(value: int, field: str, maximum: int = 100) -> int:
@@ -107,7 +108,7 @@ def search_dense_evidence(
     if len(vector) != expected_dimension:
         raise RuntimeError("查询向量维度与 Dense manifest 不一致。")
     candidate_limit = min(max(validated_limit * 5, validated_limit), 100)
-    client = QdrantClient(path=str(dense_index_path(root)))
+    client = build_qdrant_client(dense_index_path(root))
     try:
         response = client.query_points(
             collection_name=str(manifest.get("collection_name")),
@@ -142,6 +143,8 @@ def search_dense_evidence(
                 "title": payload.get("title"),
                 "authors": payload.get("authors"),
                 "year": payload.get("year"),
+                "publication_date": payload.get("publication_date"),
+                "venue": payload.get("venue"),
                 "doi": payload.get("doi"),
                 "section_path": payload.get("section_path"),
                 "content_zone": payload.get("content_zone"),

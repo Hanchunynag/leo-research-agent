@@ -39,6 +39,12 @@ from app.scholar.project import ScholarProjectStore
 from app.scholar.research import ResearchBudget, ResearchCapabilityService, ResearchRequest
 from app.scholar.writing.harness import ScholarSkillRuntime
 from app.scholar.writing.models import TaskType, WritingRequest
+from app.scholar.writing.citation_coverage import (
+    INTRODUCTION_EVIDENCE_LIMIT,
+    INTRODUCTION_MINIMUM_UNIQUE_PAPERS,
+    INTRODUCTION_PAPER_RETRIEVAL_LIMIT,
+    INTRODUCTION_SECTION_RETRIEVAL_LIMIT,
+)
 from app.scholar.writing.runtime import SkillDefinition, SkillRuntimeError
 from app.scholar.writing.support import SupportClaimRequest
 
@@ -374,42 +380,67 @@ class ScholarHarnessService:
         text and metadata at this Harness boundary.
         """
 
+        # The Writing Runtime already de-duplicates this projection by
+        # ``evidence_id`` when it builds its evidence mapping.  Preserve the
+        # same semantics here: three Introduction ResearchNeeds commonly
+        # return the same verified item, and sending it three times consumes
+        # reviewer context without adding any grounding information.
         allowed = (
             "evidence_id",
-            "candidate_id",
-            "request_id",
             "source_type",
             "canonical_id",
             "source_locator",
             "locator_type",
             "publication_date",
-            "retrieved_at",
             "provider",
-            "validation_status",
             "paper_id",
             "work_id",
             "document_id",
             "section_id",
             "chunk_id",
-            "block_ids",
-            "content_hash",
-            "verification_method",
             "evidence_grade",
             "directness",
         )
+        field_limits = {
+            "source_type": 48,
+            "canonical_id": 128,
+            "source_locator": 192,
+            "locator_type": 48,
+            "publication_date": 32,
+            "provider": 96,
+            "paper_id": 128,
+            "work_id": 128,
+            "document_id": 128,
+            "section_id": 128,
+            "chunk_id": 128,
+            "evidence_grade": 48,
+            "directness": 48,
+        }
+        def compact(raw: Any, *, limit: int = 256) -> Any:
+            if isinstance(raw, str):
+                return raw[:limit]
+            if isinstance(raw, (list, tuple)):
+                return [compact(item, limit=96) for item in raw[:4]]
+            return raw
+
         output: list[Mapping[str, Any]] = []
+        seen_ids: set[str] = set()
         for item in value if isinstance(value, (list, tuple)) else ():
             if not isinstance(item, Mapping) or not item.get("evidence_id"):
                 continue
+            evidence_id = str(item["evidence_id"])
+            if evidence_id in seen_ids:
+                continue
+            seen_ids.add(evidence_id)
             bounded = {
-                key: item[key]
+                key: compact(item[key], limit=field_limits.get(key, 128))
                 for key in allowed
                 if key in item and item[key] is not None
             }
             metadata = item.get("metadata")
             if isinstance(metadata, Mapping):
                 bounded["metadata"] = {
-                    key: metadata[key]
+                    key: compact(metadata[key], limit=160)
                     for key in (
                         "title",
                         "authors",
@@ -424,7 +455,7 @@ class ScholarHarnessService:
                 }
             text = item.get("content") or item.get("text")
             if text:
-                bounded["content"] = str(text)[:160]
+                bounded["content"] = str(text)[:120]
             output.append(bounded)
         return tuple(output)
 
@@ -669,6 +700,16 @@ class ScholarHarnessService:
             target_section=section,
             session_id=session_id,
             task_type=task_type,
+            metadata=(
+                {
+                    "minimum_unique_papers": INTRODUCTION_MINIMUM_UNIQUE_PAPERS,
+                    "paper_retrieval_limit": INTRODUCTION_PAPER_RETRIEVAL_LIMIT,
+                    "section_retrieval_limit": INTRODUCTION_SECTION_RETRIEVAL_LIMIT,
+                    "evidence_limit": INTRODUCTION_EVIDENCE_LIMIT,
+                }
+                if task_type == "WRITE_INTRODUCTION"
+                else {}
+            ),
         )
 
     def _execute_skill(

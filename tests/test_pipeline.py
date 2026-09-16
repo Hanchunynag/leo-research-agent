@@ -6,6 +6,11 @@ from pathlib import Path
 import pymupdf
 
 from app.ingestion.ingest import calculate_sha256
+from app.normalization.mineru_adapter import (
+    augment_native_pdf_text,
+    filename_title_fallback,
+    should_retry_with_ocr,
+)
 from app.parsing.pipeline import (
     PaperParseConfig,
     build_mineru_command,
@@ -14,12 +19,15 @@ from app.parsing.pipeline import (
 )
 
 
-def create_pdf(path: Path) -> None:
+def create_pdf(path: Path, *, repeat: int = 4) -> None:
     document = pymupdf.open()
     page = document.new_page()
-    page.insert_text(
-        (72, 72),
-        "A native-text test paper with enough content for parsing. " * 4,
+    page.insert_textbox(
+        (72, 72, 540, 740),
+        "\n".join(
+            "A native-text test paper with enough content for parsing."
+            for _ in range(repeat)
+        ),
     )
     document.save(path)
     document.close()
@@ -130,6 +138,10 @@ def test_pipeline_reuses_mineru_and_writes_one_paper_json(
 
     paper = json.loads(result.paper_json.read_text(encoding="utf-8"))
     assert paper["metadata"]["title"] == "Test Paper"
+    assert paper["identity"]["document_id"] == f"D_{calculate_sha256(pdf)[:12]}"
+    assert paper["identity"]["work_id"].startswith("W_")
+    assert paper["identity"]["work_id_method"] == "document"
+    assert paper["identity"]["status"] == "unresolved"
     assert paper["formulas"][0]["latex"] == "x = 1"
     assert paper["formulas"][0]["paper_id"] == paper_id
     paragraph = next(
@@ -181,6 +193,80 @@ def test_reparse_preserves_verified_external_metadata(tmp_path: Path) -> None:
     assert reparsed["metadata"]["title"] == "Externally Verified Test Paper"
     assert reparsed["metadata"]["authors"] == ["Ada Lovelace"]
     assert reparsed["metadata"]["verification"]["status"] == "verified"
+
+
+def test_native_pdf_text_fallback_recovers_low_coverage_pages(tmp_path: Path) -> None:
+    pdf = tmp_path / "native.pdf"
+    create_pdf(pdf, repeat=30)
+    document = {
+        "paper_id": "P_aaaaaaaaaaaa",
+        "blocks": [
+            {
+                "block_id": "P_aaaaaaaaaaaa_p001_b000",
+                "paper_id": "P_aaaaaaaaaaaa",
+                "page_number": 1,
+                "reading_order": 0,
+                "type": "paragraph",
+                "text": "Short MinerU fragment.",
+            }
+        ],
+    }
+
+    report = augment_native_pdf_text(document, pdf)
+
+    assert report["status"] == "applied"
+    assert report["fallback_page_count"] == 1
+    assert document["blocks"][-1]["source_type"] == "native_pdf_text"
+    assert "native-text test paper" in document["blocks"][-1]["text"]
+
+
+def test_degraded_cjk_ocr_is_detected_and_filename_title_is_safe() -> None:
+    document = {
+        "metadata": {
+            "title": "Positionin<sub>g</sub> technolo<sub>gy</sub>",
+        },
+        "blocks": [
+            {
+                "type": "paragraph",
+                "text": "Positionin<sub>g</sub> technolo<sub>gy</sub> based on IRIDIUM signals.",
+                "quality": {"retrieval_enabled": True},
+            }
+        ],
+    }
+
+    decision = should_retry_with_ocr(
+        document,
+        "基于铱星机会信号的定位技术_秦红磊.pdf",
+        pdf_type="native_text",
+    )
+
+    assert decision["retry"] is True
+    assert decision["reason"] in {
+        "cjk_filename_but_weak_cjk_text_layer",
+        "malformed_title_and_weak_cjk_text_layer",
+    }
+    assert filename_title_fallback("基于铱星机会信号的定位技术_秦红磊.pdf") == "基于铱星机会信号的定位技术"
+
+
+def test_good_cjk_text_does_not_trigger_ocr_retry() -> None:
+    document = {
+        "metadata": {"title": "基于铱星机会信号的定位技术"},
+        "blocks": [
+            {
+                "type": "paragraph",
+                "text": "基于铱星机会信号的定位技术采用瞬时多普勒定位方法，并通过单音信号测量多普勒频移。",
+                "quality": {"retrieval_enabled": True},
+            }
+        ],
+    }
+
+    decision = should_retry_with_ocr(
+        document,
+        "基于铱星机会信号的定位技术_秦红磊.pdf",
+        pdf_type="native_text",
+    )
+
+    assert decision["retry"] is False
 
 
 def test_mineru_command_uses_dedicated_executable(tmp_path: Path) -> None:

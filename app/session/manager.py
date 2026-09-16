@@ -54,7 +54,6 @@ class SessionManager:
     def _connect_catalog(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.catalog_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")
         return connection
@@ -217,6 +216,47 @@ class SessionManager:
             ).rowcount
         if updated != 1:
             raise KeyError(f"Session 不存在：{value}")
+
+    def clear_active_run_if(self, session_id: str, run_id: str) -> bool:
+        """Clear a pointer only when it still points at ``run_id``.
+
+        Recovery can race with a newer request in the same Session.  An
+        unconditional clear would erase that newer request's active pointer.
+        """
+
+        value = _validate(session_id)
+        with self._connect_catalog() as connection:
+            updated = connection.execute(
+                """
+                UPDATE sessions SET active_run_id=NULL, updated_at=?
+                WHERE session_id=? AND active_run_id=?
+                """,
+                (_now(), value, run_id),
+            ).rowcount
+        return updated == 1
+
+    def reconcile_terminal_active_runs(self) -> int:
+        """Remove stale pointers to terminal or missing Runs.
+
+        ``INTERRUPTED`` and ``WAITING_USER`` remain resumable/interactive and
+        therefore are deliberately not treated as terminal here.
+        """
+
+        cleared = 0
+        for record in self.list(include_deleted=False):
+            active_run_id = record.active_run_id
+            if not active_run_id:
+                continue
+            try:
+                run = self.open(record.session_id).get_run(active_run_id)
+            except KeyError:
+                self.set_active_run(record.session_id, None)
+                cleared += 1
+                continue
+            if run.status in {"COMPLETED", "FAILED", "CANCELLED"}:
+                if self.clear_active_run_if(record.session_id, active_run_id):
+                    cleared += 1
+        return cleared
 
     @staticmethod
     def _record(row: sqlite3.Row) -> SessionRecord:

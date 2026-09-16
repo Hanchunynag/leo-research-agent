@@ -9,7 +9,9 @@ from typing import Literal
 SessionStatus = Literal["ACTIVE", "ARCHIVED", "DELETED"]
 RunStatus = Literal[
     "PENDING",
+    "QUEUED",
     "RUNNING",
+    "WAITING_HUMAN_APPROVAL",
     "WAITING_USER",
     "COMPLETED",
     "FAILED",

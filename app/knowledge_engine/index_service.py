@@ -46,7 +46,7 @@ class KnowledgeIndexService:
         if indexed < generation.document_count:
             return False, "indexed_document_count 小于 generation.document_count"
         if generation.chunk_count and mapped < generation.chunk_count:
-            return False, "LightRAG Chunk 未全部映射回 Canonical Corpus"
+            return False, "Canonical Chunk 未全部进入本地索引"
         return True, "validated"
 
     def build_generation(self, documents: Sequence[Document], *, workspace_id: str, scope_version: int, corpus_version: str, profile: IndexProfile, activate: bool = False) -> tuple[IndexGeneration, Mapping[str, Any]]:
@@ -203,8 +203,7 @@ class KnowledgeIndexService:
     ) -> dict[str, Any]:
         """Web/CLI 在解析后调用的唯一旧索引兼容编排点。
 
-        LightRAG 影子 generation 由 ``build_generation``/``update_documents``
-        独立推进；此方法只保持阶段一对 catalog/BM25/Dense 的外部行为。
+        此方法负责 catalog、BM25、Dense 与 Paper Dense 的一致更新。
         """
 
         if self.project_root is None:
@@ -247,7 +246,19 @@ class KnowledgeIndexService:
 
             if emit:
                 emit("building_dense", "正在通过 KnowledgeIndexService 更新迁移期 Dense 索引。", 0.98, None)
-            dense = build_dense_index(root, embedding_provider)
+            raw_changed_paper_ids = getattr(knowledge, "changed_paper_ids", None)
+            changed_paper_ids = set(raw_changed_paper_ids or ())
+            if raw_changed_paper_ids is None:
+                # Keep compatibility with lightweight integrations that still
+                # return the pre-incremental report shape.  The real
+                # KnowledgeBuildReport always exposes changed_paper_ids.
+                dense = build_dense_index(root, embedding_provider)
+            else:
+                dense = build_dense_index(
+                    root,
+                    embedding_provider,
+                    changed_paper_ids=changed_paper_ids,
+                )
             # Keep the established parse response compatible for lightweight
             # fixtures, while production providers build the new Paper layer
             # in the same offline synchronization transaction.
@@ -255,7 +266,11 @@ class KnowledgeIndexService:
             if getattr(embedding_provider, "model_name", None):
                 from app.indexing.paper_dense import build_paper_dense_index
 
-                paper_dense = build_paper_dense_index(root, embedding_provider)
+                paper_dense = build_paper_dense_index(
+                    root,
+                    embedding_provider,
+                    changed_paper_ids=changed_paper_ids,
+                )
             from app.workspaces import WorkspaceService
 
             workspace = WorkspaceService(root).synchronize_default_documents()
@@ -274,6 +289,7 @@ class KnowledgeIndexService:
                 "dense": dense.to_dict(),
                 "workspace_id": workspace.workspace_id,
                 "scope_version": workspace.scope_version,
+                "changed_paper_ids": sorted(changed_paper_ids),
             }
             if paper_dense is not None:
                 result["paper_dense"] = paper_dense.to_dict()

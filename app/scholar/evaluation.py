@@ -96,6 +96,30 @@ def _trace_events(result: Any) -> tuple[Mapping[str, Any], ...]:
     return tuple(value for value in events if isinstance(value, Mapping))
 
 
+def _trace_tool_names(events: Iterable[Mapping[str, Any]]) -> set[str]:
+    """Collect both legacy event names and CrewAI tool metadata names."""
+
+    names: set[str] = set()
+    for event in events:
+        if event.get("kind") != "tool":
+            continue
+        name = event.get("name")
+        if name:
+            names.add(str(name))
+        metadata = event.get("metadata")
+        if isinstance(metadata, Mapping) and metadata.get("tool_name"):
+            names.add(str(metadata["tool_name"]))
+        if event.get("tool_name"):
+            names.add(str(event["tool_name"]))
+    return names
+
+
+def _skill_key(value: Any) -> str:
+    """Normalize Legacy skill names and CrewAI route names for comparison."""
+
+    return str(value or "").strip().casefold().replace("_", "-")
+
+
 def _domain_result_is_valid(result: Any, expected_type: str | None) -> bool:
     """Validate the outer Scholar result without judging prose quality.
 
@@ -121,21 +145,31 @@ class ScholarHarnessEvaluationSuite:
         metadata = getattr(result, "metadata", {})
         metadata = metadata if isinstance(metadata, Mapping) else {}
         events = _trace_events(result)
-        tool_names = {
-            str(event.get("name"))
-            for event in events
-            if event.get("kind") == "tool"
-        }
+        tool_names = _trace_tool_names(events)
         selected = metadata.get("selected_skill")
-        research = bool("research_evidence" in tool_names or any(
-            event.get("name") == "LOCAL_RESEARCH" and event.get("status") == "succeeded"
-            for event in events
-        ))
-        web = bool("literature.search" in tool_names or any(
-            event.get("name") == "WEB_DISCOVERY" and event.get("status") == "succeeded"
-            for event in events
-        ))
-        reviewed = "review_draft" in tool_names
+        research = bool(
+            tool_names
+            & {
+                "research_capability",
+                "research_evidence",
+                "LOCAL_RESEARCH",
+                "WEB_DISCOVERY",
+            }
+            or any(
+                event.get("name") == "LOCAL_RESEARCH"
+                and event.get("status") == "succeeded"
+                for event in events
+            )
+        )
+        web = bool(
+            tool_names & {"literature.search", "WEB_DISCOVERY", "web_research"}
+            or any(
+                event.get("name") == "WEB_DISCOVERY"
+                and event.get("status") == "succeeded"
+                for event in events
+            )
+        )
+        reviewed = bool(tool_names & {"review_draft", "review_capability"})
         resumed = bool(metadata.get("resumed", False))
         observed_forbidden = set(metadata.get("unexpected_tool_calls", ())) if isinstance(metadata.get("unexpected_tool_calls"), (list, tuple, set, frozenset)) else set()
         forbidden_calls = len((tool_names | {str(value) for value in observed_forbidden}) & set(case.forbidden_tools))
@@ -150,7 +184,7 @@ class ScholarHarnessEvaluationSuite:
         if not case.web_allowed and web:
             isolation_violations += 1
         failures: list[str] = []
-        if selected != case.expected_skill:
+        if _skill_key(selected) != _skill_key(case.expected_skill):
             failures.append("TASK_ROUTING_MISMATCH")
         if case.research_expected is True and not research:
             failures.append("REQUIRED_RESEARCH_MISSED")

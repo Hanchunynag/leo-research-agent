@@ -269,6 +269,7 @@ class LocalRAGWebRuntime:
                 base_url=llm.base_url,
                 model=llm.model,
                 api_key=api_key,
+                auth_scheme=llm.auth_scheme,
                 timeout_seconds=llm.timeout_seconds,
                 max_tokens=llm.max_tokens,
                 prompt_layout=llm.prompt_layout or "context_first",
@@ -638,12 +639,12 @@ class LocalRAGWebRuntime:
 
         llm = load_local_llm_settings(self.project_root)
         from app.knowledge.corpus import corpus_summary
-        from app.knowledge_engine import knowledge_serving_status
+        from app.knowledge_engine import knowledge_runtime_status
 
-        serving = knowledge_serving_status(self.project_root)
+        serving = knowledge_runtime_status(self.project_root)
         return {
             "service": "leo-research-agent-web",
-            "rag_mode": "langchain_bilingual_rag",
+            "rag_mode": "hierarchical_paper_content_rag",
             "llm_configured": bool(llm.base_url and llm.model),
             "llm_model": llm.model,
             "embedding_model": self.config.embedding_model,

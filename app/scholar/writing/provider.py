@@ -6,7 +6,8 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from app.generation.openai_compatible import parse_json_object
+from app.generation.openai_compatible import parse_json_object, structured_chat_completion
+from app.generation.security import redact_sensitive_text
 from app.scholar.models import ReviewIssue
 from app.scholar.writing.models import SectionDraft, WritingContext
 from app.scholar.writing.runtime import SkillExecutionContext
@@ -19,9 +20,62 @@ class ChatCompletionIntroductionWriter:
         if not callable(getattr(provider, "chat_completion", None)):
             raise TypeError("Introduction Writer 需要 chat_completion Provider。")
         self.provider = provider
+        self._trace: Any | None = None
+
+    def set_trace(self, trace: Any | None) -> None:
+        """Attach the current Run trace for direct (non-CrewAI) LLM calls."""
+
+        self._trace = trace
+
+    def _structured_call(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int,
+        stage: str,
+    ) -> Mapping[str, Any]:
+        trace = self._trace
+        metadata = {
+            "agent_role": "Writer Agent",
+            "provider_stage": stage,
+            "max_tokens": max_tokens,
+        }
+        if trace is not None:
+            trace.record("writer_provider_call", "RUNNING", metadata, kind="llm")
+        try:
+            response = structured_chat_completion(
+                self.provider,
+                messages,
+                max_tokens=max_tokens,
+            )
+        except Exception as error:
+            if trace is not None:
+                trace.record(
+                    "writer_provider_call",
+                    "FAILED",
+                    {**metadata, "error_type": type(error).__name__},
+                    kind="llm",
+                )
+            raise
+        if trace is not None:
+            usage = response.get("usage") if isinstance(response, Mapping) else None
+            trace.record(
+                "writer_provider_call",
+                "COMPLETED",
+                {
+                    **metadata,
+                    **({"usage": usage} if isinstance(usage, Mapping) else {}),
+                },
+                kind="llm",
+            )
+        return response
 
     def _call(self, context: WritingContext) -> SectionDraft:
-        payload = context.public_mapping()
+        # Keep complete evidence in the domain runtime, but send only the
+        # bounded writer projection over the wire.  The old public mapping
+        # included repeated chunks and full metadata and could exceed the
+        # gateway context window before a draft was generated.
+        payload = context.writer_mapping()
         messages = [
             {
                 "role": "system",
@@ -29,18 +83,101 @@ class ChatCompletionIntroductionWriter:
                     "You are a conservative scientific Introduction editor. Return only JSON. "
                     "Use only supplied verified evidence for external claims. Never invent facts, "
                     "contributions, evidence IDs, or citation keys. Preserve unrelated existing text. "
-                    "Return fields: content, claim_ids, evidence_ids, citation_keys, citation_binding_ids, contribution_ids, "
-                    "change_summary, warnings."
+                    "This is a literature-grounded Introduction: cite at least 5 DISTINCT papers. "
+                    "Count papers by stable paper identity, never by chunks or duplicate BibKeys. "
+                    "If the supplied evidence cannot support 5 distinct papers, explain the insufficiency "
+                    "in warnings and do not pretend that fewer sources satisfy the requirement. "
+                    "Return exactly one JSON object matching this shape: "
+                    '{"content":"...","claim_ids":[],"evidence_ids":[],"citation_keys":[],'
+                    '"citation_binding_ids":[],"contribution_ids":[],"change_summary":"...","warnings":[]}. '
+                    "Do not write any text before or after the JSON object."
                 ),
             },
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
         ]
-        response = self.provider.chat_completion(messages)
+        # Structured Writer output does not need hidden chain-of-thought.  On
+        # the local Qwen-compatible gateway, allowing it to consume the full
+        # 8k default budget made the call look hung and often left no JSON
+        # content.  Keep the response bounded and explicitly disable hidden
+        # reasoning where the concrete provider supports it.
+        response = self._structured_call(
+            messages,
+            max_tokens=4096,
+            stage="draft_generation",
+        )
         choices = response.get("choices", []) if isinstance(response, Mapping) else []
         content = choices[0].get("message", {}).get("content") if choices and isinstance(choices[0], Mapping) else None
         if not isinstance(content, str) or not content.strip():
             raise ValueError("Introduction Writer 返回空内容。")
-        value = parse_json_object(content)
+        try:
+            value = parse_json_object(content)
+        except ValueError as original_error:
+            # Some OpenAI-compatible gateways honor JSON mode for short
+            # prompts but return a useful plain-text draft for a long writing
+            # prompt. Give the same model one bounded normalization pass. The
+            # repair prompt contains only the draft and allow-lists; it cannot
+            # invent IDs and the deterministic reviewer remains authoritative.
+            repair_payload = {
+                "draft_text": content[:9000],
+                "allowed_claim_ids": sorted(context.claim_plan.claim_ids),
+                "allowed_evidence_ids": sorted(context.claim_plan.evidence_ids),
+                "citation_catalog": dict(context.citation_catalog),
+                "allowed_contribution_ids": sorted(
+                    item.contribution_id for item in context.contributions
+                ),
+            }
+            repair_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict JSON normalizer. Return exactly one JSON object and "
+                        "nothing else. Wrap the supplied draft text into content and select "
+                        "only IDs from the allow-lists. Select citation_keys only from the "
+                        "citation_catalog. Do not add Markdown fences, explanations, or new "
+                        "facts. Required shape: "
+                        '{"content":"...","claim_ids":[],"evidence_ids":[],"citation_keys":[],'
+                        '"citation_binding_ids":[],"contribution_ids":[],"change_summary":"...","warnings":[]}. '
+                        "Keep content concise enough to fit the response and preserve the supplied draft meaning."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        repair_payload, ensure_ascii=False, default=str
+                    ),
+                },
+            ]
+            try:
+                repaired = self._structured_call(
+                    repair_messages,
+                    max_tokens=4096,
+                    stage="json_repair",
+                )
+                repair_choices = (
+                    repaired.get("choices", [])
+                    if isinstance(repaired, Mapping)
+                    else []
+                )
+                repair_content = (
+                    repair_choices[0].get("message", {}).get("content")
+                    if repair_choices and isinstance(repair_choices[0], Mapping)
+                    else None
+                )
+                if not isinstance(repair_content, str) or not repair_content.strip():
+                    raise ValueError("JSON 修复调用返回空内容。")
+                value = parse_json_object(repair_content)
+            except Exception as repair_error:
+                # Keep the provider failure actionable without persisting the
+                # full model response or any prompt content to Run events.
+                preview = redact_sensitive_text(content.strip()[:500])
+                repair_preview = ""
+                if "repair_content" in locals() and isinstance(repair_content, str):
+                    repair_preview = redact_sensitive_text(repair_content.strip()[:500])
+                raise ValueError(
+                    f"{original_error}; JSON_REPAIR_FAILED={type(repair_error).__name__}: "
+                    f"{repair_error}; raw_content_preview={preview!r}; "
+                    f"repair_content_preview={repair_preview!r}"
+                ) from repair_error
         allowed_claims = context.claim_plan.claim_ids
         allowed_evidence = context.claim_plan.evidence_ids
         allowed_contributions = {item.contribution_id for item in context.contributions}

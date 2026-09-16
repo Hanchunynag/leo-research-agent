@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -30,7 +30,12 @@ from filelock import FileLock
 
 from app.ingestion.ingest import IngestResult, ingest_paper
 from app.knowledge.identity import build_identity
-from app.normalization.mineru_adapter import build_canonical_document
+from app.normalization.mineru_adapter import (
+    augment_native_pdf_text,
+    build_canonical_document,
+    filename_title_fallback,
+    should_retry_with_ocr,
+)
 from app.parsing.precheck import PDFPrecheckResult, precheck_pdf
 from app.parsing.quality import validate_canonical_document
 from app.parsing.formula_recovery import (
@@ -414,6 +419,14 @@ def parse_paper(
     notify("prechecking")
     precheck_result: PDFPrecheckResult = precheck_pdf(ingest_result.source_path)
 
+    # Definite scanned PDFs should not spend a full pass in MinerU's automatic
+    # detector.  Ambiguous PDFs still start with ``auto`` and are inspected
+    # after normalization below; this catches the common case where a bad OCR
+    # text layer makes a scanned Chinese paper look like native text.
+    initial_config = config
+    if config.method == "auto" and precheck_result.pdf_type == "scanned_image":
+        initial_config = replace(config, method="ocr")
+
     mineru_root = parsed_root / ingest_result.paper_id / "mineru"
     paper_directory = canonical_root / ingest_result.paper_id
     paper_json = paper_directory / "paper.json"
@@ -447,7 +460,7 @@ def parse_paper(
             artifacts, command = run_mineru(
                 pdf_path=ingest_result.source_path,
                 mineru_root=mineru_root,
-                config=config,
+                config=initial_config,
             )
 
     notify("normalizing")
@@ -455,6 +468,75 @@ def parse_paper(
         paper_id=ingest_result.paper_id,
         content_list_v2_path=artifacts.content_list_v2,
         middle_path=artifacts.middle_json,
+    )
+
+    # Some PDFs have a nominal OCR layer, but the extracted text is visibly
+    # corrupt (for example every Chinese character becomes an HTML subscript
+    # fragment).  Re-run only those files with MinerU's explicit OCR method.
+    # The fallback lives in a separate directory so the original auto output
+    # remains available for audit and the second pass is idempotently reusable.
+    ocr_retry = should_retry_with_ocr(
+        document,
+        ingest_result.original_filename,
+        pdf_type=precheck_result.pdf_type,
+    )
+    ocr_fallback_command: list[str] | None = None
+    ocr_fallback_reused = False
+    ocr_fallback_applied = False
+    selected_method = initial_config.method
+    if ocr_retry["retry"] and initial_config.method != "ocr":
+        ocr_root = mineru_root / "ocr_fallback"
+        with parse_lock:
+            ocr_artifacts = (
+                None
+                if config.force_mineru
+                else find_mineru_artifacts(ocr_root)
+            )
+            if ocr_artifacts is None:
+                ocr_config = replace(config, method="ocr")
+                ocr_artifacts, ocr_fallback_command = run_mineru(
+                    pdf_path=ingest_result.source_path,
+                    mineru_root=ocr_root,
+                    config=ocr_config,
+                )
+            else:
+                ocr_fallback_reused = True
+        document, adapter_report = build_canonical_document(
+            paper_id=ingest_result.paper_id,
+            content_list_v2_path=ocr_artifacts.content_list_v2,
+            middle_path=ocr_artifacts.middle_json,
+        )
+        artifacts = ocr_artifacts
+        selected_method = "ocr"
+        ocr_fallback_applied = True
+        if ocr_fallback_command is None:
+            previous_fallback_command = previous_pipeline.get("ocr_fallback_command")
+            if isinstance(previous_fallback_command, list):
+                ocr_fallback_command = [str(value) for value in previous_fallback_command]
+        # A new OCR fallback is a real parse even when the initial ``auto``
+        # artifacts were reused.  Expose that fact to the caller and catalog.
+        mineru_reused = mineru_reused and ocr_fallback_reused
+
+    # If the parser did not provide a trustworthy title, retain the user's
+    # filename title as a retrieval-safe fallback.  This is deliberately only
+    # applied to the degraded OCR case and never overwrites verified metadata.
+    parser_metadata = document.get("metadata")
+    filename_title = filename_title_fallback(ingest_result.original_filename)
+    if (
+        ocr_retry["retry"]
+        and isinstance(parser_metadata, dict)
+        and filename_title
+        and not isinstance(parser_metadata.get("verification"), dict)
+    ):
+        parser_title = parser_metadata.get("title")
+        document["metadata"] = {
+            **parser_metadata,
+            "parser_title": parser_title,
+            "title": filename_title,
+        }
+    native_text_fallback_report = augment_native_pdf_text(
+        document,
+        ingest_result.source_path,
     )
 
     table_recovery_report = recover_image_only_tables(
@@ -535,6 +617,10 @@ def parse_paper(
         paper_id=ingest_result.paper_id,
         sha256=ingest_result.sha256,
         metadata=metadata_value if isinstance(metadata_value, dict) else {},
+        # Local ingestion must be indexable before optional external metadata
+        # verification. The identity is still file-scoped and provisional;
+        # verification can later replace it with a bibliographic work ID.
+        allow_document_work_identity=True,
     )
     precheck_payload = asdict(precheck_result)
     precheck_payload["source_path"] = project_relative(
@@ -543,6 +629,11 @@ def parse_paper(
     )
     document["precheck"] = precheck_payload
 
+    selected_command = (
+        ocr_fallback_command
+        if selected_method == "ocr" and ocr_retry["retry"] and ocr_fallback_command
+        else command
+    )
     requested_options = {
         "method": config.method,
         "backend": config.backend,
@@ -552,8 +643,8 @@ def parse_paper(
     }
     previous_applied = previous_pipeline.get("applied_mineru_options")
     applied_options = (
-        requested_options
-        if command is not None
+        {**requested_options, "method": selected_method}
+        if selected_command is not None
         else previous_applied
         if isinstance(previous_applied, dict)
         else None
@@ -573,7 +664,15 @@ def parse_paper(
             if command
             else previous_pipeline.get("mineru_executable")
         ),
-        "mineru_command": command or previous_pipeline.get("mineru_command"),
+        "mineru_command": selected_command or previous_pipeline.get("mineru_command"),
+        "ocr_retry": ocr_retry,
+        "ocr_fallback_command": ocr_fallback_command or previous_pipeline.get("ocr_fallback_command"),
+        "ocr_fallback_reused": ocr_fallback_reused,
+        "ocr_fallback_output_directory": (
+            project_relative(artifacts.output_directory, project_root)
+            if ocr_fallback_applied
+            else previous_pipeline.get("ocr_fallback_output_directory")
+        ),
         "requested_mineru_options": requested_options,
         "applied_mineru_options": applied_options,
         "mineru_output_directory": project_relative(
@@ -581,6 +680,7 @@ def parse_paper(
             project_root,
         ),
         "adapter_report": adapter_report,
+        "native_text_fallback_report": native_text_fallback_report,
         "table_recovery_report": table_recovery_report,
         "formula_recovery_report": formula_recovery_report,
         "quality_validation_report": quality_validation_report,

@@ -80,7 +80,10 @@ class SynthesisWritingService:
         if request.project_id != self.project_store.project_id:
             return self._result(request, "CONFLICT", error_codes=("PROJECT_CONFLICT",))
         previous = self.project_store.load_manuscript_state()
-        state = self.synchronizer.scan(previous=previous)
+        # Keep synthesis usable for a newly created project while preserving
+        # the PatchApprovalService write boundary. This only creates missing
+        # empty template files.
+        state = self.synchronizer.ensure_initialized()
         target = state.sections.get(request.target_section)
         if target is None:
             return self._result(request, "FAILED", error_codes=("INSUFFICIENT_MANUSCRIPT_STATE",))

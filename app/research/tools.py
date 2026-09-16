@@ -182,10 +182,11 @@ _SCHOLAR = frozenset({"scholar_research"})
 def default_tool_specs() -> tuple[ToolSpec, ...]:
     object_schema = {"type": "object"}
     return (
-        # Local BGE-M3 + Cross Encoder model loading can exceed 30 seconds on
-        # CPU/MPS cold start.  The timeout covers one idempotent retrieval
-        # attempt; subsequent requests reuse the providers in the process.
-        ToolSpec("knowledge.retrieve", {"required": ["query", "workspace_id", "scope_version"], "properties": {"query": {"type": "string"}, "workspace_id": {"type": "string"}, "scope_version": {"type": "integer"}}}, object_schema, "knowledge.read", 120.0, True, "read", _ALL, RetryPolicy(2)),
+        # Local BGE-M3 + Cross Encoder inference can exceed two minutes on a
+        # CPU cold start. The timeout covers one idempotent retrieval attempt;
+        # a normal slow inference must not be interrupted and then duplicated
+        # by the retry path while its worker thread is still running.
+        ToolSpec("knowledge.retrieve", {"required": ["query", "workspace_id", "scope_version"], "properties": {"query": {"type": "string"}, "workspace_id": {"type": "string"}, "scope_version": {"type": "integer"}}}, object_schema, "knowledge.read", 180.0, True, "read", _ALL, RetryPolicy(2)),
         ToolSpec("workspace.read_scope", {"required": ["workspace_id", "scope_version"]}, object_schema, "workspace.read", 5.0, True, "read", _ALL),
         ToolSpec("workspace.update_scope", {"required": ["workspace_id", "scope_version", "document_ids"], "properties": {"workspace_id": {"type": "string"}, "scope_version": {"type": "integer"}, "document_ids": {"type": "array"}}}, object_schema, "workspace.write", 10.0, True, "bounded_write", _BOOTSTRAP),
         ToolSpec("literature.search", {"required": ["query"], "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}, "year_from": {"type": "integer"}, "year_to": {"type": "integer"}}}, object_schema, "literature.search", 30.0, True, "read", _DEEP_BOOTSTRAP | _SCHOLAR, RetryPolicy(2)),

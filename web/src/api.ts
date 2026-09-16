@@ -70,7 +70,13 @@ export type AgenticResult = {
 
 export type JobSnapshot = {
   job_id: string;
-  status: "queued" | "running" | "succeeded" | "failed";
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  events: Array<{
+    sequence: number;
+    stage: string;
+    message: string;
+    progress: number;
+  }>;
   result: Record<string, any> | null;
   error: string | null;
 };
@@ -111,15 +117,17 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ thread_id: threadId, user_input: userInput }),
     }),
-  upload: (file: File) => {
+  upload: (file: File, signal?: AbortSignal) => {
     const data = new FormData();
     data.append("file", file);
     return request<{ job_id: string }>("/api/papers/upload", {
       method: "POST",
       body: data,
+      signal,
     });
   },
   job: (jobId: string) => request<JobSnapshot>(`/api/jobs/${jobId}`),
+  cancelJob: (jobId: string) => request<JobSnapshot>(`/api/jobs/${jobId}/cancel`, { method: "POST" }),
 };
 
 export function watchJob(
@@ -127,26 +135,100 @@ export function watchJob(
   onProgress: (event: { stage: string; message: string; progress: number }) => void,
 ): Promise<JobSnapshot> {
   return new Promise((resolve, reject) => {
-    const source = new EventSource(`/api/jobs/${jobId}/events`);
-    source.addEventListener("progress", (event) => {
-      onProgress(JSON.parse((event as MessageEvent).data));
-    });
-    source.addEventListener("done", async () => {
-      source.close();
+    const terminalStatuses = new Set<JobSnapshot["status"]>(["succeeded", "failed", "cancelled"]);
+    let source: EventSource | null = null;
+    let pollTimer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    let lastSequence = 0;
+    let polling = false;
+    let pollFailures = 0;
+
+    const cleanup = () => {
+      source?.close();
+      source = null;
+      if (pollTimer !== undefined) clearTimeout(pollTimer);
+      pollTimer = undefined;
+    };
+
+    const finish = (snapshot: JobSnapshot) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (snapshot.status === "failed") {
+        reject(new Error(snapshot.error || "任务执行失败。"));
+      } else {
+        resolve(snapshot);
+      }
+    };
+
+    const applySnapshot = (snapshot: JobSnapshot) => {
+      snapshot.events.forEach((event) => {
+        if (event.sequence <= lastSequence) return;
+        lastSequence = event.sequence;
+        onProgress(event);
+      });
+      if (terminalStatuses.has(snapshot.status)) finish(snapshot);
+    };
+
+    const poll = async () => {
+      if (settled) return;
       try {
         const snapshot = await api.job(jobId);
-        if (snapshot.status === "failed") {
-          reject(new Error(snapshot.error || "任务执行失败。"));
-        } else {
-          resolve(snapshot);
-        }
+        pollFailures = 0;
+        applySnapshot(snapshot);
+        if (!settled) pollTimer = setTimeout(() => void poll(), 1000);
       } catch (error) {
+        pollFailures += 1;
+        if (pollFailures >= 5) {
+          settled = true;
+          cleanup();
+          reject(error);
+          return;
+        }
+        pollTimer = setTimeout(() => void poll(), Math.min(1000 * pollFailures, 5000));
+      }
+    };
+
+    const startPolling = () => {
+      if (settled || polling) return;
+      polling = true;
+      void poll();
+    };
+
+    source = new EventSource(`/api/jobs/${jobId}/events`);
+    source.addEventListener("progress", (event) => {
+      if (settled) return;
+      try {
+        const payload = JSON.parse((event as MessageEvent).data) as {
+          sequence: number;
+          stage: string;
+          message: string;
+          progress: number;
+        };
+        if (payload.sequence <= lastSequence) return;
+        lastSequence = payload.sequence;
+        onProgress(payload);
+      } catch (error) {
+        settled = true;
+        cleanup();
         reject(error);
       }
     });
+    source.addEventListener("done", () => {
+      void api.job(jobId).then((snapshot) => {
+        if (terminalStatuses.has(snapshot.status)) finish(snapshot);
+        else {
+          applySnapshot(snapshot);
+          startPolling();
+        }
+      }).catch(() => startPolling());
+    });
     source.onerror = () => {
-      source.close();
-      reject(new Error("与本地 RAG 服务的事件连接已中断。"));
+      // Reverse proxies and long OCR stages can close an idle SSE stream.
+      // The durable Job API contains the same event log, so continue from
+      // the last sequence instead of falsely reporting an import failure.
+      cleanup();
+      startPolling();
     };
   });
 }

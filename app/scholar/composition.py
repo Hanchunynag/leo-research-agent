@@ -7,6 +7,7 @@ task routing, research planning, skill policy, or file-application logic.
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -39,6 +40,7 @@ from app.scholar.writing import (
     ChatCompletionSynthesisWriter,
     ClaimSupportService,
     IntroductionReviewer,
+    ResearchDelegate,
     SectionDraft,
     ScholarSkillRuntime,
     ScholarWritingService,
@@ -47,6 +49,8 @@ from app.scholar.writing import (
 )
 from app.scholar.harness import ScholarHarnessService
 from app.session import SessionManager
+from app.orchestration.service import CrewAIBackend, ScholarOrchestrationService
+from app.scholar.events import RunEventStore
 
 
 @dataclass(slots=True)
@@ -61,11 +65,18 @@ class ScholarRuntimeBundle:
     session_manager: SessionManager
     checkpointer: Any
     _resources: ExitStack
+    orchestration: Any | None = None
     _closed: bool = False
 
     @property
     def scholar_harness(self) -> ScholarHarnessService:
         return self.harness
+
+    @property
+    def scholar_orchestration(self) -> Any:
+        """Unified top-level orchestration entry (legacy or CrewAI backend)."""
+
+        return self.orchestration or self.harness
 
     def close(self) -> None:
         if self._closed:
@@ -109,6 +120,8 @@ class ScholarRuntimeFactory:
         writers: Mapping[str, Any] | None = None,
         reviewer: Any | None = None,
         harness: ScholarHarnessService | None = None,
+        orchestration: Any | None = None,
+        orchestration_backend: str | None = None,
         interrupt_on: Mapping[str, Any] | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve()
@@ -131,7 +144,9 @@ class ScholarRuntimeFactory:
             "writers": writers,
             "reviewer": reviewer,
             "harness": harness,
+            "orchestration": orchestration,
         }
+        self.orchestration_backend = orchestration_backend
         self.interrupt_on = dict(interrupt_on or {}) or None
         for key, value in overrides.items():
             if key not in self._provided:
@@ -169,6 +184,13 @@ class ScholarRuntimeFactory:
     def _model(self) -> tuple[Any, Any]:
         provided = self._provided["model"]
         if provided is not None:
+            # A deterministic/local-compatible provider may be injected for
+            # release validation. Keep it as the Harness model and also pass
+            # its existing chat_completion surface to the real domain
+            # writers; no domain service is replaced by this boundary.
+            completion_provider = getattr(provided, "provider", provided)
+            if callable(getattr(completion_provider, "chat_completion", None)):
+                return provided, completion_provider
             return provided, None
         llm = load_local_llm_settings(self.project_root)
         if not llm.base_url or not llm.model:
@@ -181,6 +203,7 @@ class ScholarRuntimeFactory:
                 base_url=llm.base_url,
                 model=llm.model,
                 api_key=api_key,
+                auth_scheme=llm.auth_scheme,
                 timeout_seconds=llm.timeout_seconds,
                 max_tokens=llm.max_tokens,
                 prompt_layout=llm.prompt_layout or "context_first",
@@ -269,7 +292,23 @@ class ScholarRuntimeFactory:
             gateway=gateway,
             cache=LiteratureDiscoveryCache(self.project_root),
         )
-        research = ResearchCapabilityService(knowledge, web=web)
+        try:
+            research_parallelism = int(
+                # BGE-M3 and the Cross-Encoder are process-local CPU/GPU
+                # resources. Serial ResearchNeeds are materially faster than
+                # making several workers queue behind the same model lock;
+                # callers can still opt into bounded parallelism explicitly.
+                os.getenv("LEO_SCHOLAR_RESEARCH_MAX_CONCURRENCY", "1")
+            )
+        except ValueError as error:
+            raise ConfigurationError(
+                "CONFIGURATION_ERROR: LEO_SCHOLAR_RESEARCH_MAX_CONCURRENCY 必须是整数。"
+            ) from error
+        research = ResearchCapabilityService(
+            knowledge,
+            web=web,
+            max_parallel_retrievals=research_parallelism,
+        )
         citation = CitationResolutionService(
             self.project_root,
             project_store=project_store,
@@ -290,11 +329,19 @@ class ScholarRuntimeFactory:
             project_store=project_store,
             citation_service=citation,
             approval_service=approval,
+            delegate=ResearchDelegate(
+                research,
+                max_parallelism=research_parallelism,
+            ),
         )
         support = ClaimSupportService(
             research,
             project_store=project_store,
             citation_service=citation,
+            delegate=ResearchDelegate(
+                research,
+                max_parallelism=research_parallelism,
+            ),
         )
         synthesis = SynthesisWritingService(
             self.project_root,
@@ -388,13 +435,53 @@ class ScholarRuntimeFactory:
             project_store = self._provided["project_store"] or ScholarProjectStore(self.project_root)
             session_manager = self._provided["session_manager"] or SessionManager(self.project_root)
             checkpointer = self._checkpoint(stack)
-            # A newly-created process owns a new worker id.  Marking stale
-            # RUNNING records before exposing the Harness makes orphan
-            # detection part of runtime startup, while resume still requires
-            # a real checkpoint below the Harness boundary.
-            session_manager.recover_orphans()
+            # In production the external Scholar Worker owns heartbeat-based
+            # recovery.  The API process must not infer that another live
+            # Worker is stale merely because it has a different process ID.
+            # Keep the legacy/test startup orphan projection for compatibility
+            # with the synchronous Harness path; async production Runs are
+            # reconciled from JobRepository heartbeat state instead.
+            if self.mode != "production":
+                session_manager.recover_orphans()
             harness_override = self._provided["harness"]
             if harness_override is not None:
+                orchestration_service = self._provided["orchestration"]
+                if orchestration_service is None:
+                    selected_backend = (
+                        self.orchestration_backend
+                        or os.getenv("ORCHESTRATION_BACKEND")
+                        or os.getenv("LEO_AGENTIC_ORCHESTRATION_BACKEND")
+                        or ("crewai" if self.mode == "production" else "legacy")
+                    ).strip().lower()
+                    if selected_backend == "crewai":
+                        if (
+                            harness_override.skill_runtime is None
+                            or harness_override.research is None
+                        ):
+                            raise ConfigurationError(
+                                "CONFIGURATION_ERROR: CrewAI backend 需要 Harness 提供 skill_runtime 和 research capability。"
+                            )
+                        orchestration_service = ScholarOrchestrationService(
+                            backend="crewai",
+                            crewai=CrewAIBackend(
+                                self.project_root,
+                                model=getattr(harness_override, "_model", None),
+                                skill_runtime=harness_override.skill_runtime,
+                                research=harness_override.research,
+                                writers=harness_override.writers,
+                                reviewer=harness_override.reviewer,
+                                project_store=harness_override.project_store,
+                                session_manager=harness_override.session_manager,
+                                event_store=RunEventStore(self.project_root),
+                                max_review_rounds=2,
+                                max_tool_calls=16,
+                            ),
+                        )
+                    else:
+                        orchestration_service = ScholarOrchestrationService(
+                            backend="legacy",
+                            legacy=harness_override,
+                        )
                 bundle = ScholarRuntimeBundle(
                     self.project_root,
                     self.mode,
@@ -404,6 +491,7 @@ class ScholarRuntimeFactory:
                     session_manager,
                     checkpointer,
                     stack,
+                    orchestration_service,
                 )
                 self._bundle = bundle
                 return bundle
@@ -445,6 +533,36 @@ class ScholarRuntimeFactory:
             # the effective Skill/Capability surface, not prompt guidance.
             for definition in skill_runtime.registry.list():
                 harness.permission_audit(definition.task_type)
+            orchestration_service = self._provided["orchestration"]
+            if orchestration_service is None:
+                selected_backend = (
+                    self.orchestration_backend
+                    or os.getenv("ORCHESTRATION_BACKEND")
+                    or os.getenv("LEO_AGENTIC_ORCHESTRATION_BACKEND")
+                    or ("crewai" if self.mode == "production" else "legacy")
+                ).strip().lower()
+                if selected_backend == "crewai":
+                    orchestration_service = ScholarOrchestrationService(
+                        backend="crewai",
+                        crewai=CrewAIBackend(
+                            self.project_root,
+                            model=model,
+                            skill_runtime=skill_runtime,
+                            research=research,
+                            writers=writers,
+                            reviewer=reviewer,
+                            project_store=project_store,
+                            session_manager=session_manager,
+                            event_store=RunEventStore(self.project_root),
+                            max_review_rounds=2,
+                            max_tool_calls=16,
+                        ),
+                    )
+                else:
+                    orchestration_service = ScholarOrchestrationService(
+                        backend="legacy",
+                        legacy=harness,
+                    )
             bundle = ScholarRuntimeBundle(
                 self.project_root,
                 self.mode,
@@ -454,6 +572,7 @@ class ScholarRuntimeFactory:
                 session_manager,
                 checkpointer,
                 stack,
+                orchestration_service,
             )
             self._bundle = bundle
             return bundle

@@ -67,7 +67,7 @@ class RetrievalQuery(StrictModel):
     text: str
     purpose: Literal[
         "original", "paraphrase", "terminology_expansion", "subquestion",
-        "relationship_probe", "focused_followup", "community_probe",
+        "relationship_probe", "focused_followup",
     ]
     target_category: str
     required_entities: list[str]

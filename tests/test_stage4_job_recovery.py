@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -125,6 +127,66 @@ def test_process_restart_fails_job_at_retry_limit(tmp_path: Path) -> None:
     assert failed.error_type == "ProcessRestart"
 
 
+def test_stale_cancel_request_is_finalized_but_recent_cancel_is_preserved(
+    tmp_path: Path,
+) -> None:
+    repository = PersistentJobRepository(tmp_path)
+    stale, _ = repository.submit(
+        "scholar.run",
+        workspace_id="default",
+        scope_version=1,
+        payload={"run_id": "RUN_STALE_CANCEL"},
+        idempotency_key="scholar:stale-cancel",
+    )
+    recent, _ = repository.submit(
+        "scholar.run",
+        workspace_id="default",
+        scope_version=1,
+        payload={"run_id": "RUN_RECENT_CANCEL"},
+        idempotency_key="scholar:recent-cancel",
+    )
+    repository.claim(stale.job_id, "dead-worker")
+    repository.claim(recent.job_id, "live-worker")
+    repository.request_cancel(stale.job_id)
+    repository.request_cancel(recent.job_id)
+
+    old_heartbeat = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    with repository._connect() as connection:  # noqa: SLF001 - fixture setup
+        connection.execute(
+            "UPDATE jobs SET heartbeat_at=? WHERE job_id=?",
+            (old_heartbeat, stale.job_id),
+        )
+
+    stale_before = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    marked = repository.mark_interrupted(heartbeat_before=stale_before)
+
+    assert [job.job_id for job in marked] == [stale.job_id]
+    assert repository.get(stale.job_id).status == "CANCELLED"
+    assert repository.get(stale.job_id).finished_at is not None
+    assert repository.get(recent.job_id).status == "CANCEL_REQUESTED"
+
+
+def test_recent_cancel_request_is_not_finalized_by_restart_recovery(
+    tmp_path: Path,
+) -> None:
+    repository = PersistentJobRepository(tmp_path)
+    job, _ = repository.submit(
+        "scholar.run",
+        workspace_id="default",
+        scope_version=1,
+        payload={"run_id": "RUN_LIVE_CANCEL"},
+        idempotency_key="scholar:live-cancel",
+    )
+    repository.claim(job.job_id, "live-worker")
+    repository.request_cancel(job.job_id)
+
+    before_recent_heartbeat = (
+        datetime.now(timezone.utc) - timedelta(seconds=60)
+    ).isoformat()
+    assert repository.mark_interrupted(heartbeat_before=before_recent_heartbeat) == ()
+    assert repository.get(job.job_id).status == "CANCEL_REQUESTED"
+
+
 def test_worker_retries_then_succeeds_with_reference_only(tmp_path: Path) -> None:
     repository = PersistentJobRepository(tmp_path)
     job, _ = repository.submit(
@@ -159,6 +221,81 @@ def test_worker_retries_then_succeeds_with_reference_only(tmp_path: Path) -> Non
     assert completed.attempt == 2
     assert completed.result_reference == "data/results/index-1.json"
     assert completed.checkpoint == {"stage": "indexing", "attempt": 2}
+
+
+def test_worker_heartbeat_retries_transient_sqlite_errors(tmp_path: Path) -> None:
+    class FlakyRepository(PersistentJobRepository):
+        failures = 1
+        recovered = threading.Event()
+
+        def heartbeat(self, job_id: str, *, worker_id: str, checkpoint=None):  # type: ignore[no-untyped-def]
+            if self.failures:
+                self.failures -= 1
+                raise sqlite3.OperationalError("database is locked")
+            value = super().heartbeat(
+                job_id,
+                worker_id=worker_id,
+                checkpoint=checkpoint,
+            )
+            self.recovered.set()
+            return value
+
+    repository = FlakyRepository(tmp_path)
+    job, _ = repository.submit(
+        "knowledge.index",
+        workspace_id="default",
+        scope_version=1,
+        idempotency_key="index:heartbeat-retry",
+    )
+    repository.claim_next("worker-1")
+    worker = PersistentJobWorker(
+        repository,
+        {},
+        worker_id="worker-1",
+        heartbeat_interval_seconds=0.01,
+    )
+    stop = threading.Event()
+    thread = threading.Thread(target=worker._heartbeat_loop, args=(job.job_id, stop))
+    thread.start()
+
+    assert repository.recovered.wait(timeout=1)
+    stop.set()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert repository.get(job.job_id).status == "RUNNING"
+
+
+def test_worker_does_not_clobber_job_recovered_by_another_worker(tmp_path: Path) -> None:
+    repository = PersistentJobRepository(tmp_path)
+    job, _ = repository.submit(
+        "knowledge.index",
+        workspace_id="default",
+        scope_version=1,
+        idempotency_key="index:ownership-fence",
+        max_attempts=2,
+    )
+
+    def handler(record, context):  # type: ignore[no-untyped-def]
+        repository.set_status(
+            record.job_id,
+            "INTERRUPTED",
+            error_type="ProcessRestart",
+            error_summary="recovered by replacement worker",
+        )
+        raise RuntimeError("old worker lost ownership")
+
+    worker = PersistentJobWorker(
+        repository,
+        {"knowledge.index": handler},
+        worker_id="old-worker",
+        heartbeat_interval_seconds=0.01,
+    )
+
+    result = worker.run_once()
+
+    assert result is not None
+    assert result.status == "INTERRUPTED"
+    assert repository.get(job.job_id).status == "INTERRUPTED"
 
 
 def test_web_job_result_and_events_survive_manager_restart(tmp_path: Path) -> None:

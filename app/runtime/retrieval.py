@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal
@@ -38,6 +39,35 @@ class RetrievalRuntime:
         self.hierarchical_enabled = hierarchical_enabled
         self._embedding_warmed = False
         self._reranker_warmed = False
+
+    @staticmethod
+    def _enabled(value: str | None, default: bool) -> bool:
+        if value is None:
+            return default
+        return value.strip().casefold() not in {"0", "false", "no", "off"}
+
+    def _dense_retrieval_policy(self) -> tuple[bool, str | None]:
+        """Skip heavyweight query encoders on an unaccelerated container.
+
+        Dense indexes remain intact. On a CPU-only Docker Desktop host the
+        BGE-M3 query encoder can take minutes to cold-start, which makes the
+        Scholar queue look dead and prevents cooperative cancellation from
+        reaching its next checkpoint. GPU/MPS deployments retain hybrid mode;
+        operators can explicitly force dense mode with the environment flag.
+        """
+
+        if not self._enabled(os.getenv("LEO_RAG_CPU_FALLBACK"), True):
+            return True, None
+        device = getattr(self.embedding_provider, "effective_device", None)
+        if callable(device):
+            device = device()
+        if device is None:
+            config = getattr(self.embedding_provider, "config", None)
+            device = getattr(config, "device", None)
+        normalized = str(device or "").strip().casefold()
+        if normalized == "cpu":
+            return False, "embedding_provider_cpu_only"
+        return True, None
 
     def warmup(self, include_reranker: bool = True) -> dict[str, Any]:
         diagnostics: dict[str, Any] = {}
@@ -102,9 +132,10 @@ class RetrievalRuntime:
             # An explicit hierarchical call uses the configured reranker when
             # available.  Automatic use from legacy ``fast`` remains cheap;
             # callers can request ``accurate`` for the Cross Encoder stage.
+            dense_enabled, fallback_reason = self._dense_retrieval_policy()
             reranker = (
                 self.reranker_provider
-                if mode in {"hierarchical", "accurate"}
+                if mode in {"hierarchical", "accurate"} and dense_enabled
                 else None
             )
             result = search_hierarchical_evidence(
@@ -119,8 +150,23 @@ class RetrievalRuntime:
                 max_chunks_per_work=max_chunks_per_work,
                 rrf_k=rrf_k,
                 paper_filters=paper_filters,
+                dense_enabled=dense_enabled,
             )
-            self._embedding_warmed = True
+            result.setdefault("diagnostics", {})
+            result["diagnostics"].update(
+                {
+                    "dense_enabled": dense_enabled,
+                    "reranker_enabled": bool(reranker),
+                    "performance_mode": (
+                        "hybrid_dense_reranked" if dense_enabled else "bm25_cpu_fallback"
+                    ),
+                    "fallback_reason": fallback_reason,
+                    "embedding_device": getattr(
+                        self.embedding_provider, "effective_device", None
+                    ),
+                }
+            )
+            self._embedding_warmed = dense_enabled
             if reranker is not None:
                 self._reranker_warmed = True
             return result

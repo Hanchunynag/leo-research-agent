@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.scholar.writing.citation_coverage import (
+    INTRODUCTION_EVIDENCE_LIMIT,
+    INTRODUCTION_MINIMUM_UNIQUE_PAPERS,
+    INTRODUCTION_PAPER_RETRIEVAL_LIMIT,
+    INTRODUCTION_SECTION_RETRIEVAL_LIMIT,
+)
 from app.scholar.writing.models import ResearchNeed, WritingRequest
 
 
@@ -22,8 +28,25 @@ class IntroductionSkill:
         normalized = f"{request.instruction} {request.focus or ''}".casefold()
         needs: list[ResearchNeed] = []
 
-        def add(need_id: str, move: str, purpose: str, query: str, claim: str) -> None:
-            needs.append(ResearchNeed(need_id, move, query, (claim,), purpose))
+        def add(
+            need_id: str,
+            move: str,
+            purpose: str,
+            query: str,
+            claim: str,
+            *,
+            broad_paper_coverage: bool = False,
+        ) -> None:
+            metadata = {}
+            if broad_paper_coverage:
+                metadata = {
+                    "minimum_unique_papers": INTRODUCTION_MINIMUM_UNIQUE_PAPERS,
+                    "paper_retrieval_limit": INTRODUCTION_PAPER_RETRIEVAL_LIMIT,
+                    "section_retrieval_limit": INTRODUCTION_SECTION_RETRIEVAL_LIMIT,
+                    "evidence_limit": INTRODUCTION_EVIDENCE_LIMIT,
+                    "ensure_paper_coverage": True,
+                }
+            needs.append(ResearchNeed(need_id, move, query, (claim,), purpose, metadata=metadata))
 
         explicit_prior = any(token in normalized for token in ("prior", "existing", "已有", "相关工作", "现有工作"))
         explicit_problem = any(token in normalized for token in ("problem", "challenge", "问题", "挑战", "背景"))
@@ -41,6 +64,7 @@ class IntroductionSkill:
             "prior_work",
             f"{focus}: existing approaches and prior work",
             f"Existing approaches relevant to {focus}.",
+            broad_paper_coverage=True,
         )
         add(
             "limitations",

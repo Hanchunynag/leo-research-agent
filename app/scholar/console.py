@@ -17,6 +17,7 @@ from typing import Any, Literal, Mapping
 from app.scholar.evaluation import HarnessEvaluationCase, ScholarHarnessEvaluationSuite
 from app.scholar.manuscript import ManuscriptSynchronizer
 from app.scholar.project import ScholarProjectStore
+from app.scholar.events import RunEventStore
 from app.session import SessionManager
 
 
@@ -49,7 +50,7 @@ def _status(value: Any) -> str:
         "queued": "PENDING",
         "waiting_user": "WAITING_USER",
         "interrupted": "INTERRUPTED",
-        "cancelled": "FAILED",
+        "cancelled": "CANCELLED",
         "skipped": "COMPLETED",
     }.get(raw, raw.upper())
 
@@ -63,6 +64,7 @@ RunEventType = Literal[
     "SUBAGENT_COMPLETED",
     "TOOL_STARTED",
     "TOOL_COMPLETED",
+    "RESEARCH_PROGRESS",
     "RESEARCH_COMPLETED",
     "EVIDENCE_VERIFIED",
     "DOMAIN_RESULT",
@@ -75,6 +77,7 @@ RunEventType = Literal[
     "RUN_INTERRUPTED",
     "RUN_COMPLETED",
     "RUN_FAILED",
+    "RUN_CANCELLED",
 ]
 RunEventStatus = Literal[
     "PENDING",
@@ -83,6 +86,7 @@ RunEventStatus = Literal[
     "FAILED",
     "WAITING_USER",
     "INTERRUPTED",
+    "CANCELLED",
 ]
 _RUN_EVENT_TYPES = frozenset(RunEventType.__args__)
 _RUN_EVENT_STATUSES = frozenset(RunEventStatus.__args__)
@@ -152,6 +156,22 @@ def _is_verified_evidence(value: Mapping[str, Any]) -> bool:
 
 def _event_type(kind: str, name: str, *, task_type: str | None = None) -> RunEventType:
     normalized = name.casefold()
+    if normalized in {"flow_transition", "flowstartedevent", "flowfinishedevent"}:
+        return "DOMAIN_RESULT"
+    if normalized == "crewkickoffstartedevent":
+        return "SUBAGENT_STARTED"
+    if normalized == "crewkickoffcompletedevent":
+        return "SUBAGENT_COMPLETED"
+    if normalized == "agentexecutionstartedevent":
+        return "SUBAGENT_STARTED"
+    if normalized == "agentexecutioncompletedevent":
+        return "SUBAGENT_COMPLETED"
+    if normalized in {"taskstartedevent", "taskcompletedevent"}:
+        return "DOMAIN_RESULT"
+    if normalized == "toolusagestartedevent":
+        return "TOOL_STARTED"
+    if normalized == "toolusagefinishedevent":
+        return "TOOL_COMPLETED"
     if normalized == "harness_context":
         return "CONTEXT_ASSEMBLED"
     if normalized == "harness_plan":
@@ -162,6 +182,8 @@ def _event_type(kind: str, name: str, *, task_type: str | None = None) -> RunEve
         return "TOOL_COMPLETED"
     if normalized == "research_evidence":
         return "RESEARCH_COMPLETED"
+    if normalized in {"research_need", "research_stage", "research_coverage_item"}:
+        return "RESEARCH_PROGRESS"
     if normalized == "review_draft":
         return "REVIEW_COMPLETED"
     if normalized == "execute_scholar_skill":
@@ -180,6 +202,7 @@ class ScholarConsoleProjection:
         self.project_root = project_root.expanduser().resolve()
         self.project_store = project_store or ScholarProjectStore(self.project_root)
         self.session_manager = session_manager or SessionManager(self.project_root)
+        self.event_store = RunEventStore(self.project_root)
 
     def _find_run(self, run_id: str) -> tuple[Any, Any, dict[str, Any]]:
         requested = run_id.strip()
@@ -211,12 +234,25 @@ class ScholarConsoleProjection:
         if not isinstance(harness, Mapping):
             harness = {}
         harness = dict(harness)
+        # CrewAI framework events are projected through the existing trace
+        # field.  Keep the Console vocabulary and replay endpoint unchanged.
+        if metadata.get("backend") == "crewai" and not harness.get("trace"):
+            crew_trace = metadata.get("trace")
+            if isinstance(crew_trace, Mapping):
+                harness = {**harness, **dict(crew_trace)}
         for key in ("visible_capabilities", "visible_tools", "unexpected_tool_calls", "capability_violations", "context_budget"):
             if key in metadata:
                 harness[key] = _jsonable(metadata[key])
+        if "visible_tools" not in harness and "visible_capabilities" in harness:
+            # CrewAI names this projection ``visible_capabilities`` while the
+            # existing evaluator/console contract calls it ``visible_tools``.
+            harness["visible_tools"] = harness["visible_capabilities"]
         value: Any = None
+        structured_result = metadata.get("structured_result")
+        if structured_result is not None:
+            value = structured_result
         answer = result.get("answer")
-        if isinstance(answer, str) and answer:
+        if value is None and isinstance(answer, str) and answer:
             try:
                 value = json.loads(answer)
             except json.JSONDecodeError:
@@ -237,9 +273,13 @@ class ScholarConsoleProjection:
             },
             "harness": _jsonable(harness),
             "termination_reason": metadata.get("termination_reason") or harness.get("termination_reason"),
+            "orchestration_backend": metadata.get("backend") or "legacy",
         }
 
     def run_events(self, run_id: str) -> list[dict[str, Any]]:
+        persisted = list(self.event_store.list(run_id))
+        if persisted:
+            return persisted
         snapshot = self.run_snapshot(run_id)
         run = snapshot["run"]
         routing = snapshot["routing"]
@@ -258,7 +298,7 @@ class ScholarConsoleProjection:
         ) -> None:
             nonlocal sequence
             sequence += 1
-            allowed_statuses = {"PENDING", "RUNNING", "COMPLETED", "FAILED", "WAITING_USER", "INTERRUPTED"}
+            allowed_statuses = {"PENDING", "RUNNING", "COMPLETED", "FAILED", "WAITING_USER", "INTERRUPTED", "CANCELLED"}
             normalized_status = status if status in allowed_statuses else "FAILED"
             events.append(
                 RunEvent(
@@ -322,6 +362,18 @@ class ScholarConsoleProjection:
                 node = "Research Subagent"
             elif normalized_name == "review_draft":
                 node = "Reviewer"
+            elif normalized_name in {"agentexecutionstartedevent", "agentexecutioncompletedevent"}:
+                event_metadata = item.get("metadata")
+                role = event_metadata.get("agent_role") if isinstance(event_metadata, Mapping) else None
+                node = str(role or "Specialist Agent")
+            elif normalized_name in {"toolusagestartedevent", "toolusagefinishedevent"}:
+                event_metadata = item.get("metadata")
+                tool_name = event_metadata.get("tool_name") if isinstance(event_metadata, Mapping) else None
+                node = f"Research Tool: {tool_name}" if tool_name else "Capability Tool"
+            elif normalized_name == "flow_transition":
+                event_metadata = item.get("metadata")
+                state_name = event_metadata.get("state") if isinstance(event_metadata, Mapping) else None
+                node = f"CrewAI Flow: {state_name}" if state_name else "CrewAI Flow"
             elif normalized_name == "harness_result":
                 node = "Research Capability" if task_type == "SUPPORT_CLAIM" else "Writing Runtime"
             elif normalized_name.startswith(("web_", "evidence_")):
@@ -370,7 +422,7 @@ class ScholarConsoleProjection:
         terminal = {
             "INTERRUPTED": ("RUN_INTERRUPTED", "INTERRUPTED"),
             "FAILED": ("RUN_FAILED", "FAILED"),
-            "CANCELLED": ("RUN_FAILED", "FAILED"),
+            "CANCELLED": ("RUN_CANCELLED", "CANCELLED"),
             "WAITING_USER": ("WAITING_USER", "WAITING_USER"),
             "COMPLETED": ("RUN_COMPLETED", "COMPLETED"),
         }.get(str(run.get("status") or ""))
@@ -390,7 +442,27 @@ class ScholarConsoleProjection:
         if project_id != self.project_store.project_id:
             raise ValueError("PROJECT_CONFLICT: Project 不属于当前 Runtime。")
         synchronizer = ManuscriptSynchronizer(self.project_root)
-        state = synchronizer.scan(previous=self.project_store.load_manuscript_state())
+        try:
+            state = synchronizer.scan(previous=self.project_store.load_manuscript_state())
+        except FileNotFoundError:
+            # A research-only workspace may legitimately have no LaTeX root
+            # yet.  Keep the project control plane usable so SUPPORT_CLAIM
+            # runs can still be inspected; writing tasks will report their own
+            # manuscript-context requirement when they need one.
+            patches = self.project_store.list_patches()
+            return {
+                "project_id": project_id,
+                "root_tex": None,
+                "project_hash": None,
+                "version": 0,
+                "stale_sections": [],
+                "sections": [],
+                "facts": _jsonable(self.project_store.list_facts()),
+                "contributions": _jsonable(self.project_store.list_contributions()),
+                "patches": _jsonable(patches),
+                "manuscript_available": False,
+                "message": "当前项目还没有 root .tex 文件。",
+            }
         patches = self.project_store.list_patches()
         patch_by_section: dict[str, Any] = {}
         for stored in patches:
@@ -445,6 +517,82 @@ class ScholarConsoleProjection:
             "facts": _jsonable(self.project_store.list_facts()),
             "contributions": _jsonable(self.project_store.list_contributions()),
             "patches": _jsonable(patches),
+        }
+
+    def manuscript_view(self, project_id: str) -> dict[str, Any]:
+        """Return a safe, read-only manuscript projection for the web console.
+
+        The persisted project state intentionally contains hashes and metadata
+        only.  The browser needs the actual section text to make LaTeX review
+        useful, so this endpoint reads only files reachable from the root TeX
+        file and always goes through ``ManuscriptSynchronizer._safe_path``.
+        It never exposes an absolute filesystem path and never mutates files.
+        """
+
+        if project_id != self.project_store.project_id:
+            raise ValueError("PROJECT_CONFLICT: Project 不属于当前 Runtime。")
+        synchronizer = ManuscriptSynchronizer(self.project_root)
+        projection = self.project_state(project_id)
+        try:
+            state = synchronizer.scan(previous=self.project_store.load_manuscript_state())
+        except FileNotFoundError:
+            return {
+                "project_id": project_id,
+                "root_tex": None,
+                "project_hash": None,
+                "version": 0,
+                "stale_sections": [],
+                "sections": [],
+                "latest_build": None,
+                "pdf_available": False,
+                "pdf_path": None,
+                "pdf_url": None,
+                "facts": projection.get("facts", []),
+                "contributions": projection.get("contributions", []),
+                "patches": projection.get("patches", []),
+                "manuscript_available": False,
+                "message": "当前项目还没有 root .tex 文件。可以先在项目中创建 main.tex。",
+            }
+        section_by_name = {
+            str(item["name"]): item
+            for item in projection.get("sections", [])
+            if isinstance(item, Mapping) and item.get("name") is not None
+        }
+        sections: list[dict[str, Any]] = []
+        for name, section in sorted(state.sections.items()):
+            item = dict(section_by_name.get(name, _jsonable(section)))
+            try:
+                content = synchronizer.read_section(state, name)
+                read_error = None
+            except (OSError, UnicodeError, ValueError, KeyError) as error:
+                content = ""
+                read_error = str(error)
+            item["content"] = content
+            item["character_count"] = len(content)
+            item["line_count"] = len(content.splitlines())
+            if read_error:
+                item["read_error"] = read_error
+            sections.append(item)
+
+        root_path = synchronizer._safe_path(state.root_tex)
+        pdf_path = root_path.with_suffix(".pdf")
+        pdf_available = pdf_path.is_file()
+        latest_build = self.project_store.latest_build_result(project_id)
+        return {
+            "project_id": project_id,
+            "root_tex": state.root_tex,
+            "project_hash": state.project_hash,
+            "version": state.version,
+            "stale_sections": list(state.stale_sections),
+            "sections": sections,
+            "latest_build": _jsonable(latest_build) if latest_build is not None else None,
+            "pdf_available": pdf_available,
+            "pdf_path": state.root_tex.rsplit("/", 1)[-1].replace(".tex", ".pdf") if pdf_available else None,
+            "pdf_url": f"/api/scholar/projects/{project_id}/manuscript/pdf" if pdf_available else None,
+            "manuscript_available": True,
+            "facts": projection.get("facts", []),
+            "contributions": projection.get("contributions", []),
+            "patches": projection.get("patches", []),
         }
 
     def evidence_view(self, project_id: str, *, run_id: str | None = None) -> dict[str, Any]:
@@ -583,15 +731,34 @@ class ScholarConsoleProjection:
 
     def evaluation(self, run_id: str) -> dict[str, Any]:
         snapshot = self.run_snapshot(run_id)
-        task_type = str(snapshot.get("routing", {}).get("task_type") or "")
+        raw_task_type = snapshot.get("routing", {}).get("task_type")
+        task_type = str(raw_task_type or "").strip().upper()
         expected = {
-            "SUPPORT_CLAIM": ("support-claim", True, True, "ClaimSupportResult", False),
+            "SUPPORT_CLAIM": ("support-claim", True, False, "ClaimSupportResult", False),
             "WRITE_INTRODUCTION": ("write-introduction", None, True, "WritingResult", True),
             "WRITE_CONCLUSION": ("write-conclusion", False, False, "WritingResult", True),
             "WRITE_ABSTRACT": ("write-abstract", False, False, "WritingResult", True),
         }.get(task_type)
         if expected is None:
-            raise ValueError("EVALUATION_UNSUPPORTED_TASK")
+            if task_type:
+                return {
+                    "run_id": run_id,
+                    "task_type": task_type,
+                    "supported": False,
+                    "reason_code": "EVALUATION_UNSUPPORTED_TASK",
+                    "reason": f"任务类型 {task_type} 当前没有对应的质量评估合同。",
+                    "metrics": {},
+                    "record": None,
+                }
+            return {
+                "run_id": run_id,
+                "task_type": None,
+                "supported": False,
+                "reason_code": "EVALUATION_NOT_ROUTED",
+                "reason": "任务尚未完成路由，暂时没有可计算的质量评估。",
+                "metrics": {},
+                "record": None,
+            }
         case = HarnessEvaluationCase(
             run_id,
             str(snapshot["run"].get("query") or ""),
@@ -616,8 +783,13 @@ class ScholarConsoleProjection:
         record = ScholarHarnessEvaluationSuite().evaluate_result(case, Result())
         return {
             "run_id": run_id,
+            "task_type": task_type,
+            "supported": True,
             "metrics": {
-                "Task Routing Accuracy": 1.0 if record.selected_skill == case.expected_skill else 0.0,
+                "Task Routing Accuracy": 1.0
+                if str(record.selected_skill or "").casefold().replace("_", "-")
+                == str(case.expected_skill).casefold().replace("_", "-")
+                else 0.0,
                 "Forbidden Tool Call Count": record.forbidden_tool_calls,
                 "Unexpected Research Rate": int("UNEXPECTED_RESEARCH" in record.failures),
                 "Required Research Miss Rate": int("REQUIRED_RESEARCH_MISSED" in record.failures),

@@ -238,9 +238,16 @@ def __getattr__(name: str) -> object:
         "ScholarHarnessService",
         "ScholarRuntimeBundle",
         "ScholarRuntimeFactory",
+        "ScholarOrchestrationService",
+        "ScholarRunManager",
+        "ScholarRunWorker",
+        "RunEventStore",
     }:
         from app.scholar.harness import DeepAgentsSkillAdapter, ScholarHarnessResult, ScholarHarnessService
         from app.scholar.composition import ScholarRuntimeBundle, ScholarRuntimeFactory
+        from app.orchestration.service import ScholarOrchestrationService
+        from app.scholar.runs import ScholarRunManager, ScholarRunWorker
+        from app.scholar.events import RunEventStore
 
         return {
             "DeepAgentsSkillAdapter": DeepAgentsSkillAdapter,
@@ -248,6 +255,10 @@ def __getattr__(name: str) -> object:
             "ScholarHarnessService": ScholarHarnessService,
             "ScholarRuntimeBundle": ScholarRuntimeBundle,
             "ScholarRuntimeFactory": ScholarRuntimeFactory,
+            "ScholarOrchestrationService": ScholarOrchestrationService,
+            "ScholarRunManager": ScholarRunManager,
+            "ScholarRunWorker": ScholarRunWorker,
+            "RunEventStore": RunEventStore,
         }[name]
     raise AttributeError(name)
 
@@ -259,5 +270,9 @@ __all__.extend(
         "ScholarHarnessService",
         "ScholarRuntimeBundle",
         "ScholarRuntimeFactory",
+        "ScholarOrchestrationService",
+        "ScholarRunManager",
+        "ScholarRunWorker",
+        "RunEventStore",
     )
 )

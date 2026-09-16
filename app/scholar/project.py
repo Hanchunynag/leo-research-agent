@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sqlite3
 from datetime import datetime, timezone
@@ -32,7 +33,6 @@ class ScholarProjectStore:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30.0)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")
         return connection
@@ -142,18 +142,62 @@ class ScholarProjectStore:
                 );
                 """
             )
+            aliases = tuple(
+                value.strip()
+                for value in os.getenv("LEO_PROJECT_ROOT_ALIASES", "").split(",")
+                if value.strip()
+            )
             row = connection.execute(
                 "SELECT project_id FROM project_info WHERE root_path=?",
                 (str(self.project_root),),
             ).fetchone()
-            if row is None:
+            # A containerized deployment may move the same persisted project
+            # from its old in-image path to a host-mounted workspace. Keep the
+            # existing project identity when the deployment explicitly lists
+            # that old path as an alias; do not guess across unrelated local
+            # projects.
+            legacy = None
+            if aliases:
+                legacy = connection.execute(
+                    "SELECT project_id FROM project_info WHERE root_path IN ({}) ORDER BY rowid DESC LIMIT 1".format(
+                        ",".join("?" for _ in aliases)
+                    ),
+                    aliases,
+                ).fetchone()
+            if row is not None and legacy is not None and row["project_id"] != legacy["project_id"]:
+                # A prior startup may already have registered the new path
+                # before this migration flag was introduced. Prefer the alias
+                # only when the current row is empty and the legacy row owns
+                # persisted domain data; this avoids guessing in a real
+                # multi-project database.
+                tables = (
+                    "patches",
+                    "manuscript_state",
+                    "manuscript_sections",
+                    "build_results",
+                    "citation_registry",
+                    "external_evidence_projection",
+                )
+                current_count = sum(
+                    int(connection.execute(f"SELECT count(*) FROM {table} WHERE project_id=?", (row["project_id"],)).fetchone()[0])
+                    for table in tables
+                )
+                legacy_count = sum(
+                    int(connection.execute(f"SELECT count(*) FROM {table} WHERE project_id=?", (legacy["project_id"],)).fetchone()[0])
+                    for table in tables
+                )
+                if current_count == 0 and legacy_count > 0:
+                    row = legacy
+            if row is not None:
+                self._project_id = str(row["project_id"])
+            elif legacy is not None:
+                self._project_id = str(legacy["project_id"])
+            else:
                 self._project_id = f"PROJECT_{secrets.token_hex(8)}"
                 connection.execute(
                     "INSERT INTO project_info(project_id, root_path) VALUES (?, ?)",
                     (self._project_id, str(self.project_root)),
                 )
-            else:
-                self._project_id = str(row["project_id"])
 
     @property
     def project_id(self) -> str:
@@ -501,6 +545,7 @@ class ScholarProjectStore:
     ) -> object:
         now = _utc_now()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT * FROM patches WHERE patch_id=?", (patch_id,)
             ).fetchone()
@@ -510,18 +555,22 @@ class ScholarProjectStore:
                 raise ValueError(
                     f"PATCH_STATE_CONFLICT: 期望 {expected_status}，实际为 {row['status']}。"
                 )
-            connection.execute(
-                """
+            update_where = "WHERE patch_id=?"
+            update_values: tuple[object, ...] = (status, json.dumps(result or json.loads(row["result_json"]), ensure_ascii=False, sort_keys=True), now, patch_id)
+            if expected_status is not None:
+                update_where += " AND status=?"
+                update_values += (expected_status,)
+            changed = connection.execute(
+                f"""
                 UPDATE patches SET status=?, result_json=?, updated_at=?
-                WHERE patch_id=?
+                {update_where}
                 """,
-                (
-                    status,
-                    json.dumps(result or json.loads(row["result_json"]), ensure_ascii=False, sort_keys=True),
-                    now,
-                    patch_id,
-                ),
-            )
+                update_values,
+            ).rowcount
+            if changed != 1:
+                raise ValueError(
+                    f"PATCH_STATE_CONFLICT: 期望 {expected_status}，实际状态已被其他请求更新。"
+                )
             updated = connection.execute(
                 "SELECT * FROM patches WHERE patch_id=?", (patch_id,)
             ).fetchone()

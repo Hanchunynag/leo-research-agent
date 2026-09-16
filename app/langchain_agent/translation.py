@@ -7,7 +7,10 @@ from typing import Any, Mapping
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
-from app.generation.openai_compatible import parse_json_object
+from app.generation.openai_compatible import (
+    parse_json_object,
+    structured_chat_completion,
+)
 
 
 def detect_output_language(text: str) -> str:
@@ -76,7 +79,11 @@ class BilingualQueryTranslator:
             {"role": "user", "content": original},
         ]
         try:
-            response = self.provider.chat_completion(messages, max_tokens=800)
+            response = structured_chat_completion(
+                self.provider,
+                messages,
+                max_tokens=800,
+            )
             choices = response.get("choices") if isinstance(response, Mapping) else None
             first = choices[0] if isinstance(choices, list) and choices else {}
             message = first.get("message") if isinstance(first, Mapping) else {}

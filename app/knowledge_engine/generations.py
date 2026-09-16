@@ -1,4 +1,4 @@
-"""LightRAG 索引代际状态机和 active 指针。"""
+"""通用索引构建代际状态机和 active 指针。"""
 
 from __future__ import annotations
 

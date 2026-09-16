@@ -97,18 +97,29 @@ def build_identity(
     paper_id: str,
     sha256: str,
     metadata: dict[str, Any],
+    *,
+    allow_document_work_identity: bool = False,
 ) -> dict[str, Any]:
     document_id = document_id_from_sha256(sha256)
     work_key = work_identity_key(metadata)
     if work_key is None:
-        return {
-            "document_id": document_id,
-            "work_id": None,
-            "work_key": None,
-            "work_id_method": None,
-            "status": "unresolved",
-            "legacy_paper_id": paper_id,
-        }
+        if allow_document_work_identity:
+            # A freshly uploaded local PDF may not have verified bibliographic
+            # metadata yet, but it still needs a stable identity to enter the
+            # structure/chunk/RAG pipeline. Bind this provisional work only to
+            # the file digest so two unrelated PDFs can never be merged. A
+            # later metadata verification pass may replace it with a DOI,
+            # arXiv, or bibliographic work identity.
+            work_key = (f"document:{sha256}", "document")
+        else:
+            return {
+                "document_id": document_id,
+                "work_id": None,
+                "work_key": None,
+                "work_id_method": None,
+                "status": "unresolved",
+                "legacy_paper_id": paper_id,
+            }
     key, method = work_key
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
     return {
@@ -116,7 +127,13 @@ def build_identity(
         "work_id": f"W_{digest[:12]}",
         "work_key": key,
         "work_id_method": method,
-        "status": "verified" if method in {"doi", "arxiv"} else "provisional",
+        "status": (
+            "verified"
+            if method in {"doi", "arxiv"}
+            else "provisional"
+            if method == "bibliographic"
+            else "unresolved"
+        ),
         "legacy_paper_id": paper_id,
     }
 

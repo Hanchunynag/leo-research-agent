@@ -8,19 +8,36 @@ wheels/
 node_modules/
 *.tsbuildinfo
 
-# Virtual environments
-.venv
-.venv-mineru/
+# Virtual environments（覆盖 .venv / .venv-mineru / .venv-paddleocr 等全部变体）
+.venv*/
 
 # Local generated artifacts
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 .scholar/
 tmp/
 .env
 .env.*
 !.env.example
+
+# Local SQLite runtime databases（Scholar Checkpoint / 本地空库）
+scholar.db
+*.sqlite
+*.sqlite3
+
+# Local output directories
+output*/
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
 # Keep local paper data private, but version the human retrieval qrels.
 data/*
 !data/evaluation/

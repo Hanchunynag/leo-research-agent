@@ -90,8 +90,8 @@ class PersistentJobRepository:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=30000")
         return connection
 
     def _initialize(self) -> None:
@@ -222,6 +222,16 @@ class PersistentJobRepository:
         if row is None:
             raise KeyError(f"Job 不存在：{job_id}")
         return self._record(row)
+
+    def get_by_idempotency(self, idempotency_key: str) -> JobRecord | None:
+        """Return an existing durable Job for an idempotency key, if any."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return self._record(row) if row is not None else None
 
     def list(self, *, status: JobStatus | None = None) -> tuple[JobRecord, ...]:
         query = "SELECT * FROM jobs"
@@ -385,29 +395,44 @@ class PersistentJobRepository:
         return self.get(job_id).status in {"CANCEL_REQUESTED", "CANCELLED"}
 
     def mark_interrupted(self, *, heartbeat_before: str) -> tuple[JobRecord, ...]:
-        """进程启动时把失联 RUNNING 任务显式标记为 INTERRUPTED。"""
+        """收束进程启动时已经失联的任务。
+
+        A cancellation request is durable state, so a dead Worker must not
+        leave it in ``CANCEL_REQUESTED`` forever.  Only requests whose last
+        heartbeat is older than ``heartbeat_before`` are finalized; a live
+        Worker still gets the cooperative-cancellation grace period.
+        """
 
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT job_id FROM jobs
-                WHERE status='RUNNING'
+                SELECT job_id, status FROM jobs
+                WHERE status IN ('RUNNING', 'CANCEL_REQUESTED')
                   AND (heartbeat_at IS NULL OR heartbeat_at < ?)
                 ORDER BY created_at, job_id
                 """,
                 (heartbeat_before,),
             ).fetchall()
-            ids = tuple(str(row["job_id"]) for row in rows)
-            if ids:
+            if rows:
                 connection.executemany(
                     """
-                    UPDATE jobs SET status='INTERRUPTED', worker_id=NULL,
-                        error_type='ProcessRestart',
-                        error_summary='Worker heartbeat lost after process restart.'
-                    WHERE job_id=? AND status='RUNNING'
+                    UPDATE jobs SET
+                        status=CASE WHEN status='CANCEL_REQUESTED'
+                                    THEN 'CANCELLED' ELSE 'INTERRUPTED' END,
+                        finished_at=CASE WHEN status='CANCEL_REQUESTED'
+                                         THEN ? ELSE NULL END,
+                        worker_id=NULL,
+                        error_type=CASE WHEN status='CANCEL_REQUESTED'
+                                        THEN 'CancelledAfterWorkerLost'
+                                        ELSE 'ProcessRestart' END,
+                        error_summary=CASE WHEN status='CANCEL_REQUESTED'
+                                           THEN 'Cancellation finalized after Worker heartbeat expired.'
+                                           ELSE 'Worker heartbeat lost after process restart.' END
+                    WHERE job_id=? AND status IN ('RUNNING', 'CANCEL_REQUESTED')
                     """,
-                    ((job_id,) for job_id in ids),
+                    ((_now(), str(row["job_id"])) for row in rows),
                 )
+            ids = tuple(str(row["job_id"]) for row in rows)
         return tuple(self.get(job_id) for job_id in ids)
 
     def recover_interrupted(self) -> tuple[JobRecord, ...]:

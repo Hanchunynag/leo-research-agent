@@ -9,6 +9,13 @@ type ChatMessage = {
   outcome?: AgenticResult["outcome"];
 };
 
+type BatchImportSummary = {
+  total: number;
+  completed: number;
+  succeeded: number;
+  failed: string[];
+};
+
 const OUTCOME_LABELS: Record<string, string> = {
   insufficient_evidence: "证据不足",
   generation_failed: "生成格式失败",
@@ -44,6 +51,8 @@ function LegacyApp() {
   const [system, setSystem] = useState<Record<string, any>>({});
   const [error, setError] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const batchFileInput = useRef<HTMLInputElement>(null);
+  const [batchSummary, setBatchSummary] = useState<BatchImportSummary | null>(null);
 
   const refresh = async () => {
     const [paperPayload, sessionPayload, systemPayload] = await Promise.all([
@@ -116,19 +125,103 @@ function LegacyApp() {
   };
 
   const upload = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
+    const files = Array.from(event.target.files || []);
+    const isBatch = event.currentTarget.multiple || files.length > 1;
+    event.target.value = "";
+    if (!files.length) return;
+
+    const pdfFiles = files.filter((file) => file.name.toLowerCase().endsWith(".pdf"));
+    const failed = files
+      .filter((file) => !file.name.toLowerCase().endsWith(".pdf"))
+      .map((file) => `${file.name}：只支持 PDF 文件`);
+    let succeeded = 0;
+
     setError(null);
+    if (isBatch) {
+      setBatchSummary({
+        total: files.length,
+        completed: 0,
+        succeeded: 0,
+        failed: [...failed],
+      });
+    } else {
+      setBatchSummary(null);
+    }
+
+    if (!pdfFiles.length) {
+      setError("未找到可导入的 PDF 文件。");
+      return;
+    }
+
     setBusy(true);
     try {
-      const created = await api.upload(file);
-      await watchJob(created.job_id, setProgress);
+      for (const [index, file] of files.entries()) {
+        const isPdf = file.name.toLowerCase().endsWith(".pdf");
+        if (!isPdf) {
+          if (isBatch) {
+            setBatchSummary({
+              total: files.length,
+              completed: index + 1,
+              succeeded,
+              failed: [...failed],
+            });
+          }
+          continue;
+        }
+
+        const completedBefore = index;
+        setProgress({
+          stage: "uploading",
+          message: `${isBatch ? `${completedBefore + 1}/${files.length} · ` : ""}${file.name}：正在提交解析任务。`,
+          progress: completedBefore / files.length,
+        });
+
+        try {
+          const created = await api.upload(file);
+          await watchJob(created.job_id, (event) =>
+            setProgress({
+              stage: event.stage,
+              message: `${isBatch ? `${completedBefore + 1}/${files.length} · ` : ""}${file.name}：${event.message}`,
+              progress: (completedBefore + event.progress) / files.length,
+            }),
+          );
+          succeeded += 1;
+        } catch (reason: any) {
+          failed.push(`${file.name}：${reason.message || String(reason)}`);
+        }
+
+        if (isBatch) {
+          setBatchSummary({
+            total: files.length,
+            completed: completedBefore + 1,
+            succeeded,
+            failed: [...failed],
+          });
+        }
+      }
+
       await refresh();
+
+      if (isBatch) {
+        setBatchSummary({
+          total: files.length,
+          completed: files.length,
+          succeeded,
+          failed: [...failed],
+        });
+        setProgress({
+          stage: "batch_completed",
+          message: `批量导入完成：${succeeded}/${files.length} 个文件成功。`,
+          progress: 1,
+        });
+        if (failed.length) {
+          setError(`批量导入完成，但有 ${failed.length} 个文件失败：${failed.join("；")}`);
+        }
+      }
     } catch (reason: any) {
       setError(reason.message || String(reason));
     } finally {
       setBusy(false);
-      event.target.value = "";
     }
   };
 
@@ -176,12 +269,31 @@ function LegacyApp() {
             <span className="eyebrow">LIBRARY</span>
             <h2>论文库</h2>
           </div>
-          <button className="icon-button" onClick={() => fileInput.current?.click()} disabled={busy} aria-label="上传 PDF">
-            +
-          </button>
+          <div className="library-actions">
+            <button className="icon-button" type="button" onClick={() => fileInput.current?.click()} disabled={busy} aria-label="上传单篇 PDF" title="上传单篇 PDF">
+              +
+            </button>
+            <button className="batch-button" type="button" onClick={() => batchFileInput.current?.click()} disabled={busy}>
+              批量导入
+            </button>
+          </div>
           <input ref={fileInput} type="file" accept="application/pdf,.pdf" hidden onChange={upload} />
+          <input ref={batchFileInput} type="file" accept="application/pdf,.pdf" multiple hidden onChange={upload} />
         </section>
         <div className="paper-count">{papers.length} 篇已入库论文</div>
+        {batchSummary && (
+          <section className={`batch-summary ${batchSummary.failed.length ? "has-failures" : ""}`}>
+            <div className="batch-summary-line">
+              <strong>批量导入 {batchSummary.completed}/{batchSummary.total}</strong>
+              <span>{batchSummary.succeeded} 成功</span>
+            </div>
+            {batchSummary.failed.length > 0 && (
+              <ul>
+                {batchSummary.failed.map((item) => <li key={item}>{item}</li>)}
+              </ul>
+            )}
+          </section>
+        )}
         <div className="paper-list">
           {papers.map((paper) => (
             <article className="paper-card" key={paper.document_id}>
@@ -196,7 +308,7 @@ function LegacyApp() {
               </div>
             </article>
           ))}
-          {!papers.length && <div className="empty-mini">尚无论文，点击右上角上传 PDF。</div>}
+          {!papers.length && <div className="empty-mini">尚无论文，点击“批量导入”选择多个 PDF。</div>}
         </div>
         <section className="session-heading">
           <div>

@@ -39,8 +39,6 @@ class RealRunCostMetrics:
     cache_hit_rate: float | None
     monetary_cost: float | None
     currency: str | None
-    lightrag_query_tokens: int
-    lightrag_ingestion_tokens: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -85,8 +83,6 @@ class RealCostMetricsCollector:
         measurement_source: str,
         provider_measured: bool,
         pricing: ProviderPricing | None = None,
-        lightrag_query_tokens: int = 0,
-        lightrag_ingestion_tokens: int = 0,
     ) -> RealRunCostMetrics:
         if not provider_measured or measurement_source in {
             "fixture",
@@ -163,8 +159,4 @@ class RealCostMetricsCollector:
             cache_hit_rate=cache_hit_rate,
             monetary_cost=cost,
             currency=currency,
-            lightrag_query_tokens=lightrag_query_tokens,
-            # 保留独立字段并明确不参与本次问答 monetary_cost。
-            lightrag_ingestion_tokens=lightrag_ingestion_tokens,
         )
-

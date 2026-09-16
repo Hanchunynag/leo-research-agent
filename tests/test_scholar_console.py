@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from app.scholar.console import RunEvent, ScholarConsoleProjection
+from app.scholar.manuscript import ManuscriptSynchronizer
 from app.scholar.models import DraftPatch
 from app.scholar.project import ScholarProjectStore
 from app.session import SessionManager
@@ -103,6 +104,91 @@ def test_console_project_state_reads_current_sections_and_patch_projection(tmp_p
     assert state["sections"][0]["stale"] is False
     assert state["sections"][0]["dependencies"] == []
     assert state["sections"][0]["review_status"] == "NONE"
+
+
+def test_manuscript_initialization_is_complete_idempotent_and_non_destructive(tmp_path: Path) -> None:
+    synchronizer = ManuscriptSynchronizer(tmp_path)
+
+    first = synchronizer.ensure_initialized()
+    assert first.root_tex == "main.tex"
+    assert {
+        "main.tex",
+        "sections/abstract.tex",
+        "sections/introduction.tex",
+        "sections/method.tex",
+        "sections/experiment.tex",
+        "sections/results.tex",
+        "sections/conclusion.tex",
+        "references.bib",
+    } <= {
+        path.relative_to(tmp_path).as_posix()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    main = tmp_path / "main.tex"
+    authored = "\\documentclass{article}\n% user-authored\n"
+    main.write_text(authored, encoding="utf-8")
+    second = synchronizer.ensure_initialized()
+
+    assert main.read_text(encoding="utf-8") == authored
+    assert second.root_tex == "main.tex"
+    assert second.sections["root"].content_hash != first.sections["root"].content_hash
+
+
+def test_evaluation_returns_structured_unsupported_state_for_non_quality_tasks(tmp_path: Path) -> None:
+    for task_type in ("RESEARCH", "REVIEW"):
+        root = tmp_path / task_type.lower()
+        store, _ = _stored_run(root, task_type=task_type)
+        projection = ScholarConsoleProjection(
+            root,
+            project_store=store,
+            session_manager=SessionManager(root),
+        )
+
+        payload = projection.evaluation("CONSOLE_RUN")
+
+        assert payload["supported"] is False
+        assert payload["task_type"] == task_type
+        assert payload["reason_code"] == "EVALUATION_UNSUPPORTED_TASK"
+        assert payload["metrics"] == {}
+
+
+def test_console_manuscript_endpoint_returns_safe_text_and_pdf_preview(tmp_path: Path) -> None:
+    (tmp_path / "sections").mkdir()
+    (tmp_path / "main.tex").write_text(
+        "\\documentclass{article}\n\\input{sections/introduction}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "sections" / "introduction.tex").write_text(
+        "\\section{Introduction}\n这是可以在网页中阅读的正文。\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "main.pdf").write_bytes(b"%PDF-1.4 fixture")
+
+    from app.web.api import create_app
+
+    class Runtime:
+        project_root = tmp_path
+
+        def public_status(self):
+            return {"status": "ok"}
+
+    store = ScholarProjectStore(tmp_path)
+    app = create_app(tmp_path, runtime=Runtime(), scholar_harness=SimpleNamespace())
+    with TestClient(app) as client:
+        response = client.get(f"/api/scholar/projects/{store.project_id}/manuscript")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["root_tex"] == "main.tex"
+        introduction = next(item for item in payload["sections"] if item["name"] == "introduction")
+        assert "可以在网页中阅读" in introduction["content"]
+        assert payload["pdf_available"] is True
+        assert payload["pdf_url"].endswith("/manuscript/pdf")
+
+        pdf = client.get(f"/api/scholar/projects/{store.project_id}/manuscript/pdf")
+        assert pdf.status_code == 200
+        assert pdf.headers["content-type"].startswith("application/pdf")
 
 
 def test_scholar_console_sse_supports_cursor_replay(tmp_path: Path) -> None:

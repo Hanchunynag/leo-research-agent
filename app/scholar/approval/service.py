@@ -525,6 +525,10 @@ class PatchApprovalService:
         record: StoredPatch,
         request: PatchApprovalRequest,
     ) -> PatchApprovalResult:
+        if request.expected_base_hash != record.patch.base_hash:
+            raise PatchConflictError(
+                "expected_base_hash 与 immutable DraftPatch.base_hash 不一致。"
+            )
         if record.status == "REJECTED":
             return PatchApprovalResult(
                 patch_id=request.patch_id,

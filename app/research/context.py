@@ -46,7 +46,6 @@ _EVIDENCE_FIELDS = (
     "content",
     "evidence_grade",
     "directness",
-    "graph_inference_disclaimer",
 )
 
 

@@ -14,7 +14,7 @@ from app.storage import write_json_atomic
 
 
 STRUCTURE_SCHEMA_VERSION = "1.0"
-STRUCTURE_POLICY_VERSION = "1.3"
+STRUCTURE_POLICY_VERSION = "1.4"
 SEARCHABLE_ZONES = {"abstract", "main_body", "appendix"}
 ASSET_TYPES = {"equation", "figure", "table", "algorithm"}
 TEXT_TYPES = {"paragraph", "list", "algorithm"}
@@ -318,6 +318,24 @@ def build_structure(document: dict[str, Any]) -> dict[str, Any]:
         block_zone = _block_specific_zone(raw, current_zone, metadata_abstract)
         if block_zone != current_zone and _is_explicit_abstract_start(raw):
             current_zone = block_zone
+        # Some PDFs (especially scanned Chinese journal layouts) contain body
+        # text and equations but no detectable section-title blocks. Keeping
+        # the whole document in ``front_matter`` would silently produce zero
+        # searchable chunks even though MinerU extracted usable content. Once
+        # a substantive body block appears after the first page, enter
+        # ``main_body`` until an explicit references/appendix heading changes
+        # the zone. This does not affect documents with normal headings.
+        if (
+            current_zone == "front_matter"
+            and block_zone == "front_matter"
+            and page > 1
+            and (
+                len(clean_text(raw.get("text"))) >= 32
+                or block_type in {"equation", "table", "algorithm"}
+            )
+        ):
+            current_zone = "main_body"
+            block_zone = current_zone
         current_section = section_stack[-1] if section_stack else None
         section_path = list(current_section["section_path"]) if current_section else []
         content = render_block_content(raw)
@@ -393,6 +411,11 @@ def build_structure(document: dict[str, Any]) -> dict[str, Any]:
         "title": title,
         "authors": metadata.get("authors") or [],
         "year": metadata.get("year"),
+        "publication_date": metadata.get("publication_date")
+        or metadata.get("published_date"),
+        "venue": metadata.get("venue")
+        or metadata.get("journal")
+        or metadata.get("booktitle"),
         "doi": metadata.get("doi"),
         "canonical_path": None,
         "section_count": len(sections),

@@ -176,11 +176,11 @@ class ClaimEvidenceValidator:
             ]
             cited_values = [evidence_by_id[item] for item in cited]
             # 先阻断高风险语义误述，再执行通用的词面支持代理检查。
-            # 否则 graph inference/analogy 可能只显示为泛化的“不支持”，
+            # 否则 inferred/analogy 可能只显示为泛化的“不支持”，
             # 不利于选择正确的降级措辞与恢复动作。
-            if any(value.get("evidence_grade") == "graph_inference" for value in cited_values):
-                if not re.search(r"可能|提示|推断|may|might|suggest|inferred", text, re.IGNORECASE):
-                    issues.append(ClaimIssue(claim_id, "graph_inference_as_fact", "图推断被写成了直接事实。"))
+            if any(value.get("evidence_grade") == "inferred" for value in cited_values):
+                if not re.search(r"可能|提示|推断|may|might|suggest", text, re.IGNORECASE):
+                    issues.append(ClaimIssue(claim_id, "inferred_as_fact", "推断性证据被写成了直接事实。"))
                     continue
             if any(value.get("evidence_grade") == "analogy" for value in cited_values):
                 if not re.search(r"类比|analog|可能|suggest", text, re.IGNORECASE):
@@ -287,8 +287,8 @@ class TieredClaimEvidenceValidator:
         if self._NOVELTY.search(text):
             risks.append("novelty_or_research_gap")
         grades = {str(value.get("evidence_grade") or "") for value in cited}
-        if "graph_inference" in grades:
-            risks.append("graph_inference")
+        if "inferred" in grades:
+            risks.append("inferred")
         if "analogy" in grades:
             risks.append("analogy")
         documents = {str(value.get("document_id") or "") for value in cited}

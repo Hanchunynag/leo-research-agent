@@ -157,6 +157,23 @@ def test_web_api_lists_library_and_runs_answer_job(tmp_path: Path) -> None:
         assert "event: done" in stream.text
 
 
+def test_ready_exposes_knowledge_readiness_without_breaking_liveness(
+    tmp_path: Path,
+) -> None:
+    runtime = FakeWebRuntime(tmp_path)
+    app = create_app(tmp_path, runtime=runtime, jobs=JobManager(max_workers=1))
+
+    with TestClient(app) as client:
+        response = client.get("/ready")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "degraded"
+        assert payload["application_runtime"] == "ready"
+        assert payload["research_readiness"] == "degraded"
+        assert payload["knowledge_index"]["status"] == "not_initialized"
+        assert client.get("/health").status_code == 200
+
+
 def test_web_api_uploads_pdf_and_removes_temporary_copy(tmp_path: Path) -> None:
     runtime = FakeWebRuntime(tmp_path)
     app = create_app(tmp_path, runtime=runtime, jobs=JobManager(max_workers=1))
@@ -202,6 +219,43 @@ def test_web_api_sessions_and_spa_fallback(tmp_path: Path) -> None:
         assert client.post("/api/sessions/web-demo/compact").status_code == 200
         assert "LEO UI" in client.get("/").text
         assert "LEO UI" in client.get("/research/session").text
+
+
+def test_web_api_initializes_empty_manuscript_without_writing_agent_content(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from app.scholar.project import ScholarProjectStore
+    from app.web.api import create_app
+
+    class Runtime:
+        project_root = tmp_path
+
+        def public_status(self):
+            return {"status": "ok"}
+
+    store = ScholarProjectStore(tmp_path)
+    app = create_app(tmp_path, runtime=Runtime(), scholar_harness=SimpleNamespace())
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/scholar/projects/{store.project_id}/manuscript/initialize"
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["manuscript_available"] is True
+        assert payload["root_tex"] == "main.tex"
+        assert (tmp_path / "main.tex").is_file()
+        assert (tmp_path / "sections" / "introduction.tex").read_text(encoding="utf-8") == "% Introduction\n"
+        assert payload["patches"] == []
+
+        existing = tmp_path / "main.tex"
+        authored = "\\documentclass{book}\n% keep this\n"
+        existing.write_text(authored, encoding="utf-8")
+        second = client.post(
+            f"/api/scholar/projects/{store.project_id}/manuscript/initialize"
+        )
+        assert second.status_code == 200
+        assert existing.read_text(encoding="utf-8") == authored
 
 
 def test_web_runtime_config_resolves_relative_model_cache(

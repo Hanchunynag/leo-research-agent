@@ -210,19 +210,19 @@ def test_partial_high_risk_claim_without_judge_becomes_hypothesis() -> None:
     assert repaired["claims"][0]["text"].startswith("待验证假设：")
 
 
-def test_graph_inference_still_fails_deterministic_layer_before_semantic() -> None:
+def test_inferred_evidence_still_fails_deterministic_layer_before_semantic() -> None:
     local = LocalResult("supports")
     validator = TieredClaimEvidenceValidator(local_validator=local)
 
     report = validator.validate(
-        _draft("Graph relation proves the mechanism.", ["E1"]),
+        _draft("An inferred mechanism proves the claim.", ["E1"]),
         [
             _evidence(
-                "E1", "Graph relation suggests the mechanism.", grade="graph_inference"
+                "E1", "An inferred mechanism suggests the claim.", grade="inferred"
             )
         ],
     )
 
     assert report.valid is False
-    assert report.issues[0].code == "graph_inference_as_fact"
+    assert report.issues[0].code == "inferred_as_fact"
     assert local.calls == []

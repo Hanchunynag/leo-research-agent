@@ -275,7 +275,7 @@ def build_research_tool_handlers(
     """Build the small, atomic document/workspace tools exposed to the graph.
 
     These handlers use the canonical repositories already owned by the project.  They
-    never expose BM25, Dense, Qdrant, Neo4j, or LightRAG objects to an Agent.
+        never expose BM25, Dense, or Qdrant objects to an Agent.
     """
 
     from app.corpus import CanonicalCorpusService

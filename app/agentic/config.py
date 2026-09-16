@@ -22,8 +22,6 @@ class AgenticRAGConfig:
     max_retrieval_rounds: int = 2
     max_query_expansion_calls: int = 1
     max_query_variants: int = 5
-    max_graph_hops: int = 2
-    max_graph_paths: int = 20
     max_focused_queries_per_round: int = 2
     max_cross_query_candidates: int = 40
     max_rerank_candidates: int = 20
@@ -131,8 +129,6 @@ class AgenticRAGConfig:
                 "MAX_QUERY_EXPANSION_CALLS", defaults.max_query_expansion_calls
             ),
             max_query_variants=integer("MAX_QUERY_VARIANTS", defaults.max_query_variants),
-            max_graph_hops=integer("MAX_GRAPH_HOPS", defaults.max_graph_hops),
-            max_graph_paths=integer("MAX_GRAPH_PATHS", defaults.max_graph_paths),
             max_focused_queries_per_round=integer(
                 "MAX_FOCUSED_QUERIES_PER_ROUND", defaults.max_focused_queries_per_round
             ),
@@ -228,10 +224,6 @@ class AgenticRAGConfig:
             raise ValueError("max_query_expansion_calls must equal 1")
         if not 1 <= self.max_query_variants <= 5:
             raise ValueError("max_query_variants must be 1..5")
-        if self.max_graph_hops not in {1, 2}:
-            raise ValueError("max_graph_hops must be 1 or 2")
-        if not 1 <= self.max_graph_paths <= 100:
-            raise ValueError("max_graph_paths must be 1..100")
         if not 1 <= self.max_focused_queries_per_round <= 2:
             raise ValueError("max_focused_queries_per_round must be 1..2")
         if not 1 <= self.max_cross_query_candidates <= 100:

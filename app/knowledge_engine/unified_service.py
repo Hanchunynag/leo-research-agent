@@ -1,19 +1,18 @@
 """Agent 可见的唯一 Unified Knowledge Service。
 
-迁移期开关固定为 legacy official + optional LightRAG shadow。旧后端判断只封装在
-该兼容边界内，不泄漏到 Agent/Harness。
+检索实现固定为本地 Hybrid RAG：BM25 与 BGE-M3 Dense 通过 RRF 融合，随后
+由 Cross-Encoder 和 Evidence Governance 完成精排、校验与选择。上层 Agent
+只依赖本服务，不接触任何索引客户端或存储细节。
 """
 
 from __future__ import annotations
 
 import secrets
-from time import perf_counter
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from app.contracts import CandidateEvidence, EvidenceRequest
 from app.contracts.adapters import LegacyEvidenceMapper
-from app.evaluation.shadow import ShadowReportStore, compare_retrievals
 from app.evidence import EvidenceIntelligencePipeline
 
 
@@ -23,34 +22,12 @@ class UnifiedKnowledgeService:
         official_runtime: Any,
         evidence: EvidenceIntelligencePipeline,
         *,
-        official_engine_name: str = "legacy",
-        official_engine: Any | None = None,
-        official_generation_id: str | None = None,
-        shadow_engine: Any | None = None,
-        shadow_engine_name: str | None = None,
-        shadow_generation_id: str | None = None,
-        report_store: ShadowReportStore | None = None,
         workspace_id: str = "default",
         scope_version: int = 1,
         supports_advanced_retrieval: bool = False,
     ) -> None:
         self.official_runtime = official_runtime
-        if official_engine_name not in {"legacy", "lightrag"}:
-            raise ValueError(f"未知 Official Engine：{official_engine_name}")
-        if official_engine_name == "lightrag" and (
-            official_engine is None or not official_generation_id
-        ):
-            raise ValueError("LightRAG Official 必须提供 Engine 和 Generation Pin。")
-        self.official_engine_name = official_engine_name
-        self.official_engine = official_engine
-        self.official_generation_id = official_generation_id
         self.evidence = evidence
-        self.shadow_engine = shadow_engine
-        self.shadow_engine_name = shadow_engine_name or (
-            "lightrag" if shadow_engine is not None else "none"
-        )
-        self.shadow_generation_id = shadow_generation_id
-        self.report_store = report_store
         self.workspace_id = workspace_id
         self.scope_version = scope_version
         self.supports_advanced_retrieval = supports_advanced_retrieval
@@ -123,38 +100,6 @@ class UnifiedKnowledgeService:
             output.append(raw)
         return output, candidates
 
-    def _shadow(self, request: EvidenceRequest, official: tuple[CandidateEvidence, ...], official_ms: float) -> None:
-        if self.shadow_engine is None:
-            return
-        started = perf_counter()
-        if hasattr(self.shadow_engine, "retrieve_candidates"):
-            raw_shadow = tuple(self.shadow_engine.retrieve_candidates(request))
-        elif hasattr(self.shadow_engine, "retrieve"):
-            raw = self.shadow_engine.retrieve(request.query, limit=request.top_k)
-            values = raw.get("results", []) if isinstance(raw, dict) else []
-            raw_shadow = tuple(
-                self.mapper.candidate_from_mapping(request, value, fallback_rank=index)
-                for index, value in enumerate(values, 1)
-                if isinstance(value, dict)
-            )
-        else:
-            raise RuntimeError("Shadow Engine 不支持 retrieve_candidates/retrieve。")
-        bundle = self.evidence.verify(request, raw_shadow)
-        selected = self.evidence.select(request, bundle)
-        shadow = tuple(value.evidence for value in selected)
-        report = compare_retrievals(
-            request.query,
-            official,
-            shadow,
-            k=request.top_k,
-            official_elapsed_ms=official_ms,
-            shadow_elapsed_ms=(perf_counter() - started) * 1000,
-            shadow_diagnostics=dict(self.evidence.last_diagnostics),
-        )
-        self.last_diagnostics["shadow"] = report
-        if self.report_store is not None:
-            self.last_diagnostics["shadow_report"] = str(self.report_store.write(request.request_id, report))
-
     def retrieve(self, query: str, **kwargs: Any) -> dict[str, Any]:
         official_kwargs = dict(kwargs)
         workspace_id = official_kwargs.pop("workspace_id", None)
@@ -166,32 +111,19 @@ class UnifiedKnowledgeService:
             workspace_id=str(workspace_id) if workspace_id is not None else None,
             scope_version=int(scope_version) if scope_version is not None else None,
         )
-        started = perf_counter()
-        if self.official_engine_name == "lightrag":
-            assert self.official_engine is not None
-            if getattr(self.official_engine, "serving_generation_id", None) != self.official_generation_id:
-                raise RuntimeError("LightRAG Engine 与 Official Generation Pin 不一致。")
-            candidates = tuple(self.official_engine.retrieve_candidates(request))
-            governed, candidates = self._govern_candidates(request, candidates)
-            result: dict[str, Any] = {
-                "retriever": "lightrag",
-                "results": governed,
-                "result_count": len(governed),
-            }
-        else:
-            result = self.official_runtime.retrieve(query, **official_kwargs)
-            raw = result.get("results") if isinstance(result, dict) else None
-            values = [value for value in raw if isinstance(value, dict)] if isinstance(raw, list) else []
-            governed, candidates = self._govern(request, values)
-        official_ms = (perf_counter() - started) * 1000
+        result = self.official_runtime.retrieve(query, **official_kwargs)
+        raw = result.get("results") if isinstance(result, dict) else None
+        values = [value for value in raw if isinstance(value, dict)] if isinstance(raw, list) else []
+        governed, _ = self._govern(request, values)
         self.last_diagnostics = {
             **dict(getattr(self.official_runtime, "last_diagnostics", {})),
-            "official_engine": self.official_engine_name,
-            "official_generation_id": self.official_generation_id,
-            "active_engine": self.official_engine_name,
+            "retrieval_backend": (
+                "hierarchical"
+                if str(result.get("retriever") or "").startswith("hierarchical")
+                else "hybrid"
+            ),
             "evidence_intelligence": dict(self.evidence.last_diagnostics),
         }
-        self._shadow(request, candidates, official_ms)
         return {**result, "results": governed, "result_count": len(governed)}
 
     def retrieve_multi(
@@ -210,11 +142,10 @@ class UnifiedKnowledgeService:
             )
         )
         if not normalized_queries:
-            return {"retriever": f"unified_{self.official_engine_name}", "results": [], "result_count": 0}
+            return {"retriever": "unified_legacy_hybrid", "results": [], "result_count": 0}
         normalized_filters = dict(paper_filters or {})
         if (
-            self.official_engine_name == "legacy"
-            and hasattr(self.official_runtime, "retrieve_multi")
+            hasattr(self.official_runtime, "retrieve_multi")
             and not normalized_filters
         ):
             query = normalized_queries[0]
@@ -224,20 +155,19 @@ class UnifiedKnowledgeService:
                 workspace_id=workspace_id,
                 scope_version=scope_version,
             )
-            started = perf_counter()
             result = self.official_runtime.retrieve_multi(normalized_queries, limit=limit, rrf_k=rrf_k)
             raw = result.get("results") if isinstance(result, dict) else None
             values = [value for value in raw if isinstance(value, dict)] if isinstance(raw, list) else []
             governed, candidates = self._govern(request, values)
-            official_ms = (perf_counter() - started) * 1000
             self.last_diagnostics = {
                 **dict(getattr(self.official_runtime, "last_diagnostics", {})),
-                "official_engine": "legacy",
-                "official_generation_id": None,
-                "active_engine": "legacy",
+                "retrieval_backend": (
+                    "hierarchical"
+                    if str(result.get("retriever") or "").startswith("hierarchical")
+                    else "hybrid"
+                ),
                 "evidence_intelligence": dict(self.evidence.last_diagnostics),
             }
-            self._shadow(request, candidates, official_ms)
             return {**result, "results": governed, "result_count": len(governed)}
         merged: list[dict[str, Any]] = []
         per_query: list[dict[str, Any]] = []
@@ -319,9 +249,8 @@ def build_legacy_unified_service(
     runtime: Any,
     *,
     supports_advanced_retrieval: bool = False,
-    shadow_engine: Any | None = None,
 ) -> UnifiedKnowledgeService:
-    """生产组装点：Agent 只接收本服务，不接收具体旧 RAG runtime。"""
+    """生产组装点：Agent 只接收 Legacy Hybrid RAG 服务。"""
 
     from app.corpus import CanonicalCorpusService
     from app.workspaces import WorkspaceService
@@ -338,8 +267,6 @@ def build_legacy_unified_service(
     return UnifiedKnowledgeService(
         runtime,
         evidence,
-        shadow_engine=shadow_engine,
-        report_store=ShadowReportStore(project_root),
         scope_version=workspace.scope_version,
         supports_advanced_retrieval=supports_advanced_retrieval,
     )
@@ -352,106 +279,43 @@ def build_configured_unified_service(
     *,
     llm_model_name: str,
 ) -> UnifiedKnowledgeService:
-    """生产组装点：严格按审计配置和 Generation Pin 选择引擎。"""
+    """生产组装点：固定返回唯一的 Legacy Hybrid RAG 服务。"""
 
-    from app.corpus import CanonicalCorpusService
-    from app.knowledge_engine.generations import IndexGenerationRepository
-    from app.knowledge_engine.lightrag_engine import LightRAGKnowledgeEngine
-    from app.knowledge_engine.model_bridge import build_lightrag_client_config
-    from app.knowledge_engine.serving import KnowledgeServingConfigRepository
-    from app.workspaces import WorkspaceService
-
-    root = project_root.expanduser().resolve()
-    serving = KnowledgeServingConfigRepository(root)
-    config = serving.load()
-    generations = IndexGenerationRepository(root)
-    corpus = CanonicalCorpusService(root)
-    workspaces = WorkspaceService(root, corpus=corpus)
-    workspace = workspaces.ensure_default()
-    evidence = EvidenceIntelligencePipeline(
-        corpus,
-        workspaces,
-        max_candidates_per_document=100,
-        max_selected_per_document=100,
-    )
-
-    def require_pin(generation_id: str | None) -> Any:
-        if not generation_id:
-            raise ValueError("LightRAG 服务配置缺少 Generation Pin。")
-        generation = generations.get(generation_id)
-        if generation is None or generation.state not in {"active", "retired"}:
-            raise ValueError(f"Pinned Generation 不可服务：{generation_id}")
-        if generation.workspace_id != workspace.workspace_id:
-            raise PermissionError("Pinned Generation workspace 不匹配。")
-        return generation
-
-    client_config = None
-
-    def lightrag(generation_id: str | None) -> Any:
-        nonlocal client_config
-        require_pin(generation_id)
-        if client_config is None:
-            client_config, _ = build_lightrag_client_config(
-                legacy_runtime.embedding_provider,
-                completion_provider,
-                llm_model_name=llm_model_name,
-            )
-        return LightRAGKnowledgeEngine(
-            root,
-            corpus=corpus,
-            workspaces=workspaces,
-            generations=generations,
-            client_config=client_config,
-            serving_generation_id=generation_id,
-        )
-
-    official_engine = (
-        lightrag(config.official_generation_id)
-        if config.official_engine == "lightrag"
-        else None
-    )
-    if config.official_engine == "lightrag":
-        latest = serving.audit_records()[-1:] or ()
-        if not latest:
-            raise PermissionError("LightRAG Official 缺少 Cutover 审计。")
-        record = latest[0]
-        details = record.get("details")
-        target = record.get("to")
-        accepted_operation = record.get("operation") == "rollback_previous" or (
-            record.get("operation") == "cutover"
-            and isinstance(details, dict)
-            and details.get("acceptance_passed") is True
-        )
-        if (
-            not accepted_operation
-            or not isinstance(target, dict)
-            or target.get("official_engine") != "lightrag"
-            or target.get("official_generation_id")
-            != config.official_generation_id
-        ):
-            raise PermissionError("LightRAG Official 配置没有匹配的合格审计记录。")
-    shadow: Any | None = None
-    if config.shadow_engine == "lightrag":
-        shadow = lightrag(config.shadow_generation_id)
-    elif config.shadow_engine == "legacy":
-        shadow = legacy_runtime
-    return UnifiedKnowledgeService(
-        legacy_runtime,
-        evidence,
-        official_engine_name=config.official_engine,
-        official_engine=official_engine,
-        official_generation_id=config.official_generation_id,
-        shadow_engine=shadow,
-        shadow_engine_name=config.shadow_engine,
-        shadow_generation_id=config.shadow_generation_id,
-        report_store=ShadowReportStore(root),
-        workspace_id=workspace.workspace_id,
-        scope_version=workspace.scope_version,
-        supports_advanced_retrieval=config.official_engine == "lightrag",
-    )
+    # ``completion_provider`` and ``llm_model_name`` remain accepted so existing
+    # composition roots keep a stable call signature; generation belongs to the
+    # Agent/application layer, not to retrieval.
+    del completion_provider, llm_model_name
+    return build_legacy_unified_service(project_root, legacy_runtime)
 
 
 def legacy_advanced_capability(runtime: Any) -> bool:
-    """仅供尚未迁移的测试/嵌入式调用；生产组装不依赖该旧标志。"""
+    """兼容旧调用点；当前 Hybrid RAG 不暴露专用后端能力开关。"""
 
-    return bool(getattr(runtime, "is_" + "graphrag", False))
+    return bool(getattr(runtime, "supports_advanced_retrieval", False))
+
+
+def knowledge_runtime_status(project_root: Path) -> dict[str, Any]:
+    """Return the public, backend-independent retrieval status."""
+
+    root = project_root.expanduser().resolve()
+    from app.knowledge.corpus import knowledge_index_readiness
+
+    index_status = knowledge_index_readiness(root)
+    return {
+        "retrieval_backend": "hierarchical",
+        "retrieval_components": [
+            "paper_level_bm25",
+            "paper_level_bge_m3_dense",
+            "paper_level_rrf",
+            "per_paper_content_bm25",
+            "per_paper_content_bge_m3_dense",
+            "per_paper_content_rrf",
+            "cross_encoder_reranker",
+            "evidence_governance",
+        ],
+        "dense_index_present": (root / "data" / "index" / "qdrant_dense").is_dir(),
+        "paper_dense_index_present": (
+            root / "data" / "index" / "qdrant_papers_dense"
+        ).is_dir(),
+        "knowledge_index": index_status,
+    }

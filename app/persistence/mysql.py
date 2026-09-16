@@ -174,7 +174,11 @@ class MySQLKnowledgeRepository:
             "pdf_path": str(value.get("pdf_path") or "") or None,
             "source_sha256": str(value.get("source_sha256") or "") or None,
             "status": str(value.get("status") or "indexed"),
-            "metadata_json": _json(dict(value.get("metadata") or {})),
+            "metadata_json": _json({
+                **dict(value.get("metadata") or {}),
+                "publication_date": value.get("publication_date"),
+                "venue": value.get("venue"),
+            }),
             "index_epoch": str(value.get("index_epoch") or "") or None,
             "created_time": now,
             "updated_time": now,
@@ -309,6 +313,10 @@ class MySQLKnowledgeRepository:
         value["authors"] = _decode(value.pop("authors_json", None), [])
         value["keywords"] = _decode(value.pop("keywords_json", None), [])
         value["metadata"] = _decode(value.pop("metadata_json", None), {})
+        metadata_value = value["metadata"]
+        if isinstance(metadata_value, dict):
+            value["publication_date"] = metadata_value.get("publication_date")
+            value["venue"] = metadata_value.get("venue")
         return value
 
     @staticmethod

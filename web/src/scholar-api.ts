@@ -6,6 +6,31 @@ export type ScholarRequest = {
   thread_id?: string;
 };
 
+export type AsyncScholarRunRequest = ScholarRequest & {
+  metadata?: Record<string, unknown>;
+  idempotency_key?: string;
+};
+
+export type AsyncScholarRun = {
+  run_id: string;
+  session_id: string;
+  project_id: string;
+  thread_id: string;
+  trace_id: string;
+  status: string;
+  job_id?: string;
+  job_status?: string;
+  event_cursor?: number;
+  error?: string | null;
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  title?: string | null;
+  task_type?: string | null;
+  detail_available?: boolean;
+  availability_message?: string | null;
+};
+
 export type ScholarRunEvent = {
   event_id: string;
   cursor?: number;
@@ -27,6 +52,26 @@ export type ScholarRunSnapshot = {
   result: Record<string, any>;
   harness: Record<string, any>;
   termination_reason: string | null;
+  async_run?: Record<string, any>;
+  orchestration_backend?: string;
+};
+
+export type ScholarManuscript = {
+  project_id: string;
+  root_tex: string;
+  project_hash: string;
+  version: number;
+  stale_sections: string[];
+  sections: Array<Record<string, any>>;
+  latest_build?: Record<string, any> | null;
+  pdf_available: boolean;
+  pdf_path?: string | null;
+  pdf_url?: string | null;
+  manuscript_available?: boolean;
+  message?: string;
+  facts?: Array<Record<string, any>>;
+  contributions?: Array<Record<string, any>>;
+  patches?: Array<Record<string, any>>;
 };
 
 export type ScholarDemoPayload = {
@@ -65,6 +110,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const scholarApi = {
   runtime: () => request<Record<string, any>>("/api/scholar/runtime/status"),
+  systemStatus: () => request<Record<string, any>>("/api/system/status"),
   request: (payload: ScholarRequest) =>
     request<ScholarResult>("/api/scholar/requests", {
       method: "POST",
@@ -79,12 +125,36 @@ export const scholarApi = {
     }),
   snapshot: (runId: string) => request<ScholarRunSnapshot>(`/api/scholar/runs/${encodeURIComponent(runId)}`),
   project: (projectId: string) => request<Record<string, any>>(`/api/scholar/projects/${encodeURIComponent(projectId)}/state`),
+  manuscript: (projectId: string) => request<ScholarManuscript>(`/api/scholar/projects/${encodeURIComponent(projectId)}/manuscript`),
+  initializeManuscript: (projectId: string) => request<ScholarManuscript>(`/api/scholar/projects/${encodeURIComponent(projectId)}/manuscript/initialize`, { method: "POST" }),
+  requestBuild: (projectId: string, patchId?: string) => {
+    const query = patchId ? `?patch_id=${encodeURIComponent(patchId)}` : "";
+    return request<Record<string, any>>(`/api/scholar/projects/${encodeURIComponent(projectId)}/build${query}`, { method: "POST" });
+  },
   evidence: (projectId: string, runId?: string) => {
     const query = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
     return request<Record<string, any>>(`/api/scholar/projects/${encodeURIComponent(projectId)}/evidence${query}`);
   },
   evaluation: (runId: string) => request<Record<string, any>>(`/api/scholar/runs/${encodeURIComponent(runId)}/evaluation`),
   demo: () => request<ScholarDemoPayload>('/api/scholar/demo'),
+  createRun: (payload: AsyncScholarRunRequest) =>
+    request<AsyncScholarRun>('/api/scholar/runs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  runs: () => request<{ runs: AsyncScholarRun[] }>('/api/scholar/runs'),
+  projects: () => request<{ projects: Array<Record<string, any>> }>('/api/scholar/projects'),
+  approvals: () => request<{ approvals: Array<Record<string, any>> }>('/api/scholar/approvals'),
+  workers: () => request<Record<string, any>>('/api/scholar/workers/status'),
+  metrics: () => request<Record<string, any>>('/api/metrics'),
+  cancelRun: (runId: string) => request<AsyncScholarRun>(`/api/scholar/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' }),
+  stopRun: (runId: string) => request<AsyncScholarRun>(`/api/scholar/runs/${encodeURIComponent(runId)}/stop`, { method: 'POST' }),
+  resumeRun: (runId: string, resumeValue?: unknown) => request<AsyncScholarRun>(`/api/scholar/runs/${encodeURIComponent(runId)}/resume`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ resume_value: resumeValue }),
+  }),
   patch: (patchId: string) => request<Record<string, any>>(`/api/scholar/patches/${encodeURIComponent(patchId)}`),
   approve: (patchId: string, payload: { project_id: string; expected_base_hash: string; actor: string }) =>
     request<Record<string, any>>(`/api/scholar/patches/${encodeURIComponent(patchId)}/accept`, {

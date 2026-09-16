@@ -1,7 +1,7 @@
 """阶段一冻结的统一知识服务领域契约。
 
-这些类型只表达跨模块语义，不依赖 Qdrant、Neo4j、FTS、GraphRAG 或
-Agentic Service。阶段一不要求现有业务对象立即迁移到这些类型。
+这些类型只表达跨模块语义，不依赖 Qdrant、FTS 或 Agentic Service。
+阶段一不要求现有业务对象立即迁移到这些类型。
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ EvidenceGrade = Literal[
     "primary",
     "candidate",
     "analogy",
-    "graph_inference",
+    "inferred",
 ]
 EvidenceSourceType = Literal["LOCAL_CORPUS", "WEB_LITERATURE"]
 ExternalLocatorType = Literal["ABSTRACT", "FULLTEXT_SPAN"]
@@ -455,7 +455,7 @@ class IndexProfile:
     """索引和查询阶段共同引用的显式配置快照。"""
 
     profile_id: str
-    engine: str = "lightrag"
+    engine: str = "legacy_hybrid"
     query_mode: Literal["local", "global", "hybrid", "naive", "mix"] = "mix"
     top_k: int = 10
     chunk_top_k: int = 20

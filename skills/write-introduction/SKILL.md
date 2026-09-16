@@ -27,6 +27,11 @@ when relevant. Delegate each need through `ResearchRequest` and the local
 `ResearchCapabilityService`. External literature claims require verified evidence and a stable
 citation key or an explicit citation requirement.
 
+An Introduction must cite at least 5 distinct papers. Distinctness is counted by stable paper
+identity (`paper_id`, or the canonical external identity when there is no local paper id), not by
+Chunk count, Evidence count, or duplicate BibKeys. The research budget must first recall a broad
+Paper-Level shortlist and then obtain verified content evidence within that shortlist.
+
 ## Workflow
 
 ```text
@@ -46,6 +51,8 @@ Do not create or confirm Contributions, modify Manuscript Facts, invent evidence
 citation keys, use Web Research, access retrieval internals, or write any manuscript file.
 Preserve unrelated Introduction text in REVISE mode. Contributions must come only from the
 user-confirmed registry, and external academic claims must remain traceable to verified evidence.
+The runtime must not create or register a DraftPatch when fewer than 5 distinct paper identities
+are citation-bound in the final draft.
 
 ## Completion Criteria
 

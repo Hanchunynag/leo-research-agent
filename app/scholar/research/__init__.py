@@ -31,7 +31,7 @@ from app.scholar.research.models import (
     SectionSearchResult,
     VerifiedEvidenceResult,
 )
-from app.scholar.research.service import ResearchCapabilityService
+from app.scholar.research.service import ResearchCapabilityService, ResearchProgressCallback
 from app.scholar.research.web import WebLiteratureAdapter, canonical_identity
 
 __all__ = [
@@ -45,6 +45,7 @@ __all__ = [
     "ResearchBudget",
     "ResearchCapabilityError",
     "ResearchCapabilityService",
+    "ResearchProgressCallback",
     "ResearchRequest",
     "ResearchRequestError",
     "SectionCandidate",

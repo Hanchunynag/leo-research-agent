@@ -1,4 +1,4 @@
-"""Run PaddleOCR-VL formula recognition in the isolated PaddleOCR venv."""
+"""Run lightweight PaddleOCR formula recognition in the isolated venv."""
 
 from __future__ import annotations
 
@@ -30,19 +30,27 @@ def main() -> None:
     if not isinstance(manifest, list):
         raise RuntimeError("公式恢复 manifest 必须是 JSON 数组。")
 
-    # Do not override PADDLE_PDX_CACHE_HOME here. The validated PaddleOCR-VL
-    # model is installed in the user's standard ~/.paddlex cache. The parent
-    # process still passes --cache-home for audit compatibility, but changing
-    # the model cache root would hide the existing local model.
+    # Keep model downloads inside the mounted project data directory. This is
+    # also the Docker runtime path, so PaddleOCR-VL never depends on a host
+    # user's ~/.paddlex cache or another local Python environment.
     args.cache_home.mkdir(parents=True, exist_ok=True)
+    import os
 
-    from paddleocr import PaddleOCRVL, __version__
+    os.environ["PADDLE_PDX_CACHE_HOME"] = str(args.cache_home.resolve())
 
-    pipeline = PaddleOCRVL(
+    from paddleocr_compat import enable_headless_opencv_compat
+
+    enable_headless_opencv_compat()
+
+    from paddleocr import FormulaRecognitionPipeline, __version__
+
+    # FormulaRecognitionPipeline uses the dedicated LaTeX formula model and
+    # does not load the 0.9B PaddleOCR-VL language model. This keeps formula
+    # fallback usable on ordinary CPU Docker deployments.
+    pipeline = FormulaRecognitionPipeline(
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_layout_detection=False,
-        use_ocr_for_image_block=False,
         device=args.device,
     )
     for item in manifest:
@@ -57,37 +65,30 @@ def main() -> None:
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_layout_detection=False,
-                use_ocr_for_image_block=False,
-                prompt_label="formula",
-                format_block_content=True,
-                max_new_tokens=1024,
             )
             if not results:
-                raise RuntimeError("PaddleOCR-VL 未返回公式识别结果。")
+                raise RuntimeError("PaddleOCR 公式管线未返回识别结果。")
             payload = results[0].json
             if isinstance(payload, dict) and isinstance(payload.get("res"), dict):
                 payload = payload["res"]
-            parsing = payload.get("parsing_res_list", [])
+            parsing = payload.get("formula_res_list", [])
             latex = None
             if isinstance(parsing, list):
                 for parsing_item in parsing:
-                    if (
-                        isinstance(parsing_item, dict)
-                        and parsing_item.get("block_label") == "formula"
-                    ):
+                    if isinstance(parsing_item, dict):
                         latex = _normalize_formula(
-                            parsing_item.get("block_content")
+                            parsing_item.get("rec_formula")
                         )
                         if latex:
                             break
             if not latex:
-                raise RuntimeError("PaddleOCR-VL 未返回可用公式 LaTeX。")
+                raise RuntimeError("PaddleOCR 公式管线未返回可用 LaTeX。")
             result = {
                 "done": True,
                 "paddleocr_version": __version__,
                 "input_image": str(input_image.resolve()),
                 "latex": latex,
-                "prompt_label": "formula",
+                "engine": "FormulaRecognitionPipeline",
             }
         except Exception as error:
             result = {

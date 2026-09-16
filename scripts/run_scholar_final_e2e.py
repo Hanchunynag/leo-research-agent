@@ -36,7 +36,11 @@ from app.indexing.paper import load_paper_records, papers_digest
 from app.indexing.paper_dense import load_paper_dense_manifest
 from app.scholar.approval import LatexBridgeService, PatchApprovalRequest, PatchApprovalService
 from app.scholar.composition import ScholarRuntimeFactory
-from app.scholar.evaluation import HarnessEvaluationCase, ScholarHarnessEvaluationSuite
+from app.orchestration.evaluation import (
+    OrchestrationEvaluationCase,
+    default_orchestration_cases,
+    evaluate_backend,
+)
 from app.scholar.models import Contribution, ManuscriptFact
 from app.retrieval.search import load_chunks
 from app.web.runtime import WebRuntimeConfig
@@ -68,7 +72,339 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Apply the generated Introduction DraftPatch through Human Approval.",
     )
+    parser.add_argument(
+        "--fixture-provider",
+        action="store_true",
+        help="Use a deterministic local-compatible model provider; keep all Scholar domain services real.",
+    )
+    parser.add_argument(
+        "--orchestration-backend",
+        choices=("legacy", "crewai"),
+        default=None,
+        help="Top-level orchestration backend; defaults to ORCHESTRATION_BACKEND or crewai in production.",
+    )
     return parser
+
+
+class _DeterministicFixtureProvider:
+    """Local-compatible model boundary for the offline Production E2E.
+
+    Only model responses are deterministic. Research, writing services,
+    review, persistence, approval, and artifact bridge remain the production
+    composition supplied by ``ScholarRuntimeFactory``.
+    """
+
+    model_name = "fixture/local-release"
+
+    def __init__(self) -> None:
+        self._runs: dict[str, dict[str, bool]] = {}
+        self._legacy_research_calls: dict[str, int] = {}
+        self._legacy_review_calls: dict[str, int] = {}
+
+    @staticmethod
+    def _tool_names(tools: Any) -> set[str]:
+        names: set[str] = set()
+        for item in tools if isinstance(tools, (list, tuple)) else ():
+            if not isinstance(item, dict):
+                continue
+            function = item.get("function")
+            if isinstance(function, dict) and function.get("name"):
+                names.add(str(function["name"]))
+            elif item.get("name"):
+                names.add(str(item["name"]))
+        return names
+
+    @staticmethod
+    def _tool_response(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": f"fixture-{name}",
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": json.dumps(
+                                        arguments,
+                                        ensure_ascii=False,
+                                        separators=(",", ":"),
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    @staticmethod
+    def _text_response(content: str) -> dict[str, Any]:
+        return {
+            "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    @staticmethod
+    def _introduction_response(messages: list[dict[str, Any]]) -> str:
+        payload: dict[str, Any] = {}
+        if messages and isinstance(messages[-1].get("content"), str):
+            try:
+                value = json.loads(messages[-1]["content"])
+                if isinstance(value, dict):
+                    payload = value
+            except json.JSONDecodeError:
+                pass
+        current = str(payload.get("current_introduction") or "").rstrip()
+        statement = (
+            "The study evaluates explicit ephemeris-error compensation before "
+            "receiver-state estimation."
+        )
+        content = current if statement in current else f"{current}\n\n{statement}"
+        return json.dumps(
+            {
+                "content": content.strip(),
+                "claim_ids": ["contribution:CONTRIB_DEMO_EPHEMERIS"],
+                "evidence_ids": [],
+                "citation_keys": [],
+                "citation_binding_ids": [],
+                "contribution_ids": ["CONTRIB_DEMO_EPHEMERIS"],
+                "change_summary": "Add the confirmed contribution to the introduction.",
+                "warnings": [],
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _synthesis_response(messages: list[dict[str, Any]], section: str) -> str:
+        payload: dict[str, Any] = {}
+        if messages and isinstance(messages[-1].get("content"), str):
+            try:
+                value = json.loads(messages[-1]["content"])
+                if isinstance(value, dict):
+                    payload = value
+            except json.JSONDecodeError:
+                pass
+        current = str(payload.get("current_section") or "").rstrip()
+        statement = (
+            "The study evaluates explicit ephemeris-error compensation before "
+            "receiver-state estimation."
+        )
+        content = current if statement in current else f"{current}\n\n{statement}"
+        return json.dumps(
+            {
+                "content": content.strip(),
+                "claim_ids": [],
+                "contribution_ids": ["CONTRIB_DEMO_EPHEMERIS"],
+                "change_summary": f"Add the confirmed contribution to the {section}.",
+                "warnings": [],
+            },
+            ensure_ascii=False,
+        )
+
+    def chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: Any = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        system = "\n".join(
+            str(value.get("content") or "")
+            for value in messages
+            if isinstance(value, dict) and value.get("role") == "system"
+        )
+        if "Introduction editor" in system:
+            return self._text_response(self._introduction_response(messages))
+        if "scientific conclusion editor" in system:
+            return self._text_response(self._synthesis_response(messages, "conclusion"))
+        if "scientific abstract editor" in system:
+            return self._text_response(self._synthesis_response(messages, "abstract"))
+        if "Return only JSON" in system and '"issues"' in system:
+            return self._text_response('{"issues":[]}')
+
+        # CrewAI sends each specialist's role/contract in the generated
+        # prompt.  Keep this provider deterministic for offline CrewAI Flow
+        # validation while the actual domain providers remain exercised.
+        crew_prompt = "\n".join(
+            str(value.get("content") or "")
+            for value in messages
+            if isinstance(value, dict)
+        ).casefold()
+        if "scholar supervisor agent" in crew_prompt:
+            selected_route = "RESEARCH"
+            for field in ('"deterministic_route": "', '"selected_route": "'):
+                start = crew_prompt.find(field)
+                if start < 0:
+                    continue
+                value = crew_prompt[start + len(field) :].split('"', 1)[0].upper()
+                if value in {
+                    "SUPPORT_CLAIM",
+                    "WRITE_INTRODUCTION",
+                    "WRITE_CONCLUSION",
+                    "WRITE_ABSTRACT",
+                    "REVIEW",
+                    "RESEARCH",
+                }:
+                    selected_route = value
+                    break
+            return self._text_response(
+                json.dumps(
+                    {
+                        "status": "COMPLETED",
+                        "selected_route": selected_route,
+                        "final_answer": "fixture completed",
+                        "approval_required": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if "research agent" in crew_prompt:
+            return self._text_response(
+                json.dumps(
+                    {
+                        "status": "COMPLETED",
+                        "research_summary": "fixture research completed",
+                        "evidence": [],
+                        "citations": [],
+                        "unresolved_claims": [],
+                        "contradictions": [],
+                        "freshness_status": "LOCAL_ONLY",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if "writer agent" in crew_prompt:
+            return self._text_response(
+                json.dumps(
+                    {
+                        "status": "READY",
+                        "research_required": False,
+                        "missing_context": [],
+                        "used_evidence": [],
+                        "warnings": [],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        if "reviewer agent" in crew_prompt:
+            return self._text_response(
+                json.dumps(
+                    {
+                        "decision": "PASS",
+                        "issues": [],
+                        "unsupported_claims": [],
+                        "citation_issues": [],
+                        "fact_conflicts": [],
+                        "revision_instructions": [],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        names = self._tool_names(tools)
+        if "research_evidence" in names and "Research Subagent" in system:
+            # Deep Agents calls the same isolated subagent repeatedly until
+            # it returns a final message.  The fixture must therefore model a
+            # bounded subagent conversation instead of emitting the same tool
+            # call forever.  The tool itself remains the real Legacy
+            # ResearchCapability adapter and records each returned pack.
+            research_key = "introduction" if "Introduction run" in system else "support"
+            research_limit = 3 if research_key == "introduction" else 1
+            research_calls = self._legacy_research_calls.get(research_key, 0)
+            if research_calls >= research_limit:
+                return self._text_response("bounded research completed")
+            self._legacy_research_calls[research_key] = research_calls + 1
+            return self._tool_response(
+                "research_evidence",
+                {"query": "LEO ephemeris-error compensation", "purpose": "background"},
+            )
+        if "review_draft" in names and "Reviewer Subagent" in system:
+            review_prompt = "\n".join(
+                str(value.get("content") or "")
+                for value in messages
+                if isinstance(value, dict)
+            )
+            review_key = str(
+                next(
+                    (
+                        value
+                        for value in (
+                            "WRITE_INTRODUCTION",
+                            "WRITE_CONCLUSION",
+                            "WRITE_ABSTRACT",
+                        )
+                        if value in f"{system}\n{review_prompt}"
+                    ),
+                    "review",
+                )
+            )
+            if self._legacy_review_calls.get(review_key, 0) >= 1:
+                return self._text_response("bounded review completed")
+            self._legacy_review_calls[review_key] = 1
+            return self._tool_response(
+                "review_draft",
+                {"task_type": "WRITE_INTRODUCTION", "draft": "fixture draft"},
+            )
+
+        selected_task = next(
+            (
+                task
+                for task in (
+                    "WRITE_INTRODUCTION",
+                    "SUPPORT_CLAIM",
+                    "WRITE_CONCLUSION",
+                    "WRITE_ABSTRACT",
+                )
+                if f"selected task is {task}" in system
+            ),
+        )
+        if selected_task is None:
+            return self._text_response("fixture completed")
+        state = self._runs.setdefault(
+            selected_task,
+            {"context": False, "research": False, "execute": False, "review": False},
+        )
+        if "get_project_context" in names and not state["context"]:
+            state["context"] = True
+            return self._tool_response("get_project_context", {})
+        if (
+            "task" in names
+            and not state["research"]
+            and selected_task in {"WRITE_INTRODUCTION", "SUPPORT_CLAIM"}
+        ):
+            state["research"] = True
+            return self._tool_response(
+                "task",
+                {
+                    "description": "Research the bounded local evidence.",
+                    "subagent_type": "research",
+                },
+            )
+        if "execute_scholar_skill" in names and not state["execute"]:
+            state["execute"] = True
+            return self._tool_response(
+                "execute_scholar_skill",
+                {"task_type": selected_task, "instruction": "execute the selected skill"},
+            )
+        if (
+            "task" in names
+            and not state["review"]
+            and selected_task in {"WRITE_INTRODUCTION", "WRITE_CONCLUSION", "WRITE_ABSTRACT"}
+        ):
+            state["review"] = True
+            return self._tool_response(
+                "task",
+                {
+                    "description": "Review the proposed draft.",
+                    "subagent_type": "reviewer",
+                },
+            )
+        return self._text_response("fixture completed")
 
 
 def _load_provider_environment(env_root: Path) -> AgenticRAGConfig:
@@ -264,57 +600,25 @@ def _seed_project(store: Any) -> None:
     )
 
 
-def _cases(project_id: str) -> tuple[HarnessEvaluationCase, ...]:
-    cases = (
-        HarnessEvaluationCase(
-            "support-claim",
-            "Can local LEO literature support the claim that explicit ephemeris-error compensation improves positioning estimates?",
-            project_id,
-            "support-claim",
-            True,
-            True,
-            "ClaimSupportResult",
-            False,
-            task_type="SUPPORT_CLAIM",
-        ),
-        HarnessEvaluationCase(
-            "introduction",
-            "Write an evidence-grounded introduction about ephemeris-error compensation for LEO signals-of-opportunity positioning.",
-            project_id,
-            "write-introduction",
-            None,
-            True,
-            "WritingResult",
-            True,
-            task_type="WRITE_INTRODUCTION",
-        ),
-        HarnessEvaluationCase(
-            "conclusion",
-            "Write a conclusion using only the current manuscript, confirmed facts, and confirmed contribution.",
-            project_id,
-            "write-conclusion",
-            False,
-            False,
-            "WritingResult",
-            True,
-            task_type="WRITE_CONCLUSION",
-        ),
-        HarnessEvaluationCase(
-            "abstract",
-            "Write an abstract using only the latest full manuscript state and confirmed numerical or qualitative results.",
-            project_id,
-            "write-abstract",
-            False,
-            False,
-            "WritingResult",
-            True,
-            task_type="WRITE_ABSTRACT",
-        ),
-    )
-    return cases
+def _cases(project_id: str) -> tuple[OrchestrationEvaluationCase, ...]:
+    return default_orchestration_cases(project_id)
 
 
 def _result_summary(result: Any) -> dict[str, Any]:
+    if hasattr(result, "backend"):
+        return {
+            "status": result.status,
+            "backend": result.backend,
+            "selected_route": result.selected_route,
+            "error_codes": list(result.error_codes),
+            "patch_id": (
+                result.pending_action.get("patch_id")
+                if isinstance(result.pending_action, dict)
+                else None
+            ),
+            "approval_required": result.approval_required,
+            "trace_id": result.trace_id,
+        }
     value = getattr(result, "value", None)
     patch = getattr(value, "patch", None)
     return {
@@ -343,7 +647,12 @@ def main() -> int:
     _link_optional(project_root, "skills", args.skills_root)
     _prepare_local_indexes(project_root)
 
-    base_config = _load_provider_environment(args.env_root)
+    fixture_provider = _DeterministicFixtureProvider() if args.fixture_provider else None
+    base_config = (
+        AgenticRAGConfig.from_environment(project_root / ".env")
+        if fixture_provider is not None
+        else _load_provider_environment(args.env_root)
+    )
     checkpoint = project_root / "data" / "runtime" / "scholar" / "checkpoint.sqlite"
     config = replace(
         base_config,
@@ -351,13 +660,18 @@ def main() -> int:
         scholar_checkpoint_path=checkpoint,
     )
 
-    with ScholarRuntimeFactory(project_root, config=config).open() as runtime:
+    with ScholarRuntimeFactory(
+        project_root,
+        config=config,
+        model=fixture_provider,
+        orchestration_backend=args.orchestration_backend,
+    ).open() as runtime:
         _seed_project(runtime.project_store)
         cases = _cases(runtime.project_store.project_id)
         results: list[Any] = []
         summaries: list[dict[str, Any]] = []
         for index, case in enumerate(cases, 1):
-            result = runtime.harness.scholar_request(
+            result = runtime.scholar_orchestration.scholar_request(
                 case.instruction,
                 runtime.project_store.project_id,
                 task_type=case.task_type,
@@ -408,12 +722,16 @@ def main() -> int:
                 "compiler_available": compiler is not None,
             }
 
-        suite = ScholarHarnessEvaluationSuite()
-        records = tuple(
-            suite.evaluate_result(case, result)
-            for case, result in zip(cases, results, strict=True)
+        backend_name = (
+            str(args.orchestration_backend or os.getenv("ORCHESTRATION_BACKEND") or "crewai")
+            .strip()
+            .lower()
         )
-        report = suite.run(cases, lambda case: results[cases.index(case)])
+        report = evaluate_backend(
+            backend_name,
+            cases,
+            lambda case: results[cases.index(case)],
+        )
         payload = {
             "production": {
                 "project_id": runtime.project_store.project_id,
@@ -423,7 +741,7 @@ def main() -> int:
             "cases": summaries,
             "evaluation": report.to_dict(),
             "approval": approval_summary,
-            "record_count": len(records),
+            "record_count": len(report.records),
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         return 0 if report.passed else 1

@@ -10,6 +10,11 @@ from typing import Any, Protocol
 from app.scholar.models import Contribution, ManuscriptFact, ReviewIssue, ReviewReport
 from app.scholar.citation.models import CitationBinding, CitationIdentity
 from app.scholar.writing.models import ClaimPlan, SectionDraft
+from app.scholar.writing.citation_coverage import (
+    INTRODUCTION_MINIMUM_UNIQUE_PAPERS,
+    citation_coverage,
+    insufficient_introduction_message,
+)
 
 
 ReviewPolicy = str
@@ -38,6 +43,7 @@ class IntroductionReviewer:
         *,
         revision_round: int = 0,
         citation_bindings: Mapping[str, CitationBinding] | None = None,
+        minimum_unique_papers: int | None = None,
     ) -> ReviewReport:
         issues: list[ReviewIssue] = []
         claim_by_id = {value.claim_id: value for value in claim_plan.claims}
@@ -78,6 +84,20 @@ class IntroductionReviewer:
         unknown_citations = set(draft.citation_keys) - known_citation_keys
         if unknown_citations:
             issues.append(_issue("FABRICATED_CITATION_KEY", "HIGH", f"Citation keys are not present in Citation Store: {sorted(unknown_citations)}."))
+
+        if minimum_unique_papers is not None:
+            coverage = citation_coverage(
+                draft.citation_keys,
+                citation_catalog,
+                evidence,
+                minimum_unique_papers=max(INTRODUCTION_MINIMUM_UNIQUE_PAPERS, minimum_unique_papers),
+            )
+            if not coverage.sufficient:
+                issues.append(_issue(
+                    "INSUFFICIENT_INTRODUCTION_CITATIONS",
+                    "BLOCKER",
+                    insufficient_introduction_message(coverage),
+                ))
 
         # A known BibKey is not enough: the binding must still point to the
         # same work as the Evidence used by the claim.  This is intentionally

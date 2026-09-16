@@ -15,6 +15,16 @@ from app.scholar.writing.models import (
     deterministic_patch_id,
     deterministic_review_report_id,
 )
+from app.scholar.writing.citation_coverage import (
+    CitationCoverage,
+    INTRODUCTION_EVIDENCE_LIMIT,
+    INTRODUCTION_MINIMUM_UNIQUE_PAPERS,
+    INTRODUCTION_PAPER_RETRIEVAL_LIMIT,
+    INTRODUCTION_SECTION_RETRIEVAL_LIMIT,
+    citation_coverage,
+    paper_identity,
+    unique_paper_identities,
+)
 from app.scholar.writing.provider import (
     ChatCompletionIntroductionWriter,
     ChatCompletionSemanticReviewJudge,
@@ -45,6 +55,14 @@ from app.scholar.writing.harness import ScholarSkillRuntime
 
 __all__ = [
     "CapabilitySet",
+    "CitationCoverage",
+    "INTRODUCTION_EVIDENCE_LIMIT",
+    "INTRODUCTION_MINIMUM_UNIQUE_PAPERS",
+    "INTRODUCTION_PAPER_RETRIEVAL_LIMIT",
+    "INTRODUCTION_SECTION_RETRIEVAL_LIMIT",
+    "citation_coverage",
+    "paper_identity",
+    "unique_paper_identities",
     "CapabilityProfile",
     "ChatCompletionIntroductionWriter",
     "ChatCompletionSemanticReviewJudge",

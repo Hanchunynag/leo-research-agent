@@ -15,7 +15,7 @@ from app.scholar.evaluation import (
     HarnessEvaluationCase,
     ScholarHarnessEvaluationSuite,
 )
-from app.scholar.harness import ScholarHarnessService
+from app.scholar.harness import ScholarHarnessService, _token_estimate
 from app.scholar.errors import CorrelationConflict, ResumeUnavailable
 from app.scholar.context import ScholarContextBudget
 from app.scholar.writing.harness import ScholarSkillRuntime
@@ -145,6 +145,42 @@ def test_harness_evaluation_rejects_failed_domain_result_with_matching_type() ->
 
     assert record.passed is False
     assert "INVALID_DOMAIN_RESULT" in record.failures
+
+
+def test_harness_evaluation_accepts_crewai_route_and_tool_metadata() -> None:
+    result = SimpleNamespace(
+        status="COMPLETED",
+        result_type="ClaimSupportResult",
+        metadata={
+            "selected_skill": "SUPPORT_CLAIM",
+            "trace": {
+                "trace": [
+                    {
+                        "kind": "tool",
+                        "name": "capability_tool_call",
+                        "status": "COMPLETED",
+                        "metadata": {"tool_name": "research_capability"},
+                    }
+                ]
+            },
+        },
+    )
+    case = HarnessEvaluationCase(
+        "crewai-claim",
+        "support claim",
+        "PROJECT",
+        "support-claim",
+        True,
+        True,
+        "ClaimSupportResult",
+        False,
+    )
+
+    record = ScholarHarnessEvaluationSuite().evaluate_result(case, result)
+
+    assert record.passed is True
+    assert record.research_invoked is True
+    assert record.reviewer_invoked is False
 
 
 def test_session_runtime_tracks_scholar_run_lifecycle(tmp_path: Path) -> None:
@@ -405,6 +441,51 @@ def test_context_budget_failure_is_a_failed_run_not_a_stale_running_run(tmp_path
     assert result.status == "FAILED"
     assert result.metadata["trace"]["termination_reason"] == "BUDGET_EXHAUSTED"
     assert manager.open("SESSION_CONTEXT_BUDGET").get_run(result.run_id).status == "FAILED"
+
+
+def test_reviewer_context_projection_deduplicates_and_bounds_evidence() -> None:
+    raw = [
+        {
+            "evidence_id": f"EVIDENCE_{index % 4}",
+            "source_type": "x" * 1_000,
+            "canonical_id": "x" * 1_000,
+            "source_locator": "x" * 1_000,
+            "locator_type": "x" * 1_000,
+            "publication_date": "x" * 1_000,
+            "provider": "x" * 1_000,
+            "paper_id": "x" * 1_000,
+            "work_id": "x" * 1_000,
+            "document_id": "x" * 1_000,
+            "section_id": "x" * 1_000,
+            "chunk_id": "x" * 1_000,
+            "evidence_grade": "x" * 1_000,
+            "directness": "x" * 1_000,
+            "content": "x" * 10_000,
+            "metadata": {
+                "title": "x" * 1_000,
+                "authors": ["x" * 1_000 for _ in range(20)],
+                "venue": "x" * 1_000,
+                "doi": "x" * 1_000,
+                "arxiv_id": "x" * 1_000,
+                "canonical_id": "x" * 1_000,
+            },
+        }
+        for index in range(12)
+    ]
+
+    projected = ScholarHarnessService._bounded_reviewer_evidence(raw)
+
+    assert [item["evidence_id"] for item in projected] == [
+        "EVIDENCE_0",
+        "EVIDENCE_1",
+        "EVIDENCE_2",
+        "EVIDENCE_3",
+    ]
+    assert all(len(str(item["content"])) == 120 for item in projected)
+    assert all(len(item.get("metadata", {}).get("authors", ())) == 4 for item in projected)
+    # The projection itself stays comfortably inside the fixed 8k reviewer
+    # audience budget even when upstream metadata is unexpectedly verbose.
+    assert _token_estimate({"evidence": projected}) < 8_000
 
 
 def test_existing_session_schema_migrates_checkpoint_reference(tmp_path: Path) -> None:

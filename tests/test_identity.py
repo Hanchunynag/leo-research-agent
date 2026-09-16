@@ -50,6 +50,27 @@ def test_unverified_metadata_has_no_work_id() -> None:
     assert identity["status"] == "unresolved"
 
 
+def test_unverified_document_can_use_file_scoped_work_identity() -> None:
+    first = build_identity(
+        paper_id="P_111111111111",
+        sha256="1" * 64,
+        metadata={"title": "Unverified"},
+        allow_document_work_identity=True,
+    )
+    second = build_identity(
+        paper_id="P_222222222222",
+        sha256="2" * 64,
+        metadata={"title": "Unverified"},
+        allow_document_work_identity=True,
+    )
+
+    assert first["document_id"] == "D_111111111111"
+    assert first["work_id"] != second["work_id"]
+    assert first["work_key"] == f"document:{'1' * 64}"
+    assert first["work_id_method"] == "document"
+    assert first["status"] == "unresolved"
+
+
 def test_canonical_pdf_filename_is_safe_readable_and_bounded() -> None:
     filename = canonical_pdf_filename('  Modeling: LEO/Signals? <A Study>  "Final"  ')
     assert filename == "Modeling LEO Signals A Study Final.pdf"

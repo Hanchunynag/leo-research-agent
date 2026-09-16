@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import sqlite3
 from threading import Event, Thread
 from typing import Any
 
@@ -63,8 +64,13 @@ class PersistentJobWorker:
         threshold = datetime.now(timezone.utc) - timedelta(
             seconds=stale_after_seconds
         )
-        self.repository.mark_interrupted(heartbeat_before=threshold.isoformat())
-        return self.repository.recover_interrupted()
+        marked = self.repository.mark_interrupted(heartbeat_before=threshold.isoformat())
+        recovered = self.repository.recover_interrupted()
+        # Return every transition caused by this recovery pass, including a
+        # stale CANCEL_REQUESTED -> CANCELLED transition.  The Scholar Run
+        # reconciler needs the final Job state to close its paired Run.
+        by_id = {job.job_id: job for job in (*marked, *recovered)}
+        return tuple(by_id.values())
 
     def _heartbeat_loop(self, job_id: str, stop: Event) -> None:
         while not stop.wait(self.heartbeat_interval_seconds):
@@ -73,8 +79,25 @@ class PersistentJobWorker:
                 self.repository.heartbeat(
                     job_id, worker_id=self.worker_id, checkpoint=checkpoint
                 )
+            except (sqlite3.OperationalError, OSError):
+                # SQLite may briefly reject a concurrent writer while the API,
+                # event store, or recovery path is committing. A transient
+                # storage error must not permanently kill the heartbeat
+                # daemon; the next interval will retry with the same durable
+                # checkpoint.
+                continue
             except (KeyError, RuntimeError):
+                # KeyError means the job disappeared. RuntimeError means the
+                # job was cancelled, recovered, or claimed by another Worker.
+                # In either case this Worker must stop heartbeating rather than
+                # overwrite the new owner or terminal state.
                 return
+
+    def _still_owned(self, job_id: str) -> JobRecord | None:
+        current = self.repository.get(job_id)
+        if current.status != "RUNNING" or current.worker_id != self.worker_id:
+            return None
+        return current
 
     def run_once(self) -> JobRecord | None:
         job = self.repository.claim_next(
@@ -104,6 +127,18 @@ class PersistentJobWorker:
                 JobExecutionContext(self.repository, job.job_id, self.worker_id),
             )
         except JobCancelled as error:
+            current = self.repository.get(job.job_id)
+            if current.status == "CANCELLED":
+                return current
+            # request_cancel intentionally changes a live Job to
+            # CANCEL_REQUESTED before the handler reaches its cooperative
+            # checkpoint. That is still this attempt's valid cancellation
+            # transition and must be finalized as CANCELLED.
+            if current.worker_id != self.worker_id or current.status not in {
+                "RUNNING",
+                "CANCEL_REQUESTED",
+            }:
+                return current
             return self.repository.set_status(
                 job.job_id,
                 "CANCELLED",
@@ -112,7 +147,12 @@ class PersistentJobWorker:
             )
         except Exception as error:
             summary = redact_sensitive_text(f"{type(error).__name__}: {error}")[:1000]
-            current = self.repository.get(job.job_id)
+            current = self._still_owned(job.job_id)
+            if current is None:
+                # Another Worker/recovery process already owns the lifecycle
+                # transition. Do not clobber its state with this old attempt's
+                # RETRY_PENDING/FAILED result.
+                return self.repository.get(job.job_id)
             status: JobStatus = (
                 "RETRY_PENDING"
                 if current.attempt < current.max_attempts
@@ -127,6 +167,8 @@ class PersistentJobWorker:
         finally:
             stop.set()
             heartbeat.join(timeout=max(0.1, self.heartbeat_interval_seconds * 2))
+        if self._still_owned(job.job_id) is None:
+            return self.repository.get(job.job_id)
         return self.repository.set_status(
             job.job_id, "SUCCEEDED", result_reference=result_reference
         )
