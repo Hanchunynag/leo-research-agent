@@ -388,6 +388,8 @@ def test_crewai_resume_reuses_original_thread_and_persisted_manager_checkpoint(
         task_type="RESEARCH",
         session_id="resume-session",
         thread_id="resume-thread",
+        tenant_id="tenant-resume",
+        principal_id="principal-resume",
         metadata={"_cancellation_checker": cancel_at_first_capability},
     )
     with pytest.raises(JobCancelled):
@@ -398,6 +400,8 @@ def test_crewai_resume_reuses_original_thread_and_persisted_manager_checkpoint(
     checkpoint = runtime.load_checkpoint(interrupted.run_id)
     assert checkpoint is not None
     assert interrupted.thread_id == "resume-thread"
+    assert interrupted.tenant_id == "tenant-resume"
+    assert interrupted.principal_id == "principal-resume"
     assert checkpoint["run_state"]["recovery_action"] == "CALL_RESEARCH"
 
     # The worker/recovery layer owns the RUNNING -> INTERRUPTED transition;
@@ -423,6 +427,95 @@ def test_crewai_resume_reuses_original_thread_and_persisted_manager_checkpoint(
     assert resumed.run_id == interrupted.run_id
     assert resumed.thread_id == "resume-thread"
     assert runtime.load_checkpoint(interrupted.run_id) is None
+
+
+def test_crewai_reviewer_checkpoint_resumes_reviewer_without_replaying_writer(
+    tmp_path: Path,
+) -> None:
+    crew_backend, research, runtime, store = make_backend(tmp_path)
+    service = ScholarOrchestrationService(backend="crewai", crewai=crew_backend)
+    capability_checks = 0
+
+    def cancel_when_reviewer_starts() -> None:
+        nonlocal capability_checks
+        capability_checks += 1
+        if capability_checks == 2:
+            raise JobCancelled("interrupt before reviewer capability")
+
+    request = OrchestrationRequest(
+        request_id="resume-reviewer-1",
+        project_id=store.project_id,
+        instruction="Write the conclusion",
+        task_type="WRITE_CONCLUSION",
+        session_id="resume-reviewer-session",
+        thread_id="resume-reviewer-thread",
+        tenant_id="tenant-reviewer",
+        principal_id="principal-reviewer",
+        metadata={"_cancellation_checker": cancel_when_reviewer_starts},
+    )
+    with pytest.raises(JobCancelled):
+        service.run(request)
+
+    session_runtime = crew_backend.session_manager.open("resume-reviewer-session")
+    interrupted = session_runtime.list_runs()[0]
+    checkpoint = session_runtime.load_checkpoint(interrupted.run_id)
+    assert checkpoint is not None
+    assert checkpoint["run_state"]["recovery_action"] == "CALL_REVIEWER"
+    assert checkpoint["run_state"]["draft_patch_id"]
+    session_runtime.complete_run(
+        interrupted.run_id,
+        status="INTERRUPTED",
+        answer="",
+        citations=[],
+        evidence=[],
+        metadata={"orchestration_status": "INTERRUPTED"},
+    )
+
+    resumed = service.resume(
+        "resume-reviewer-thread",
+        None,
+        store.project_id,
+        instruction="ignored by checkpoint resume",
+        session_id="resume-reviewer-session",
+        task_type="WRITE_CONCLUSION",
+    )
+
+    assert resumed.status == "WAITING_HUMAN_APPROVAL"
+    assert runtime.calls == ["WRITE_CONCLUSION"]
+    assert len(research.calls) == 0
+    assert any(
+        decision["next_action"] == "CALL_REVIEWER"
+        for decision in resumed.diagnostics["manager_decisions"]
+    )
+
+
+def test_checkpoint_persistence_failure_fails_closed_before_specialist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.session.runtime import SessionRuntime
+
+    crew_backend, research, runtime, store = make_backend(tmp_path)
+
+    def fail_checkpoint(*_: object, **__: object) -> str:
+        raise OSError("checkpoint store unavailable")
+
+    monkeypatch.setattr(SessionRuntime, "save_checkpoint", fail_checkpoint)
+    result = ScholarOrchestrationService(backend="crewai", crewai=crew_backend).run(
+        OrchestrationRequest(
+            request_id="checkpoint-failure-1",
+            project_id=store.project_id,
+            instruction="Find verified evidence",
+            task_type="RESEARCH",
+            session_id="checkpoint-failure-session",
+        )
+    )
+
+    assert result.status == "FAILED"
+    assert result.error_codes == ["CHECKPOINT_PERSIST_FAILED"]
+    assert research.calls == []
+    assert runtime.calls == []
+    persisted = crew_backend.session_manager.open("checkpoint-failure-session").list_runs()[0]
+    assert persisted.status == "FAILED"
 
 
 def test_crewai_trace_maps_provider_usage_and_flow_capability_calls(

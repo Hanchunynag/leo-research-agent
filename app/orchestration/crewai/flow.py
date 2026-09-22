@@ -175,8 +175,10 @@ class CrewAIOrchestrationFlow(Flow[FlowState]):
             # fresh evidence round after an interruption and turn a resumable
             # revision into an avoidable budget failure.
             recovery_action = "CALL_WRITER"
+        elif action == "CALL_REVIEWER":
+            recovery_action = "CALL_REVIEWER"
         else:
-            recovery_action = "CALL_WRITER"
+            raise ValueError(f"Unsupported checkpoint action: {action}")
         self.state.recovery_action = recovery_action
         self._backend.persist_checkpoint(self.state)
         self._trace.record(
@@ -266,6 +268,8 @@ class CrewAIOrchestrationFlow(Flow[FlowState]):
                 self.state.request, self.state.selected_route, self._research_output,
                 self._trace, review_round=self.state.review_round,
             )
+        except JobCancelled:
+            raise
         except Exception as error:
             self._trace.record(
                 "writer_failed", "FAILED",
@@ -319,11 +323,29 @@ class CrewAIOrchestrationFlow(Flow[FlowState]):
 
     def _review(self) -> ReviewAgentOutput | None:
         self._transition("REVIEWING", agent="Reviewer Agent")
+        if self._writer_output is None and hasattr(self._backend, "restore_writer_output"):
+            try:
+                self._writer_output = self._backend.restore_writer_output(self.state)
+            except Exception as error:
+                self._trace.record(
+                    "writer_handoff_restore_failed", "FAILED",
+                    {
+                        "error_type": type(error).__name__,
+                        "error_code": getattr(error, "code", "WRITER_STATE_UNAVAILABLE"),
+                        "error": redact_sensitive_text(str(error))[:1000],
+                    }, kind="flow",
+                )
+                self.state.error_codes.append(
+                    str(getattr(error, "code", "WRITER_STATE_UNAVAILABLE"))
+                )
+                return None
         try:
             output = self._backend.review(
                 self.state.request, self.state.selected_route, self._writer_output,
                 self._trace, review_round=self.state.review_round,
             )
+        except JobCancelled:
+            raise
         except Exception as error:
             self._trace.record(
                 "reviewer_failed", "FAILED",
@@ -549,6 +571,12 @@ class CrewAIOrchestrationFlow(Flow[FlowState]):
             except Exception as error:
                 self._trace.record(
                     "flow_failed", "FAILED",
-                    {"error_type": type(error).__name__, "error": redact_sensitive_text(str(error))[:1000]}, kind="flow",
+                    {
+                        "error_type": type(error).__name__,
+                        "error_code": getattr(error, "code", "ORCHESTRATION_FAILED"),
+                        "error": redact_sensitive_text(str(error))[:1000],
+                    }, kind="flow",
                 )
-                return self._fail("ORCHESTRATION_FAILED")
+                return self._fail(
+                    getattr(error, "code", "ORCHESTRATION_FAILED")
+                )

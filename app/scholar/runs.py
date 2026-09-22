@@ -236,6 +236,49 @@ class ScholarRunManager:
                     principal_id=identity.principal_id,
                 )
             except Exception:
+                # Run and Job live in separate durable stores.  If queue
+                # submission fails after Run creation, compensate the Run so
+                # the Session cannot remain blocked by an orphaned PENDING
+                # record.  Preserve and re-raise the original queue error.
+                try:
+                    runtime.complete_run(
+                        run_id,
+                        status="FAILED",
+                        answer="",
+                        citations=[],
+                        evidence=[],
+                        metadata={
+                            "backend": "crewai",
+                            "orchestration_status": "FAILED",
+                            "termination_reason": "QUEUE_SUBMISSION_FAILED",
+                        },
+                    )
+                except Exception:
+                    # The original queue error remains authoritative if the
+                    # first compensation write is itself unavailable.
+                    pass
+                try:
+                    self.event_store.append(
+                        run_id=run_id,
+                        project_id=request.project_id,
+                        session_id=session.session_id,
+                        event_type="RUN_FAILED",
+                        node="Scholar Run",
+                        status="FAILED",
+                        summary="Scholar Run failed before queue submission",
+                        metadata={
+                            "termination_reason": "QUEUE_SUBMISSION_FAILED"
+                        },
+                        event_id=f"{run_id}:queue-submission-failed",
+                    )
+                except Exception:
+                    pass
+                try:
+                    self.session_manager.clear_active_run_if(
+                        session.session_id, run_id
+                    )
+                except Exception:
+                    pass
                 raise
             if not created:
                 # The race-safe repository winner owns the Run.  Remove no

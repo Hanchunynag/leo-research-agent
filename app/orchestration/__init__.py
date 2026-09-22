@@ -25,6 +25,7 @@ from app.orchestration.evaluation import (
     default_orchestration_cases,
     evaluate_backend,
 )
+from app.orchestration.errors import CheckpointPersistenceError
 from app.orchestration.manager import (
     DecisionValidationResult,
     ManagerDecisionRejected,
@@ -39,6 +40,7 @@ __all__ = [
     "ManagerDecisionRejected",
     "ManagerDecisionValidator",
     "DecisionValidationResult",
+    "CheckpointPersistenceError",
     "RunBudget",
     "RunGoal",
     "RunState",

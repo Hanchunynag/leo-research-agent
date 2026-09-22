@@ -24,6 +24,7 @@ from app.orchestration.contracts import (
     default_run_goal,
     WriterAgentOutput,
 )
+from app.orchestration.errors import CheckpointPersistenceError
 from app.scholar.models import EvidencePack, ReviewReport
 from app.scholar.manuscript import ManuscriptSynchronizer
 from app.scholar.project import ScholarProjectStore
@@ -32,7 +33,7 @@ from app.scholar.research import (
     ResearchCapabilityService,
     ResearchRequest,
 )
-from app.scholar.writing.models import WritingRequest
+from app.scholar.writing.models import WritingRequest, WritingResult
 from app.scholar.writing.citation_coverage import (
     INTRODUCTION_EVIDENCE_LIMIT,
     INTRODUCTION_MINIMUM_UNIQUE_PAPERS,
@@ -929,6 +930,66 @@ class CrewAIBackend:
             }
         )
 
+    def restore_writer_output(self, state: Any) -> WriterAgentOutput:
+        """Rehydrate the minimal Writer handoff needed by a resumed Reviewer.
+
+        The checkpoint stores only the DraftPatch reference by design.  The
+        Project Store remains the authority for the patch and deterministic
+        ReviewReport, so a restarted Flow can rebuild the narrow contract the
+        Reviewer consumes without copying domain objects into Session state.
+        """
+
+        patch_id = str(getattr(state, "draft_patch_id", "") or "").strip()
+        if not patch_id:
+            raise SkillRuntimeError(
+                "WRITER_STATE_UNAVAILABLE",
+                "恢复 Reviewer 缺少 DraftPatch 引用。",
+            )
+        stored = self.project_store.get_patch(patch_id)
+        patch = getattr(stored, "patch", None)
+        report = getattr(stored, "review_report", None)
+        if patch is None or not isinstance(report, ReviewReport):
+            raise SkillRuntimeError(
+                "WRITER_STATE_UNAVAILABLE",
+                "恢复 Reviewer 缺少可验证的 DraftPatch/ReviewReport。",
+            )
+        if getattr(patch, "project_id", state.request.project_id) != state.request.project_id:
+            raise SkillRuntimeError(
+                "PROJECT_CONFLICT",
+                "恢复 Reviewer 的 DraftPatch 不属于当前 Project。",
+            )
+        route = getattr(state, "selected_route", None)
+        target_section = {
+            "WRITE_INTRODUCTION": "introduction",
+            "WRITE_CONCLUSION": "conclusion",
+            "WRITE_ABSTRACT": "abstract",
+        }.get(route)
+        if target_section is None:
+            raise SkillRuntimeError(
+                "WRITER_STATE_UNAVAILABLE",
+                f"恢复 Reviewer 不支持 route={route}。",
+            )
+        writing_request = WritingRequest(
+            request_id=state.request.request_id,
+            project_id=state.request.project_id,
+            instruction=state.request.instruction,
+            target_section=target_section,
+            session_id=state.request.session_id,
+            task_type=route,
+            metadata=dict(state.request.metadata),
+        )
+        domain_result = WritingResult(
+            status="READY" if report.valid else "NEEDS_USER_REVIEW",
+            request=writing_request,
+            review_report=report,
+            patch=patch,
+        )
+        return WriterAgentOutput(
+            status="READY",
+            draft_patch=patch,
+            domain_result=domain_result,
+        )
+
     def review_existing(
         self, request: OrchestrationRequest, trace: Any
     ) -> ReviewAgentOutput | None:
@@ -1249,10 +1310,13 @@ class CrewAIBackend:
                 if key not in {"request"} or key == "request"
             }
             runtime.save_checkpoint(self._session_run.run_id, payload)
-        except (KeyError, OSError, ValueError, TypeError):
-            # A telemetry/checkpoint projection failure must not mutate the
-            # authoritative domain result or turn a safe run into a write.
-            return
+        except Exception as error:
+            # This checkpoint is the recovery boundary immediately before a
+            # specialist capability runs.  Continuing would allow a run to
+            # perform work that cannot be replayed after a process failure.
+            raise CheckpointPersistenceError(
+                "CrewAI recovery checkpoint could not be persisted.", cause=error
+            ) from error
 
     def load_checkpoint(self, run_id: str) -> Mapping[str, Any] | None:
         if self.session_manager is None or self._session_run is None:
@@ -1324,6 +1388,8 @@ class CrewAIBackend:
                     session_id=run.session_id,
                     thread_id=run.thread_id,
                     task_type=task_type,
+                    tenant_id=run.tenant_id,
+                    principal_id=run.principal_id,
                     metadata={"_run_id": run.run_id, "_worker_id": "resume"},
                 )
             )
@@ -1626,7 +1692,7 @@ class CrewAIBackend:
                 "success_criteria_status", "evidence_references", "research_result_reference",
                 "domain_result_refs", "draft_patch_id", "draft_patch_reference",
                 "latest_specialist_result", "last_specialist_result", "review_round",
-                "pending_approval", "manager_decisions", "error_codes", "tool_calls",
+                "recovery_action", "pending_approval", "manager_decisions", "error_codes", "tool_calls",
                 "last_progress_fingerprint", "no_progress_rounds", "user_preferences",
             ):
                 if key in checkpoint_state:
@@ -1692,7 +1758,11 @@ class CrewAIBackend:
             trace.record(
                 "flow_failed",
                 "FAILED",
-                {"error_type": type(error).__name__, "error": str(error)[:500]},
+                {
+                    "error_type": type(error).__name__,
+                    "error_code": getattr(error, "code", "ORCHESTRATION_FAILED"),
+                    "error": str(error)[:500],
+                },
                 kind="flow",
             )
             result = OrchestrationResult(
@@ -1704,7 +1774,7 @@ class CrewAIBackend:
                 thread_id=thread_id,
                 trace_id=trace_id,
                 selected_route=self._route_hint(request),
-                error_codes=["ORCHESTRATION_FAILED"],
+                error_codes=[getattr(error, "code", "ORCHESTRATION_FAILED")],
                 diagnostics={"error": str(error)[:500], "trace": trace.diagnostics()},
                 backend="crewai",
             )

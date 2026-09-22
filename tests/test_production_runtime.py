@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from dataclasses import dataclass
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.orchestration.contracts import OrchestrationRequest, OrchestrationResult
@@ -170,6 +171,46 @@ def test_async_run_is_queued_until_worker_claims_it(tmp_path: Path) -> None:
     assert result is not None and result.status == "SUCCEEDED"
     assert orchestration.calls == [queued["run_id"]]
     assert manager.snapshot(queued["run_id"])["status"] == "COMPLETED"
+
+
+def test_job_submit_failure_does_not_leave_active_pending_run(tmp_path: Path) -> None:
+    from app.jobs.repository import PersistentJobRepository
+    from app.session import SessionManager
+
+    class FailingSubmitRepository(PersistentJobRepository):
+        def submit(self, *_: object, **__: object) -> object:
+            raise RuntimeError("queue unavailable")
+
+    sessions = SessionManager(tmp_path)
+    manager = ScholarRunManager(
+        tmp_path,
+        repository=FailingSubmitRepository(tmp_path),
+        session_manager=sessions,
+        event_store=RunEventStore(tmp_path),
+        orchestration=FixtureOrchestration(),
+    )
+    store = ScholarProjectStore(tmp_path)
+
+    with pytest.raises(RuntimeError, match="queue unavailable"):
+        manager.create(
+            OrchestrationRequest(
+                request_id="REQ_QUEUE_FAILURE",
+                project_id=store.project_id,
+                instruction="research",
+                task_type="RESEARCH",
+                session_id="queue-failure-session",
+            ),
+            idempotency_key="queue-failure-key",
+        )
+
+    runtime = sessions.open("queue-failure-session")
+    runs = runtime.list_runs()
+    assert len(runs) == 1
+    assert runs[0].status == "FAILED"
+    assert sessions.get("queue-failure-session").active_run_id is None
+    result = runtime.list_results()[0]
+    assert result["metadata"]["termination_reason"] == "QUEUE_SUBMISSION_FAILED"
+    assert manager.event_store.list(runs[0].run_id)[-1]["type"] == "RUN_FAILED"
 
 
 def test_run_events_are_persisted_and_cursor_replay_is_stable(tmp_path: Path) -> None:
