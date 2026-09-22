@@ -1,4 +1,4 @@
-"""Tool Gateway 的长任务提交适配器；不在 Harness 调用栈内执行任务。"""
+"""Tool Gateway 的长任务提交适配器；不在 CrewAI Flow 调用栈内执行任务。"""
 
 from __future__ import annotations
 

@@ -31,6 +31,8 @@ class SessionRecord:
     active_run_id: str | None = None
     project_id: str | None = None
     schema_version: int = 1
+    tenant_id: str = "local"
+    principal_id: str = "local"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,3 +51,5 @@ class RunRecord:
     project_id: str | None = None
     checkpoint_ref: str | None = None
     failure_message: str | None = None
+    tenant_id: str = "local"
+    principal_id: str = "local"

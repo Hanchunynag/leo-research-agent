@@ -126,7 +126,7 @@ class ClaimSupportService:
             for index, piece in enumerate(pieces, 1)
         )
         try:
-            # The Deep Agents Research Subagent may already have completed the
+            # The CrewAI Research Agent may already have completed the
             # bounded ResearchCapability call.  This private, request-scoped
             # handoff avoids a second search while keeping EvidencePack
             # assessment in this shared Skill service.  It is never persisted

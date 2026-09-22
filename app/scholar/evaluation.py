@@ -1,8 +1,8 @@
-"""Deterministic evaluation of Scholar Harness decisions.
+"""Deterministic evaluation of Scholar orchestration decisions.
 
-The suite evaluates routing, visibility and domain boundaries from the existing
-Harness metadata/trace.  It does not judge prose quality and does not create a
-second agent or evaluation runtime.
+The suite evaluates routing, capability visibility and domain boundaries from
+the persisted orchestration metadata/trace. It does not judge prose quality
+and does not create a second agent or evaluation runtime.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 
 @dataclass(frozen=True, slots=True)
-class HarnessEvaluationCase:
+class ScholarEvaluationCase:
     case_id: str
     instruction: str
     project_id: str
@@ -39,7 +39,7 @@ class HarnessEvaluationCase:
 
 
 @dataclass(frozen=True, slots=True)
-class HarnessEvaluationRecord:
+class ScholarEvaluationRecord:
     case_id: str
     passed: bool
     failures: tuple[str, ...] = ()
@@ -56,8 +56,8 @@ class HarnessEvaluationRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class HarnessEvaluationReport:
-    records: tuple[HarnessEvaluationRecord, ...]
+class ScholarEvaluationReport:
+    records: tuple[ScholarEvaluationRecord, ...]
     metrics: Mapping[str, float | int]
 
     @property
@@ -97,7 +97,7 @@ def _trace_events(result: Any) -> tuple[Mapping[str, Any], ...]:
 
 
 def _trace_tool_names(events: Iterable[Mapping[str, Any]]) -> set[str]:
-    """Collect both legacy event names and CrewAI tool metadata names."""
+    """Collect historical event names and current CrewAI tool metadata names."""
 
     names: set[str] = set()
     for event in events:
@@ -115,7 +115,7 @@ def _trace_tool_names(events: Iterable[Mapping[str, Any]]) -> set[str]:
 
 
 def _skill_key(value: Any) -> str:
-    """Normalize Legacy skill names and CrewAI route names for comparison."""
+    """Normalize skill names and CrewAI route names for comparison."""
 
     return str(value or "").strip().casefold().replace("_", "-")
 
@@ -134,14 +134,14 @@ def _domain_result_is_valid(result: Any, expected_type: str | None) -> bool:
     return status not in {"FAILED", "INTERRUPTED"}
 
 
-class ScholarHarnessEvaluationSuite:
-    """Run fixed Harness cases using an injected Scholar request callable."""
+class ScholarEvaluationSuite:
+    """Run fixed Scholar cases using an injected orchestration callable."""
 
     def evaluate_result(
         self,
-        case: HarnessEvaluationCase,
+        case: ScholarEvaluationCase,
         result: Any,
-    ) -> HarnessEvaluationRecord:
+    ) -> ScholarEvaluationRecord:
         metadata = getattr(result, "metadata", {})
         metadata = metadata if isinstance(metadata, Mapping) else {}
         events = _trace_events(result)
@@ -205,7 +205,7 @@ class ScholarHarnessEvaluationSuite:
         trace = metadata.get("trace", {})
         usage = trace.get("usage", {}) if isinstance(trace, Mapping) else {}
         context_tokens = int(usage.get("context_tokens", 0)) if isinstance(usage, Mapping) else 0
-        return HarnessEvaluationRecord(
+        return ScholarEvaluationRecord(
             case_id=case.case_id,
             passed=not failures,
             failures=tuple(failures),
@@ -223,9 +223,9 @@ class ScholarHarnessEvaluationSuite:
 
     def run(
         self,
-        cases: Iterable[HarnessEvaluationCase],
-        runner: Callable[[HarnessEvaluationCase], Any],
-    ) -> HarnessEvaluationReport:
+        cases: Iterable[ScholarEvaluationCase],
+        runner: Callable[[ScholarEvaluationCase], Any],
+    ) -> ScholarEvaluationReport:
         case_values = tuple(cases)
         records = tuple(self.evaluate_result(case, runner(case)) for case in case_values)
         count = len(records)
@@ -246,7 +246,7 @@ class ScholarHarnessEvaluationSuite:
             record for record, case in zip(records, case_values, strict=False)
             if case.resume_expected is not None
         ]
-        return HarnessEvaluationReport(
+        return ScholarEvaluationReport(
             records,
             {
                 "Task Routing Accuracy": sum(
@@ -272,15 +272,12 @@ class ScholarHarnessEvaluationSuite:
         )
 
 
-HarnessEvaluationSuite = ScholarHarnessEvaluationSuite
-
-
-def default_harness_cases(project_id: str) -> tuple[HarnessEvaluationCase, ...]:
+def default_scholar_cases(project_id: str) -> tuple[ScholarEvaluationCase, ...]:
     """The stable four-skill decision fixture used by CI/evaluation tooling."""
 
     return (
-        HarnessEvaluationCase("support-claim", "support this claim", project_id, "support-claim", True, True, "ClaimSupportResult", False, task_type="SUPPORT_CLAIM"),
-        HarnessEvaluationCase("introduction", "write introduction", project_id, "write-introduction", None, True, None, True, task_type="WRITE_INTRODUCTION"),
-        HarnessEvaluationCase("conclusion", "write conclusion", project_id, "write-conclusion", False, False, None, True, task_type="WRITE_CONCLUSION"),
-        HarnessEvaluationCase("abstract", "write abstract", project_id, "write-abstract", False, False, None, True, task_type="WRITE_ABSTRACT"),
+        ScholarEvaluationCase("support-claim", "support this claim", project_id, "support-claim", True, True, "ClaimSupportResult", False, task_type="SUPPORT_CLAIM"),
+        ScholarEvaluationCase("introduction", "write introduction", project_id, "write-introduction", None, True, None, True, task_type="WRITE_INTRODUCTION"),
+        ScholarEvaluationCase("conclusion", "write conclusion", project_id, "write-conclusion", False, False, None, True, task_type="WRITE_CONCLUSION"),
+        ScholarEvaluationCase("abstract", "write abstract", project_id, "write-abstract", False, False, None, True, task_type="WRITE_ABSTRACT"),
     )

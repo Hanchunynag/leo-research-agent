@@ -77,6 +77,10 @@ class JobRecord:
     result_reference: str | None
     idempotency_key: str
     worker_id: str | None
+    lease_token: str | None = None
+    available_at: str | None = None
+    tenant_id: str = "local"
+    principal_id: str = "local"
 
 
 class PersistentJobRepository:
@@ -118,19 +122,48 @@ class PersistentJobRepository:
                     checkpoint_json TEXT NOT NULL,
                     result_reference TEXT,
                     idempotency_key TEXT NOT NULL UNIQUE,
-                    worker_id TEXT
+                    worker_id TEXT,
+                    lease_token TEXT,
+                    available_at TEXT,
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
+                    principal_id TEXT NOT NULL DEFAULT 'local'
                 )
                 """
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_status_created ON jobs(status, created_at)"
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(jobs)")
+            }
+            for column in ("lease_token", "available_at", "tenant_id", "principal_id"):
+                if column not in columns:
+                    default = " NOT NULL DEFAULT 'local'" if column in {"tenant_id", "principal_id"} else ""
+                    connection.execute(
+                        f"ALTER TABLE jobs ADD COLUMN {column} TEXT{default}"
+                    )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS job_events (
                     job_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
                     event_json TEXT NOT NULL,
+                    PRIMARY KEY (job_id, sequence),
+                    FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS job_actions (
+                    job_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    worker_id TEXT,
+                    details_json TEXT NOT NULL DEFAULT '{}',
                     PRIMARY KEY (job_id, sequence),
                     FOREIGN KEY (job_id) REFERENCES jobs(job_id)
                 )
@@ -160,6 +193,10 @@ class PersistentJobRepository:
             result_reference=row["result_reference"],
             idempotency_key=str(row["idempotency_key"]),
             worker_id=row["worker_id"],
+            lease_token=row["lease_token"] if "lease_token" in row.keys() else None,
+            available_at=row["available_at"] if "available_at" in row.keys() else None,
+            tenant_id=str(row["tenant_id"] or "local") if "tenant_id" in row.keys() else "local",
+            principal_id=str(row["principal_id"] or "local") if "principal_id" in row.keys() else "local",
         )
 
     def submit(
@@ -173,6 +210,8 @@ class PersistentJobRepository:
         generation_id: str | None = None,
         idempotency_key: str,
         max_attempts: int = 3,
+        tenant_id: str = "local",
+        principal_id: str = "local",
     ) -> tuple[JobRecord, bool]:
         if not job_type or not workspace_id or not idempotency_key:
             raise ValueError("Job type/workspace/idempotency_key 不能为空。")
@@ -192,8 +231,8 @@ class PersistentJobRepository:
                     job_id, job_type, workspace_id, scope_version,
                     document_id, generation_id, payload_json, status,
                     attempt, max_attempts, created_at, checkpoint_json,
-                    idempotency_key
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED', 0, ?, ?, '{}', ?)
+                    idempotency_key, tenant_id, principal_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED', 0, ?, ?, '{}', ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -206,12 +245,20 @@ class PersistentJobRepository:
                     max_attempts,
                     _now(),
                     idempotency_key,
+                    tenant_id,
+                    principal_id,
                 ),
             )
             row = connection.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
             assert row is not None
+            self._append_action_connection(
+                connection,
+                job_id,
+                status="PLANNED",
+                details={"job_type": job_type},
+            )
             return self._record(row), True
 
     def get(self, job_id: str) -> JobRecord:
@@ -244,26 +291,113 @@ class PersistentJobRepository:
             rows = connection.execute(query, parameters).fetchall()
         return tuple(self._record(row) for row in rows)
 
+    def list_dead_letters(
+        self,
+        *,
+        tenant_id: str | None = None,
+        principal_id: str | None = None,
+    ) -> tuple[JobRecord, ...]:
+        """List terminal Jobs that exhausted their retry budget."""
+
+        query = (
+            "SELECT * FROM jobs WHERE status='FAILED' AND attempt >= max_attempts"
+        )
+        parameters: list[Any] = []
+        if tenant_id is not None:
+            query += " AND tenant_id=?"
+            parameters.append(tenant_id)
+        if principal_id is not None:
+            query += " AND principal_id=?"
+            parameters.append(principal_id)
+        query += " ORDER BY finished_at, job_id"
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(parameters)).fetchall()
+        return tuple(self._record(row) for row in rows)
+
+    def requeue_failed(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str | None = None,
+        principal_id: str | None = None,
+        reset_attempts: bool = False,
+    ) -> JobRecord:
+        """Manually replay one dead-letter Job after operator review."""
+
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Job 不存在：{job_id}")
+            if row["status"] != "FAILED" or int(row["attempt"]) < int(row["max_attempts"]):
+                raise ValueError("只有已耗尽重试次数的 FAILED Job 才能进入 DLQ 重放。")
+            if tenant_id is not None and str(row["tenant_id"]) != tenant_id:
+                raise PermissionError("Job 不属于当前租户。")
+            if principal_id is not None and str(row["principal_id"]) != principal_id:
+                raise PermissionError("Job 不属于当前主体。")
+            attempt = 0 if reset_attempts else int(row["attempt"])
+            connection.execute(
+                """
+                UPDATE jobs SET status='RETRY_PENDING', attempt=?, finished_at=NULL,
+                    error_type=NULL, error_summary=NULL, available_at=NULL
+                WHERE job_id=? AND status='FAILED'
+                """,
+                (attempt, job_id),
+            )
+            self._append_action_connection(
+                connection,
+                job_id,
+                status="REQUEUED",
+                details={"reset_attempts": reset_attempts},
+            )
+        return self.get(job_id)
+
     def claim_next(
-        self, worker_id: str, *, job_types: tuple[str, ...] | None = None
+        self,
+        worker_id: str,
+        *,
+        job_types: tuple[str, ...] | None = None,
+        max_running_per_scope: int | None = None,
     ) -> JobRecord | None:
+        if max_running_per_scope is not None and max_running_per_scope < 1:
+            raise ValueError("max_running_per_scope 必须为正数。")
         now = _now()
+        lease_token = secrets.token_urlsafe(24)
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             type_clause = ""
-            parameters: tuple[Any, ...] = ()
+            parameters: list[Any] = []
             if job_types:
                 type_clause = " AND job_type IN (" + ",".join("?" for _ in job_types) + ")"
-                parameters = job_types
+                parameters.extend(job_types)
+            scope_clause = ""
+            if max_running_per_scope is not None:
+                scope_clause = (
+                    " AND (SELECT COUNT(*) FROM jobs running "
+                    "WHERE running.status='RUNNING' "
+                    "AND running.tenant_id=jobs.tenant_id "
+                    "AND running.principal_id=jobs.principal_id) < ?"
+                )
+                parameters.append(max_running_per_scope)
+            parameters.append(now)
             row = connection.execute(
                 f"""
                 SELECT * FROM jobs
                 WHERE status IN ('QUEUED', 'RETRY_PENDING')
                   AND attempt < max_attempts
                   {type_clause}
-                ORDER BY created_at, job_id LIMIT 1
+                  {scope_clause}
+                  AND (available_at IS NULL OR available_at <= ?)
+                ORDER BY (
+                    SELECT COUNT(*) FROM jobs running
+                    WHERE running.status='RUNNING'
+                      AND running.tenant_id=jobs.tenant_id
+                      AND running.principal_id=jobs.principal_id
+                ), created_at, job_id LIMIT 1
                 """,  # noqa: S608 - placeholders are used for every job_type value.
-                parameters,
+                tuple(parameters),
             ).fetchone()
             if row is None:
                 return None
@@ -271,11 +405,19 @@ class PersistentJobRepository:
                 """
                 UPDATE jobs
                 SET status='RUNNING', attempt=attempt+1, worker_id=?,
-                    started_at=COALESCE(started_at, ?), heartbeat_at=?,
-                    finished_at=NULL, error_type=NULL, error_summary=NULL
+                    lease_token=?, started_at=COALESCE(started_at, ?), heartbeat_at=?,
+                    finished_at=NULL, error_type=NULL, error_summary=NULL,
+                    available_at=NULL
                 WHERE job_id=? AND status IN ('QUEUED', 'RETRY_PENDING')
                 """,
-                (worker_id, now, now, row["job_id"]),
+                (worker_id, lease_token, now, now, row["job_id"]),
+            )
+            self._append_action_connection(
+                connection,
+                str(row["job_id"]),
+                status="STARTED",
+                worker_id=worker_id,
+                details={"fenced": True},
             )
             claimed = connection.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (row["job_id"],)
@@ -285,17 +427,28 @@ class PersistentJobRepository:
 
     def claim(self, job_id: str, worker_id: str) -> JobRecord:
         now = _now()
+        lease_token = secrets.token_urlsafe(24)
         with self._connect() as connection:
             changed = connection.execute(
                 """
                 UPDATE jobs
                 SET status='RUNNING', attempt=attempt+1, worker_id=?,
-                    started_at=COALESCE(started_at, ?), heartbeat_at=?
+                    lease_token=?, started_at=COALESCE(started_at, ?), heartbeat_at=?,
+                    available_at=NULL
                 WHERE job_id=? AND status IN ('QUEUED', 'RETRY_PENDING')
                   AND attempt < max_attempts
+                  AND (available_at IS NULL OR available_at <= ?)
                 """,
-                (worker_id, now, now, job_id),
+                (worker_id, lease_token, now, now, job_id, now),
             ).rowcount
+            if changed == 1:
+                self._append_action_connection(
+                    connection,
+                    job_id,
+                    status="STARTED",
+                    worker_id=worker_id,
+                    details={"fenced": True},
+                )
         if changed != 1:
             raise RuntimeError("Job 无法由指定 Worker claim。")
         return self.get(job_id)
@@ -318,6 +471,61 @@ class PersistentJobRepository:
             )
         return sequence
 
+    @staticmethod
+    def _append_action_connection(
+        connection: sqlite3.Connection,
+        job_id: str,
+        *,
+        status: str,
+        worker_id: str | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> int:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) AS value FROM job_actions WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        sequence = int(row["value"]) + 1
+        connection.execute(
+            """
+            INSERT INTO job_actions(
+                job_id, sequence, action, status, timestamp, worker_id, details_json
+            ) VALUES (?, ?, 'job', ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                sequence,
+                status,
+                _now(),
+                worker_id,
+                _json(details),
+            ),
+        )
+        return sequence
+
+    def list_actions(self, job_id: str) -> tuple[Mapping[str, Any], ...]:
+        """Return the append-only lifecycle journal for one Job."""
+
+        self.get(job_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT sequence, action, status, timestamp, worker_id, details_json
+                FROM job_actions WHERE job_id=? ORDER BY sequence
+                """,
+                (job_id,),
+            ).fetchall()
+        return tuple(
+            {
+                "sequence": int(row["sequence"]),
+                "action": str(row["action"]),
+                "status": str(row["status"]),
+                "timestamp": str(row["timestamp"]),
+                "worker_id": row["worker_id"],
+                "details": json.loads(row["details_json"]),
+            }
+            for row in rows
+        )
+
     def list_events(self, job_id: str) -> tuple[Mapping[str, Any], ...]:
         self.get(job_id)
         with self._connect() as connection:
@@ -331,16 +539,29 @@ class PersistentJobRepository:
         )
 
     def heartbeat(
-        self, job_id: str, *, worker_id: str, checkpoint: Mapping[str, Any] | None = None
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        lease_token: str | None = None,
+        checkpoint: Mapping[str, Any] | None = None,
     ) -> JobRecord:
         checkpoint_json = _json(checkpoint)
+        ownership = " AND lease_token=?" if lease_token is not None else ""
+        parameters: tuple[Any, ...] = (
+            _now(),
+            checkpoint_json,
+            job_id,
+            worker_id,
+            *((lease_token,) if lease_token is not None else ()),
+        )
         with self._connect() as connection:
             changed = connection.execute(
-                """
+                f"""
                 UPDATE jobs SET heartbeat_at=?, checkpoint_json=?
-                WHERE job_id=? AND status='RUNNING' AND worker_id=?
+                WHERE job_id=? AND status='RUNNING' AND worker_id=?{ownership}
                 """,
-                (_now(), checkpoint_json, job_id, worker_id),
+                parameters,
             ).rowcount
         if changed != 1:
             raise RuntimeError("Job Heartbeat 被拒绝：状态或 worker 不匹配。")
@@ -354,23 +575,49 @@ class PersistentJobRepository:
         error_type: str | None = None,
         error_summary: str | None = None,
         result_reference: str | None = None,
+        available_at: str | None = None,
+        worker_id: str | None = None,
+        lease_token: str | None = None,
     ) -> JobRecord:
         finished_at = _now() if status in _TERMINAL else None
+        ownership = ""
+        parameters: list[Any] = [
+            status,
+            finished_at,
+            error_type,
+            error_summary,
+            result_reference,
+            available_at,
+            job_id,
+        ]
+        if worker_id is not None:
+            if lease_token is None:
+                raise ValueError("带 worker_id 更新 Job 时必须提供 lease_token。")
+            ownership = " AND worker_id=? AND lease_token=?"
+            parameters.extend([worker_id, lease_token])
         with self._connect() as connection:
             changed = connection.execute(
-                """
+                f"""
                 UPDATE jobs SET status=?, finished_at=?, error_type=?,
-                    error_summary=?, result_reference=? WHERE job_id=?
+                    error_summary=?, result_reference=?, available_at=?,
+                    worker_id=CASE WHEN ? IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
+                                   THEN NULL ELSE worker_id END,
+                    lease_token=CASE WHEN ? IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
+                                     THEN NULL ELSE lease_token END
+                WHERE job_id=?{ownership}
                 """,
-                (
-                    status,
-                    finished_at,
-                    error_type,
-                    error_summary,
-                    result_reference,
-                    job_id,
-                ),
+                # The status is repeated for the ownership-clearing CASE
+                # expressions before the WHERE parameters.
+                [status, finished_at, error_type, error_summary, result_reference, available_at, status, status, *parameters[6:]],
             ).rowcount
+            if changed == 1:
+                self._append_action_connection(
+                    connection,
+                    job_id,
+                    status=status,
+                    worker_id=worker_id,
+                    details={"error_type": error_type} if error_type else None,
+                )
         if changed != 1:
             raise KeyError(f"Job 不存在：{job_id}")
         return self.get(job_id)
@@ -394,7 +641,12 @@ class PersistentJobRepository:
     def cancellation_requested(self, job_id: str) -> bool:
         return self.get(job_id).status in {"CANCEL_REQUESTED", "CANCELLED"}
 
-    def mark_interrupted(self, *, heartbeat_before: str) -> tuple[JobRecord, ...]:
+    def mark_interrupted(
+        self,
+        *,
+        heartbeat_before: str,
+        job_type_prefix: str | None = None,
+    ) -> tuple[JobRecord, ...]:
         """收束进程启动时已经失联的任务。
 
         A cancellation request is durable state, so a dead Worker must not
@@ -403,15 +655,21 @@ class PersistentJobRepository:
         Worker still gets the cooperative-cancellation grace period.
         """
 
+        type_filter = ""
+        parameters: list[Any] = [heartbeat_before]
+        if job_type_prefix is not None:
+            type_filter = " AND job_type LIKE ?"
+            parameters.append(f"{job_type_prefix}%")
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT job_id, status FROM jobs
                 WHERE status IN ('RUNNING', 'CANCEL_REQUESTED')
                   AND (heartbeat_at IS NULL OR heartbeat_at < ?)
+                  {type_filter}
                 ORDER BY created_at, job_id
                 """,
-                (heartbeat_before,),
+                tuple(parameters),
             ).fetchall()
             if rows:
                 connection.executemany(
@@ -422,6 +680,8 @@ class PersistentJobRepository:
                         finished_at=CASE WHEN status='CANCEL_REQUESTED'
                                          THEN ? ELSE NULL END,
                         worker_id=NULL,
+                        lease_token=NULL,
+                        available_at=NULL,
                         error_type=CASE WHEN status='CANCEL_REQUESTED'
                                         THEN 'CancelledAfterWorkerLost'
                                         ELSE 'ProcessRestart' END,
@@ -435,19 +695,31 @@ class PersistentJobRepository:
             ids = tuple(str(row["job_id"]) for row in rows)
         return tuple(self.get(job_id) for job_id in ids)
 
-    def recover_interrupted(self) -> tuple[JobRecord, ...]:
+    def recover_interrupted(
+        self,
+        *,
+        job_type_prefix: str | None = None,
+    ) -> tuple[JobRecord, ...]:
         """按重试上限把 INTERRUPTED 转入 RETRY_PENDING 或 FAILED。"""
 
         finished = _now()
+        type_filter = ""
+        parameters: tuple[Any, ...] = ()
+        if job_type_prefix is not None:
+            type_filter = " AND job_type LIKE ?"
+            parameters = (f"{job_type_prefix}%",)
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT job_id, attempt, max_attempts FROM jobs WHERE status='INTERRUPTED'"
+                f"SELECT job_id, attempt, max_attempts FROM jobs "
+                f"WHERE status='INTERRUPTED'{type_filter}",
+                parameters,
             ).fetchall()
             for row in rows:
                 retry = int(row["attempt"]) < int(row["max_attempts"])
                 connection.execute(
                     """
-                    UPDATE jobs SET status=?, finished_at=?, worker_id=NULL
+                    UPDATE jobs SET status=?, finished_at=?, worker_id=NULL,
+                        lease_token=NULL, available_at=NULL
                     WHERE job_id=? AND status='INTERRUPTED'
                     """,
                     (

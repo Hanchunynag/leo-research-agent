@@ -37,8 +37,7 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
-      ORCHESTRATION_BACKEND: crewai
-      LEO_AGENTIC_RUNTIME_MODE: production
+      LEO_SCHOLAR_RUNTIME_MODE: production
       # The application and every parser runtime are baked into the image.
       # Only persistent application data is mounted below as Docker-managed
       # volumes; the host source tree is never used at runtime.
@@ -50,9 +49,10 @@ services:
       # fallbacks from the mounted host workspace or its macOS virtualenvs.
       LEO_MINERU_EXECUTABLE: /opt/mineru/bin/mineru
       LEO_PADDLEOCR_EXECUTABLE: /opt/paddleocr/bin/python
-      LEO_AGENTIC_SCHOLAR_CHECKPOINT_PATH: data/runtime/scholar/checkpoint.sqlite
+      LEO_SCHOLAR_MAX_MANAGER_STEPS: ${LEO_SCHOLAR_MAX_MANAGER_STEPS:-12}
       LEO_SCHOLAR_RESEARCH_MAX_CONCURRENCY: ${LEO_SCHOLAR_RESEARCH_MAX_CONCURRENCY:-1}
       LEO_MYSQL_ENABLED: "true"
+      LEO_MYSQL_FALLBACK_TO_JSON: "false"
       # The host .env may contain 127.0.0.1 for local CLI use.  Containers
       # must always address the Compose database service by its DNS name.
       LEO_MYSQL_URL: mysql+pymysql://leo:${MYSQL_PASSWORD:-change-me}@database:3306/leo_research
@@ -61,14 +61,11 @@ services:
       LEO_LLM_API_KEY: ${LEO_LLM_API_KEY:-}
       LEO_LLM_AUTH_SCHEME: ${LEO_LLM_AUTH_SCHEME:-bearer}
       QDRANT_URL: http://qdrant:6333
-      REDIS_URL: redis://redis:6379/0
     volumes:
       - leo_data:/app/data
       - leo_scholar:/app/.scholar
     depends_on:
       database:
-        condition: service_healthy
-      redis:
         condition: service_healthy
       qdrant:
         condition: service_healthy
@@ -86,16 +83,16 @@ services:
       dockerfile: Dockerfile
     command: [".venv/bin/python", "-m", "scripts.run_scholar_worker"]
     environment:
-      ORCHESTRATION_BACKEND: crewai
-      LEO_AGENTIC_RUNTIME_MODE: production
+      LEO_SCHOLAR_RUNTIME_MODE: production
       LEO_PROJECT_ROOT: /app
       LEO_PROJECT_ROOT_ALIASES: /app/workspace
       # Keep the worker on the same image-owned Linux parsing runtimes as API.
       LEO_MINERU_EXECUTABLE: /opt/mineru/bin/mineru
       LEO_PADDLEOCR_EXECUTABLE: /opt/paddleocr/bin/python
-      LEO_AGENTIC_SCHOLAR_CHECKPOINT_PATH: data/runtime/scholar/checkpoint.sqlite
+      LEO_SCHOLAR_MAX_MANAGER_STEPS: ${LEO_SCHOLAR_MAX_MANAGER_STEPS:-12}
       LEO_SCHOLAR_RESEARCH_MAX_CONCURRENCY: ${LEO_SCHOLAR_RESEARCH_MAX_CONCURRENCY:-1}
       LEO_MYSQL_ENABLED: "true"
+      LEO_MYSQL_FALLBACK_TO_JSON: "false"
       # Keep the Worker on the same in-network MySQL endpoint as the API;
       # never propagate a host-loopback URL from .env into a container.
       LEO_MYSQL_URL: mysql+pymysql://leo:${MYSQL_PASSWORD:-change-me}@database:3306/leo_research
@@ -104,29 +101,14 @@ services:
       LEO_LLM_API_KEY: ${LEO_LLM_API_KEY:-}
       LEO_LLM_AUTH_SCHEME: ${LEO_LLM_AUTH_SCHEME:-bearer}
       QDRANT_URL: http://qdrant:6333
-      REDIS_URL: redis://redis:6379/0
     volumes:
       - leo_data:/app/data
       - leo_scholar:/app/.scholar
     depends_on:
       api:
         condition: service_healthy
-      redis:
-        condition: service_healthy
       qdrant:
         condition: service_healthy
-    restart: unless-stopped
-
-  redis:
-    image: redis:7.4-alpine
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
     restart: unless-stopped
 
   database:
@@ -162,6 +144,5 @@ services:
 volumes:
   leo_data:
   leo_scholar:
-  redis_data:
   mysql_data:
   qdrant_data:

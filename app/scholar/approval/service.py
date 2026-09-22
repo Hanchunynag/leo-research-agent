@@ -17,7 +17,10 @@ from app.scholar.citation import (
 from app.scholar.citation.models import BibliographyChange, CitationBinding
 from app.scholar.manuscript import ManuscriptSynchronizer, PatchConflict
 from app.scholar.models import DraftPatch, ReviewReport
-from app.scholar.project import ScholarProjectStore
+from app.scholar.project import (
+    ProjectRevisionConflict,
+    ScholarProjectStore,
+)
 from app.scholar.approval.models import (
     PatchApprovalRequest,
     PatchApprovalResult,
@@ -105,6 +108,12 @@ class PatchApprovalService:
         return record.preview()
 
     def approve(self, request: PatchApprovalRequest) -> PatchApprovalResult:
+        """Apply one human decision under the Project writer fence."""
+
+        with self.project_store.write_lock():
+            return self._approve_unlocked(request)
+
+    def _approve_unlocked(self, request: PatchApprovalRequest) -> PatchApprovalResult:
         record = self._get_record(request.patch_id)
         self._check_project(record, request.project_id)
 
@@ -262,6 +271,14 @@ class PatchApprovalService:
                 message=str(error),
                 expected_status="APPLYING",
             )
+        except ProjectRevisionConflict as error:
+            return self._conflict(
+                record,
+                request,
+                previous_hash=previous_hash,
+                message=str(error),
+                expected_status="APPLYING",
+            )
         except (OSError, ValueError, KeyError) as error:
             error_code = "PARTIAL_APPLY" if bibliography_applied else "PATCH_APPLY_FAILED"
             self.project_store.transition_patch(
@@ -301,7 +318,10 @@ class PatchApprovalService:
             )
 
         try:
-            self.project_store.save_manuscript_state(new_state)
+            self.project_store.save_manuscript_state(
+                new_state,
+                expected_version=state.version,
+            )
         except (OSError, ValueError, RuntimeError) as error:
             if bibliography_applied:
                 return self._partial_apply(

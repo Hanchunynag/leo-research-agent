@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 from pydantic import BaseModel, PrivateAttr
@@ -344,7 +345,85 @@ class DeterministicContractLLM(BaseLLM):
             )
         )
         marker = text.casefold()
-        if "selected_route" in marker or "routing decision" in marker:
+        if "next_action" in marker or "manager decision" in marker or "manager agent" in marker:
+            context: dict[str, Any] = {}
+            # The Crew task contains a bounded JSON context. Best-effort
+            # extraction is only for the offline deterministic provider; real
+            # providers return the same Pydantic contract directly.
+            for line in text.splitlines():
+                if '"phase"' in line and '"route"' in line:
+                    try:
+                        candidate = json.loads(line.strip())
+                        if isinstance(candidate, dict):
+                            context = candidate
+                            break
+                    except json.JSONDecodeError:
+                        continue
+            def context_value(key: str) -> Any:
+                if key in context:
+                    return context[key]
+                match = re.search(
+                    rf'"{re.escape(key)}"\s*:\s*(?:"([^"]*)"|([^,}}\n]+))',
+                    text,
+                )
+                if not match:
+                    return None
+                return match.group(1) if match.group(1) is not None else match.group(2).strip()
+
+            route = str(context_value("route") or "RESEARCH")
+            phase = str(context_value("phase") or "INITIAL")
+            last_agent = context_value("last_agent")
+            research_status = context_value("research_status")
+            review_decision = context_value("review_decision")
+            recovery = context_value("recovery_action")
+            if recovery and phase == "RECOVERY":
+                action = str(recovery)
+            elif last_agent == "research":
+                if research_status == "INSUFFICIENT_EVIDENCE":
+                    action = "REQUEST_MORE_EVIDENCE"
+                elif route in {"RESEARCH", "SUPPORT_CLAIM"}:
+                    action = "COMPLETE"
+                else:
+                    action = "CALL_WRITER"
+            elif last_agent == "writer":
+                action = "CALL_RESEARCH" if str(context_value("last_specialist_status")) == "RESEARCH_REQUIRED" else "CALL_REVIEWER"
+            elif last_agent == "reviewer":
+                if review_decision == "REVISE":
+                    action = "REQUEST_REVISION"
+                elif review_decision == "REJECT":
+                    action = "COMPLETE"
+                else:
+                    action = "COMPLETE"
+            elif route == "WRITE_INTRODUCTION":
+                action = "CALL_RESEARCH"
+            elif route in {"WRITE_CONCLUSION", "WRITE_ABSTRACT"}:
+                action = "CALL_WRITER"
+            elif route == "REVIEW":
+                action = "CALL_REVIEWER"
+            else:
+                action = "CALL_RESEARCH"
+            target = {
+                "CALL_RESEARCH": "research", "REQUEST_MORE_EVIDENCE": "research",
+                "CALL_WRITER": "writer", "REQUEST_REVISION": "writer",
+                "CALL_REVIEWER": "reviewer", "COMPLETE": None,
+            }[action]
+            completion = (
+                "READY_TO_COMPLETE" if action == "COMPLETE" and route.startswith("WRITE_") and review_decision == "PASS"
+                else "BLOCKED" if action == "COMPLETE" and review_decision == "REJECT"
+                else "READY_TO_COMPLETE" if action == "COMPLETE" else "IN_PROGRESS"
+            )
+            payload = {
+                "next_action": action,
+                "target_agent": target,
+                "goal_alignment": (
+                    f"The {route.casefold().replace('_', ' ')} action advances the original {route.casefold().replace('_', ' ')} goal."
+                ),
+                "remaining_gap": "No unresolved gap reported." if action == "COMPLETE" else "The requested specialist action remains pending.",
+                "reason": "Deterministic Manager policy for offline contract execution.",
+                "required_context_refs": [],
+                "completion_status": completion,
+            }
+        elif "selected_route" in marker or "routing decision" in marker:
             route = "RESEARCH"
             # The Flow supplies the deterministic route hint.  Prefer it over
             # route names that may also occur in the generated JSON schema.

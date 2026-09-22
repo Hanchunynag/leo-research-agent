@@ -17,6 +17,7 @@ from filelock import FileLock
 
 from app.session.models import SessionRecord, SessionStatus
 from app.session.runtime import SessionRuntime
+from app.tenancy import LOCAL_PRINCIPAL, TenantPrincipal
 
 
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
@@ -70,6 +71,8 @@ class SessionManager:
                     updated_at TEXT NOT NULL,
                     relative_path TEXT NOT NULL UNIQUE,
                     active_run_id TEXT,
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
+                    principal_id TEXT NOT NULL DEFAULT 'local',
                     schema_version INTEGER NOT NULL
                 )
                 """
@@ -80,6 +83,14 @@ class SessionManager:
             }
             if "project_id" not in columns:
                 connection.execute("ALTER TABLE sessions ADD COLUMN project_id TEXT")
+            if "tenant_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'"
+                )
+            if "principal_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'local'"
+                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS ix_catalog_status_updated "
                 "ON sessions(status, updated_at)"
@@ -91,7 +102,10 @@ class SessionManager:
         *,
         session_id: str | None = None,
         project_id: str | None = None,
+        tenant_id: str = LOCAL_PRINCIPAL.tenant_id,
+        principal_id: str = LOCAL_PRINCIPAL.principal_id,
     ) -> SessionRecord:
+        identity = TenantPrincipal(tenant_id=tenant_id, principal_id=principal_id)
         requested = _validate(session_id) if session_id else None
         value = requested or f"session_{secrets.token_hex(6)}"
         timestamp = _now()
@@ -107,6 +121,8 @@ class SessionManager:
             relative_path=relative_path,
             project_id=project_id.strip() if project_id and project_id.strip() else None,
             schema_version=2,
+            tenant_id=identity.tenant_id,
+            principal_id=identity.principal_id,
         )
         try:
             with self._connect_catalog() as connection:
@@ -114,8 +130,9 @@ class SessionManager:
                     """
                     INSERT INTO sessions
                         (session_id, title, status, created_at, updated_at,
-                         relative_path, active_run_id, project_id, schema_version)
-                    VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                         relative_path, active_run_id, project_id, tenant_id,
+                         principal_id, schema_version)
+                    VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
                     """,
                     (
                         record.session_id,
@@ -125,6 +142,8 @@ class SessionManager:
                         record.updated_at,
                         record.relative_path,
                         record.project_id,
+                        record.tenant_id,
+                        record.principal_id,
                         record.schema_version,
                     ),
                 )
@@ -152,6 +171,8 @@ class SessionManager:
             active_run_id=row["active_run_id"],
             project_id=row["project_id"] if "project_id" in row.keys() else None,
             schema_version=int(row["schema_version"]),
+            tenant_id=str(row["tenant_id"] or "local") if "tenant_id" in row.keys() else "local",
+            principal_id=str(row["principal_id"] or "local") if "principal_id" in row.keys() else "local",
         )
 
     def resolve(
@@ -160,14 +181,28 @@ class SessionManager:
         *,
         title: str,
         project_id: str | None = None,
+        tenant_id: str = LOCAL_PRINCIPAL.tenant_id,
+        principal_id: str = LOCAL_PRINCIPAL.principal_id,
     ) -> SessionRecord:
+        identity = TenantPrincipal(tenant_id=tenant_id, principal_id=principal_id)
         if session_id is None:
-            return self.create(title, project_id=project_id)
+            return self.create(
+                title,
+                project_id=project_id,
+                tenant_id=identity.tenant_id,
+                principal_id=identity.principal_id,
+            )
         try:
             record = self.get(session_id)
         except KeyError:
             try:
-                return self.create(title, session_id=session_id, project_id=project_id)
+                return self.create(
+                    title,
+                    session_id=session_id,
+                    project_id=project_id,
+                    tenant_id=identity.tenant_id,
+                    principal_id=identity.principal_id,
+                )
             except FileExistsError:
                 # Another worker may have created the requested Session between
                 # the read and the create. Re-read instead of creating a second
@@ -175,6 +210,12 @@ class SessionManager:
                 return self.get(session_id)
         if record.status == "DELETED":
             raise ValueError(f"Session 已删除：{record.session_id}")
+        if not identity.matches(
+            tenant_id=record.tenant_id, principal_id=record.principal_id
+        ):
+            error = ValueError(f"Session 不属于当前租户或主体：{record.session_id}")
+            setattr(error, "code", "SESSION_ACCESS_DENIED")
+            raise error
         if project_id and record.project_id and record.project_id != project_id:
             raise ValueError(
                 f"Session 属于其他 Project：{record.session_id} / {record.project_id}"
@@ -270,6 +311,8 @@ class SessionManager:
             active_run_id=row["active_run_id"],
             project_id=row["project_id"] if "project_id" in row.keys() else None,
             schema_version=int(row["schema_version"]),
+            tenant_id=str(row["tenant_id"] or "local") if "tenant_id" in row.keys() else "local",
+            principal_id=str(row["principal_id"] or "local") if "principal_id" in row.keys() else "local",
         )
 
     def _set_status(self, session_id: str, status: SessionStatus) -> SessionRecord:
@@ -305,6 +348,8 @@ class SessionManager:
                 active_run_id=current.active_run_id,
                 project_id=current.project_id,
                 schema_version=max(2, current.schema_version),
+                tenant_id=current.tenant_id,
+                principal_id=current.principal_id,
             ),
         )
         with runtime._connect() as connection:

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
-
 from fastapi.testclient import TestClient
 
 from app.scholar import DraftPatch
@@ -86,47 +84,3 @@ def test_patch_api_unknown_patch_is_not_an_apply_entrypoint(tmp_path: Path) -> N
     with TestClient(app) as client:
         response = client.get("/api/scholar/patches/DOES_NOT_EXIST")
         assert response.status_code == 404
-
-
-def test_scholar_request_api_forwards_only_to_injected_harness(tmp_path: Path) -> None:
-    calls: list[tuple[str, str, dict[str, object]]] = []
-
-    class Harness:
-        def scholar_request(self, instruction: str, project_id: str, **kwargs: object) -> SimpleNamespace:
-            calls.append((instruction, project_id, kwargs))
-            return SimpleNamespace(to_dict=lambda: {"status": "READY", "result_type": "ClaimSupportResult"})
-
-        def resume(self, thread_id: str, resume_value: object, project_id: str, **kwargs: object) -> SimpleNamespace:
-            calls.append((thread_id, project_id, {"resume_value": resume_value, **kwargs}))
-            return SimpleNamespace(to_dict=lambda: {"status": "COMPLETED", "resumed": True})
-
-    app = create_app(tmp_path, runtime=FakeWebRuntime(tmp_path), scholar_harness=Harness())
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/scholar/requests",
-            json={
-                "instruction": "support this claim",
-                "project_id": "PROJECT_1",
-                "task_type": "SUPPORT_CLAIM",
-                "session_id": "SESSION_1",
-                "thread_id": "THREAD_1",
-            },
-        )
-        resumed = client.post(
-            "/api/scholar/requests/resume",
-            json={
-                "project_id": "PROJECT_1",
-                "thread_id": "THREAD_1",
-                "instruction": "support this claim",
-                "resume_value": {"decisions": [{"type": "approve"}]},
-                "task_type": "SUPPORT_CLAIM",
-                "session_id": "SESSION_1",
-            },
-        )
-
-    assert response.status_code == 200
-    assert resumed.status_code == 200
-    assert response.json()["result_type"] == "ClaimSupportResult"
-    assert resumed.json()["resumed"] is True
-    assert calls[0][2]["task_type"] == "SUPPORT_CLAIM"
-    assert calls[1][2]["resume_value"] == {"decisions": [{"type": "approve"}]}

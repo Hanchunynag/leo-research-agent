@@ -11,7 +11,7 @@ import pytest
 from app.contracts import CandidateEvidence
 from app.corpus import CanonicalCorpusService
 from app.evidence import EvidenceIntelligencePipeline
-from app.knowledge_engine import UnifiedKnowledgeService
+from app.knowledge import UnifiedKnowledgeService
 from app.scholar.models import EvidencePack
 from app.scholar.research import (
     EvidenceRef,
@@ -29,7 +29,7 @@ from app.scholar.research import (
 from app.scholar.writing.models import ResearchNeed
 from app.scholar.writing.service import ResearchDelegate
 from app.workspaces import WorkspaceService
-from tests.test_stage2_corpus_workspace import write_fixture
+from tests.test_corpus_workspace import write_fixture
 
 
 class FakeKnowledge:

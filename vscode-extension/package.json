@@ -1,9 +1,9 @@
 {
-  "name": "scholarharness-vscode",
-  "displayName": "ScholarHarness",
-  "description": "Human approval bridge for ScholarHarness manuscript patches.",
+  "name": "scholar-runtime-vscode",
+  "displayName": "Scholar Runtime",
+  "description": "Human approval bridge for Scholar Runtime manuscript patches.",
   "version": "0.1.0",
-  "publisher": "scholarharness",
+  "publisher": "leo-research-agent",
   "engines": { "vscode": "^1.86.0" },
   "categories": ["Other"],
   "activationEvents": [
@@ -16,12 +16,12 @@
   "main": "./out/extension.js",
   "contributes": {
     "configuration": {
-      "title": "ScholarHarness",
+      "title": "Scholar Runtime",
       "properties": {
         "scholar.backendUrl": {
           "type": "string",
           "default": "http://127.0.0.1:8000",
-          "description": "ScholarHarness local backend URL."
+          "description": "Scholar Runtime local backend URL."
         }
       }
     },

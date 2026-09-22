@@ -51,7 +51,7 @@ const METRIC_LABELS: Record<string, string> = {
 };
 
 const NODE_LABELS: Record<string, string> = {
-  SUPERVISOR: "主管路由",
+  MANAGER: "管理代理",
   RESEARCH: "证据研究",
   WRITER: "论文写作",
   REVIEWER: "质量审查",
@@ -300,7 +300,7 @@ function EventTimeline({ events, selectedEvent, onSelect }: { events: ScholarRun
 
 function FlowMap({ events, status }: { events: ScholarRunEvent[]; status: string }) {
   const stages = [
-    { key: "supervisor", label: "主管路由", hint: "拆解任务" },
+    { key: "manager", label: "管理代理", hint: "拆解任务" },
     { key: "research", label: "证据研究", hint: "检索与验证" },
     { key: "writer", label: "论文写作", hint: "形成草稿" },
     { key: "reviewer", label: "质量审查", hint: "检查引用" },
@@ -308,7 +308,7 @@ function FlowMap({ events, status }: { events: ScholarRunEvent[]; status: string
   ];
   const stageEvents = (key: string) => events.filter((event) => {
     const value = `${event.node} ${event.summary}`.toLowerCase();
-    if (key === "supervisor") return value.includes("supervisor") || value.includes("主管") || value.includes("route") || value.includes("worker");
+    if (key === "manager") return value.includes("manager") || value.includes("主管") || value.includes("管理") || value.includes("route") || value.includes("worker");
     if (key === "research") return value.includes("research") || value.includes("evidence") || value.includes("研究");
     if (key === "writer") return value.includes("writer") || value.includes("writing") || value.includes("draft") || value.includes("写作");
     if (key === "reviewer") return value.includes("review") || value.includes("审查");
@@ -711,7 +711,7 @@ export default function ScholarConsole() {
     setBusy(true); setError(null);
     try {
       const parsed = JSON.parse(resumeValue);
-      const next = await scholarApi.resume({ project_id: projectId, thread_id: String(snapshot.run.thread_id), instruction: "continue", session_id: snapshot.run.session_id ? String(snapshot.run.session_id) : undefined, task_type: snapshot.routing.task_type as TaskType | undefined, resume_value: parsed });
+      const next = await scholarApi.resumeRun(String(snapshot.run.run_id), parsed);
       setActiveRunId(next.run_id); setSessionId(next.session_id); setView("detail");
       await refreshRun(next.run_id, projectId);
     } catch (reason: any) { setError(reason.message || String(reason)); }
@@ -723,7 +723,7 @@ export default function ScholarConsole() {
   const selectedApprovalRecord = approvals.find((item) => String(item.patch_id) === selectedApproval);
   const displayPatch = patch || storedPatchRecord?.patch || selectedApprovalRecord?.patch || null;
   const storedPatchStatus = storedPatchRecord?.status || selectedApprovalRecord?.status;
-  const usage = snapshot?.harness?.usage || {};
+  const usage = snapshot?.orchestration?.usage || {};
   const metrics = evaluation?.metrics || {};
   const selectedSectionData = (manuscript?.sections || []).find((item: any) => item.name === selectedSection) || null;
   const currentStatus = String(snapshot?.run?.status || "");
@@ -889,7 +889,7 @@ export default function ScholarConsole() {
 
   const renderApprovals = () => <section className="approval-view view-card"><div className="view-header"><div><span className="view-eyebrow">HUMAN IN THE LOOP</span><h2>审批中心</h2><p>AI 只能提出修改，不能绕过人工审批直接改写论文。每次决定都会回写运行状态和审计记录。</p></div><div className="approval-total"><strong>{approvals.length}</strong><span>条补丁记录</span></div></div>{approvals.length ? <div className="approval-layout"><div className="approval-list">{approvals.map((item) => <button type="button" className={`approval-row ${selectedApproval === item.patch_id ? "selected" : ""}`} key={item.patch_id} onClick={() => setSelectedApproval(String(item.patch_id))}><span className="approval-icon">{item.status === "APPLIED" ? "✓" : item.status === "REJECTED" ? "×" : "!"}</span><span><strong>{displayValue(item.patch?.target_section, "论文 Section")}</strong><small>{item.patch_id} · {statusLabel(String(item.status))}</small></span><time>{formatDate(item.patch?.created_at || item.created_at)}</time></button>)}</div><div className="approval-detail">{selectedApprovalRecord ? <><div className="card-title"><div><span className="view-eyebrow">SELECTED PATCH</span><h3>{selectedApprovalRecord.patch?.target_section || "论文修改"}</h3></div><StatusPill status={String(selectedApprovalRecord.status)} /></div><p className="approval-explain">补丁 ID：<code>{selectedApprovalRecord.patch_id}</code> · 基线 Hash：<code>{selectedApprovalRecord.patch?.base_hash}</code></p><DiffPanel patch={selectedApprovalRecord.patch || null} />{["AWAITING_APPROVAL", "PENDING", "NEEDS_USER_REVIEW"].includes(String(selectedApprovalRecord.status)) && <div className="patch-review-actions"><span>审批后会触发项目状态刷新。</span><div><button className="secondary-button" type="button" onClick={() => void decidePatch("reject", selectedApprovalRecord.patch)} disabled={busy}>拒绝</button><button className="primary-button" type="button" onClick={() => void decidePatch("accept", selectedApprovalRecord.patch)} disabled={busy}>接受修改</button></div></div>}</> : <EmptyState title="请选择一条补丁" detail="左侧列表显示所有待审批、已接受和已拒绝的修改。" />}</div></div> : <EmptyState title="暂无审批记录" detail="当写作代理生成通过审查的 DraftPatch 后，审批任务会出现在这里。" />}</section>;
 
-  const renderEvaluation = () => <section className="evaluation-view view-card"><div className="view-header"><div><span className="view-eyebrow">EVALUATION / QUALITY</span><h2>运行评估</h2><p>这里展示当前任务真实返回的评估指标和运行消耗，不再使用无来源的占位统计。</p></div><StatusPill status={currentStatus || "NOT_STARTED"} /></div>{snapshot ? evaluation?.supported === false ? <div className="evaluation-unavailable"><div className="evaluation-unavailable-icon">i</div><div><strong>当前任务暂无对应评估</strong><p>{displayValue(evaluation.reason, "该任务类型当前没有可用的质量评估合同。")}</p><small>状态码：{displayValue(evaluation.reason_code, "EVALUATION_UNAVAILABLE")}</small></div></div> : <><div className="evaluation-top"><StatCard label="运行状态" value={statusLabel(currentStatus)} note={displayValue(snapshot.termination_reason, "未结束")} tone="green" /><StatCard label="事件数量" value={String(events.length)} note="完整事件时间线" /><StatCard label="上下文令牌" value={displayValue(usage.context_tokens)} note="Harness 返回" tone="purple" /><StatCard label="证据数量" value={String(evidence.length)} note="已验证证据" tone="orange" /></div><div className="metric-grid-large">{Object.keys(METRIC_LABELS).map((key) => <div key={key}><span>{METRIC_LABELS[key]}</span><strong>{formatMetric(key, metrics[key])}</strong><small>{metrics[key] === undefined ? "当前运行未返回该指标" : "来自评估接口"}</small></div>)}</div><div className="runtime-details"><div><span>运行 ID</span><code>{snapshot.run.run_id}</code></div><div><span>会话 ID</span><code>{snapshot.run.session_id}</code></div><div><span>线程 ID</span><code>{snapshot.run.thread_id}</code></div><div><span>编排后端</span><strong>{snapshot.orchestration_backend || "CrewAI"}</strong></div></div></> : <EmptyState title="还没有评估对象" detail="选择一项运行记录后，页面会加载该运行的真实指标。" />}</section>;
+  const renderEvaluation = () => <section className="evaluation-view view-card"><div className="view-header"><div><span className="view-eyebrow">EVALUATION / QUALITY</span><h2>运行评估</h2><p>这里展示当前任务真实返回的评估指标和运行消耗，不再使用无来源的占位统计。</p></div><StatusPill status={currentStatus || "NOT_STARTED"} /></div>{snapshot ? evaluation?.supported === false ? <div className="evaluation-unavailable"><div className="evaluation-unavailable-icon">i</div><div><strong>当前任务暂无对应评估</strong><p>{displayValue(evaluation.reason, "该任务类型当前没有可用的质量评估合同。")}</p><small>状态码：{displayValue(evaluation.reason_code, "EVALUATION_UNAVAILABLE")}</small></div></div> : <><div className="evaluation-top"><StatCard label="运行状态" value={statusLabel(currentStatus)} note={displayValue(snapshot.termination_reason, "未结束")} tone="green" /><StatCard label="事件数量" value={String(events.length)} note="完整事件时间线" /><StatCard label="上下文令牌" value={displayValue(usage.context_tokens)} note="CrewAI Run 返回" tone="purple" /><StatCard label="证据数量" value={String(evidence.length)} note="已验证证据" tone="orange" /></div><div className="metric-grid-large">{Object.keys(METRIC_LABELS).map((key) => <div key={key}><span>{METRIC_LABELS[key]}</span><strong>{formatMetric(key, metrics[key])}</strong><small>{metrics[key] === undefined ? "当前运行未返回该指标" : "来自评估接口"}</small></div>)}</div><div className="runtime-details"><div><span>运行 ID</span><code>{snapshot.run.run_id}</code></div><div><span>会话 ID</span><code>{snapshot.run.session_id}</code></div><div><span>线程 ID</span><code>{snapshot.run.thread_id}</code></div><div><span>编排后端</span><strong>{snapshot.orchestration_backend || "CrewAI"}</strong></div></div></> : <EmptyState title="还没有评估对象" detail="选择一项运行记录后，页面会加载该运行的真实指标。" />}</section>;
 
   const renderSystem = () => <section className="system-view view-card"><div className="view-header"><div><span className="view-eyebrow">RUNTIME / OBSERVABILITY</span><h2>系统状态</h2><p>学术 Agent 独立运行在 8001 端口，前端只通过 API 读取状态和提交任务。</p></div><button className="secondary-button" type="button" onClick={() => void refreshControls()}>↻ 刷新状态</button></div><div className="system-grid"><div className="system-card"><span className="view-eyebrow">MODEL SERVICE</span><h3><i className={`health-dot ${runtime.llm_configured ? "ok" : "warn"}`} />{runtime.llm_configured ? "本地 LLM 已配置" : "LLM 配置待检查"}</h3><p>当前学术任务使用用户服务器上的 OpenAI-compatible API。</p><div className="system-kv"><span>编排框架</span><strong>{runtime.orchestration_backend || "CrewAI"}</strong></div><div className="system-kv"><span>运行模式</span><strong>{runtimeModeLabel(runtime.mode)}</strong></div></div><div className="system-card"><span className="view-eyebrow">WORKER</span><h3><i className="health-dot ok" />任务执行器</h3><p>API 负责入队，Worker 负责执行 Agent，状态持久化后由页面实时读取。</p><div className="system-kv"><span>运行中任务</span><strong>{workers.active_jobs?.length || 0}</strong></div><div className="system-kv"><span>队列深度</span><strong>{displayValue(controlMetrics.queue_depth, "0")}</strong></div></div><div className="system-card"><span className="view-eyebrow">RAG ARCHITECTURE</span><h3>两阶段层级检索</h3><p>第一阶段在 Paper-Level 召回论文，第二阶段只在 Top-K 论文的内容 Chunk 中检索。</p><div className="rag-pipeline"><span>Paper-Level BM25 + BGE-M3</span><b>→</b><span>Top-K paper_id</span><b>→</b><span>Per-Paper Content</span></div></div></div><div className="system-runtime-foot"><span>持久化：{runtime.persistent ? "已启用" : demoMode ? "演示模式关闭" : "状态未知"}</span><span>运行历史：{controlRuns.length} 条</span><span>审批记录：{approvals.length} 条</span><span>最后刷新：{formatDate(new Date().toISOString())}</span></div></section>;
 

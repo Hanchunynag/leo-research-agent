@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import secrets
 import tempfile
 from contextvars import ContextVar
@@ -15,6 +16,7 @@ from typing import Any, Literal
 from app.generation.security import redact_sensitive_text
 from app.jobs import PersistentJobRepository
 from app.storage import write_json_atomic
+from app.tenancy import TenantPrincipal
 from app.web.models import JobCreated, JobEvent, JobSnapshot
 
 
@@ -68,8 +70,11 @@ class JobManager:
         from datetime import datetime, timedelta, timezone
 
         future = datetime.now(timezone.utc) + timedelta(seconds=1)
-        self.repository.mark_interrupted(heartbeat_before=future.isoformat())
-        for value in self.repository.recover_interrupted():
+        self.repository.mark_interrupted(
+            heartbeat_before=future.isoformat(),
+            job_type_prefix="web.",
+        )
+        for value in self.repository.recover_interrupted(job_type_prefix="web."):
             if value.status == "RETRY_PENDING" and value.job_type.startswith("web."):
                 self.repository.set_status(
                     value.job_id,
@@ -90,14 +95,22 @@ class JobManager:
         workspace_id: str = "default",
         scope_version: int = 1,
         payload: Mapping[str, Any] | None = None,
+        identity: TenantPrincipal | None = None,
     ) -> JobCreated:
+        effective_identity = identity or TenantPrincipal()
+        raw_key = (idempotency_key or f"web.{kind}:{secrets.token_hex(16)}").strip()
+        if not raw_key:
+            raise ValueError("idempotency_key 不能为空。")
+        scoped_key = self._scoped_idempotency_key(effective_identity, raw_key)
         record, created = self.repository.submit(
             f"web.{kind}",
             workspace_id=workspace_id,
             scope_version=scope_version,
             payload=payload,
-            idempotency_key=idempotency_key or f"web.{kind}:{secrets.token_hex(16)}",
+            idempotency_key=scoped_key,
             max_attempts=1,
+            tenant_id=effective_identity.tenant_id,
+            principal_id=effective_identity.principal_id,
         )
         if created:
             self._emit(record.job_id, "queued", "任务已进入队列。", 0.0)
@@ -105,6 +118,15 @@ class JobManager:
             with self._lock:
                 self._futures[record.job_id] = future
         return JobCreated(job_id=record.job_id)
+
+    @staticmethod
+    def _scoped_idempotency_key(identity: TenantPrincipal, value: str) -> str:
+        digest = hashlib.sha256(
+            f"{identity.tenant_id}\x00{identity.principal_id}\x00{value}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        return f"web:{identity.tenant_id}:{identity.principal_id}:{digest}"
 
     def _emit(
         self,
@@ -206,7 +228,24 @@ class JobManager:
             job_id, "SUCCEEDED", result_reference=reference
         )
 
-    def cancel(self, job_id: str) -> JobSnapshot:
+    @staticmethod
+    def _authorize(record: Any, identity: TenantPrincipal | None) -> None:
+        if identity is None:
+            return
+        if not identity.matches(
+            tenant_id=getattr(record, "tenant_id", None),
+            principal_id=getattr(record, "principal_id", None),
+        ):
+            raise PermissionError("Job 不属于当前租户或主体。")
+
+    def cancel(
+        self,
+        job_id: str,
+        *,
+        identity: TenantPrincipal | None = None,
+    ) -> JobSnapshot:
+        record = self.repository.get(job_id)
+        self._authorize(record, identity)
         record = self.repository.request_cancel(job_id)
         with self._lock:
             future = self._futures.get(job_id)
@@ -227,13 +266,19 @@ class JobManager:
                     "details": {},
                 },
             )
-        return self.snapshot(job_id)
+        return self.snapshot(job_id, identity=identity)
 
-    def snapshot(self, job_id: str) -> JobSnapshot:
+    def snapshot(
+        self,
+        job_id: str,
+        *,
+        identity: TenantPrincipal | None = None,
+    ) -> JobSnapshot:
         try:
             record = self.repository.get(job_id)
         except KeyError as error:
             raise KeyError(f"任务不存在：{job_id}") from error
+        self._authorize(record, identity)
         kind = record.job_type.removeprefix("web.")
         events = [JobEvent(**dict(value)) for value in self.repository.list_events(job_id)]
         result: dict[str, Any] | None = None

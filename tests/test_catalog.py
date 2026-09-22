@@ -265,5 +265,5 @@ def test_library_commands_rebuild_list_and_status(
 
     cli.main(["library", "works"])
     works_output = json.loads(capsys.readouterr().out)
-    assert works_output["record_count"] == 0
+    assert works_output["records"] == []
     assert works_output["unresolved_paper_ids"] == [paper_id]

@@ -33,7 +33,7 @@ def _stored_run(
     )
     runtime.start_run("CONSOLE_RUN", worker_id="console-test")
     trace = [
-        {"kind": "step", "name": "HARNESS_PLAN", "status": "succeeded", "elapsed_ms": 1.0, "details": {}},
+        {"kind": "step", "name": "MANAGER_DECISION", "status": "succeeded", "elapsed_ms": 1.0, "details": {}},
     ]
     if task_type not in {"WRITE_CONCLUSION", "WRITE_ABSTRACT"}:
         trace.extend([
@@ -58,7 +58,7 @@ def _stored_run(
             "selected_skill": task_type.casefold().replace("_", "-"),
             "result_type": "ClaimSupportResult" if task_type == "SUPPORT_CLAIM" else "WritingResult",
             "termination_reason": "NEEDS_USER_REVIEW",
-            "harness": {
+            "orchestration": {
                 "usage": {"steps": 4, "context_tokens": 180},
                 "trace": trace,
                 "termination_reason": "NEEDS_USER_REVIEW",
@@ -68,7 +68,7 @@ def _stored_run(
     return store, store.project_id
 
 
-def test_console_maps_persisted_harness_trace_without_second_workflow_state(tmp_path: Path) -> None:
+def test_console_maps_persisted_orchestration_trace_without_second_workflow_state(tmp_path: Path) -> None:
     store, project_id = _stored_run(tmp_path)
     projection = ScholarConsoleProjection(tmp_path, project_store=store, session_manager=SessionManager(tmp_path))
 
@@ -175,7 +175,7 @@ def test_console_manuscript_endpoint_returns_safe_text_and_pdf_preview(tmp_path:
             return {"status": "ok"}
 
     store = ScholarProjectStore(tmp_path)
-    app = create_app(tmp_path, runtime=Runtime(), scholar_harness=SimpleNamespace())
+    app = create_app(tmp_path, runtime=Runtime(), scholar_orchestration=SimpleNamespace())
     with TestClient(app) as client:
         response = client.get(f"/api/scholar/projects/{store.project_id}/manuscript")
         assert response.status_code == 200
@@ -205,7 +205,7 @@ def test_scholar_console_sse_supports_cursor_replay(tmp_path: Path) -> None:
 
     from app.web.api import create_app
 
-    app = create_app(tmp_path, runtime=Runtime(), scholar_harness=SimpleNamespace())
+    app = create_app(tmp_path, runtime=Runtime(), scholar_orchestration=SimpleNamespace())
     with TestClient(app) as client:
         response = client.get("/api/scholar/runs/CONSOLE_RUN/events?after=2")
         assert response.status_code == 200
@@ -326,7 +326,7 @@ def test_run_event_contract_rejects_invalid_cursor_and_has_stable_shape() -> Non
         session_id=None,
         timestamp="2026-09-13T00:00:00+00:00",
         type="RUN_STARTED",
-        node="Supervisor",
+        node="Manager",
         status="COMPLETED",
         summary="started",
     )
@@ -339,7 +339,7 @@ def test_run_event_contract_rejects_invalid_cursor_and_has_stable_shape() -> Non
             session_id=None,
             timestamp="2026-09-13T00:00:00+00:00",
             type="RUN_STARTED",
-            node="Supervisor",
+        node="Manager",
             status="COMPLETED",
             summary="started",
         )

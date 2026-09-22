@@ -232,7 +232,7 @@ h1, h2, h3, p { margin-top: 0; }
   .welcome h2 { font-size: 25px; }
 }
 
-/* ScholarHarness Control Console */
+/* Scholar Runtime Control Console */
 .scholar-console {
   --console-ink: #20201d;
   --console-muted: #77766e;

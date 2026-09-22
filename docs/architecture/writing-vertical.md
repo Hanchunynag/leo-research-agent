@@ -2,8 +2,7 @@
 
 ## 当前边界
 
-`ScholarWritingService`（别名 `ManuscriptSupervisor`）是当前 framework-agnostic 的 Introduction
-应用编排边界。它只读取最新 LaTeX、Project Facts 和 confirmed Contribution，加载
+`ScholarWritingService` 是 Introduction 的领域编排边界。它只读取最新 LaTeX、Project Facts 和 confirmed Contribution，加载
 `write-introduction` Skill，通过 `ResearchDelegate` 调用由 Freshness Policy 控制的
 `ResearchCapabilityService`，生成 ClaimPlan、SectionDraft、ReviewReport 和未应用的
 DraftPatch。它没有 LaTeX 写权限，也不访问 Qdrant、BM25、RRF、Graph Node 或
@@ -43,7 +42,7 @@ sequenceDiagram
 `WritingRequest` 只允许 `target_section=introduction` 和 `mode=WRITE|REVISE`。`IntroductionSkill`
 把请求拆成 technical problem、existing approaches、limitations 等 bounded ResearchNeed；它不
 产生 Contribution。`ClaimPlan` 中 Literature Claim 的 source 是 Verified Evidence，Contribution
-Claim 的 source 是 Project Registry，二者不共享同一个 authority。Supervisor 只消费
+Claim 的 source 是 Project Registry，二者不共享同一个 authority。Writing Service 只消费
 `status=confirmed` 且 `confirmed_by_user=true` 的 Contribution；任何 selected candidate、事实
 冲突或错误 project_id 都返回 conflict，不自动选择低权威来源。
 
@@ -76,7 +75,7 @@ manuscript/workspace/facts/contributions/research/evidence/citation/reviewer 的
 
 Phase 2A 的 Introduction 垂直不直接调用 Web；Phase 2D 允许其 ResearchRequest 在
 CapabilityProfile 允许且 Freshness Policy 判定需要时，经 ResearchCapabilityService 使用受控
-Web Literature。Deep Agents 现在只作为进程内 Harness 层调用该 Runtime；它不能改变
+Web Literature。CrewAI Manager 现在只通过 Flow 调用该 Runtime；它不能改变
 Writing Skill、Reviewer、DraftPatch 或 Approval 边界。自动 Apply 或其它 Writing Skill 仍不在该边界内。Phase 2B 的
 人工审批和安全落盘边界见 [`human-approval-latex-loop.md`](human-approval-latex-loop.md)。
 
@@ -91,6 +90,6 @@ Citation OFF。完整 identity、BibKey、External Evidence projection 和并发
 编辑规则见 [`citation-lifecycle.md`](citation-lifecycle.md)。
 
 Phase 3B 的 Web、CLI Scholar-level 请求由同一个
-`ScholarRuntimeFactory → ScholarHarnessService` 进入该 Writing Runtime；Deep Agent
-只负责用户级路由、Context 隔离和调用既有 Skill，不改变 Introduction、Conclusion、
+`Harness → ScholarOrchestrationService` 进入该 Writing Runtime；Manager
+只负责用户级规划、Context 隔离和调用既有 Skill，不改变 Introduction、Conclusion、
 Abstract 的 CapabilityProfile，也不获得 `.tex`、`.bib` 或 Patch Approval 权限。

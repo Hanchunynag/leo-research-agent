@@ -12,7 +12,7 @@ from app.scholar.runs import ScholarRunManager, ScholarRunWorker
 from app.scholar.models import DraftPatch, ReviewReport
 from app.jobs.registry import WorkerRegistry
 from app.observability.metrics import build_metrics_snapshot
-from app.knowledge_engine.unified_service import knowledge_runtime_status
+from app.knowledge.service import knowledge_runtime_status
 from app.web.api import create_app
 from tests.test_web_api import FakeWebRuntime
 

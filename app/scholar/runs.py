@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import hashlib
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -20,6 +21,7 @@ from app.jobs.worker import JobCancelled, JobExecutionContext, PersistentJobWork
 from app.orchestration.contracts import OrchestrationRequest
 from app.scholar.events import RunEventStore
 from app.session import SessionManager
+from app.tenancy import TenantPrincipal
 
 
 _ROUTES = {
@@ -60,7 +62,7 @@ class ScholarRunManager:
         event_store: RunEventStore | None = None,
         worker_registry: WorkerRegistry | None = None,
         orchestration: Any | None = None,
-        runtime_factory: Any | None = None,
+        harness: Any | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve()
         self.repository = repository or PersistentJobRepository(self.project_root)
@@ -68,7 +70,7 @@ class ScholarRunManager:
         self.event_store = event_store or RunEventStore(self.project_root)
         self.worker_registry = worker_registry or WorkerRegistry(self.project_root)
         self.orchestration = orchestration
-        self.runtime_factory = runtime_factory
+        self.harness = harness
         self._bundle: Any | None = None
 
     def _runtime_for(self, session_id: str) -> Any:
@@ -82,6 +84,17 @@ class ScholarRunManager:
             if job.idempotency_key == idempotency_key:
                 return job
         return None
+
+    @staticmethod
+    def _scoped_idempotency_key(identity: TenantPrincipal, value: str) -> str:
+        """Prevent one tenant/user from consuming another user's key."""
+
+        digest = hashlib.sha256(
+            f"{identity.tenant_id}\x00{identity.principal_id}\x00{value}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        return f"scholar:{identity.tenant_id}:{identity.principal_id}:{digest}"
 
     def _mark_duplicate_run_cancelled(
         self,
@@ -138,50 +151,92 @@ class ScholarRunManager:
         idempotency_key: str | None = None,
         max_attempts: int = 3,
     ) -> dict[str, Any]:
-        key = (idempotency_key or f"scholar.run:{request.request_id}").strip()
-        if not key:
+        identity = TenantPrincipal(
+            tenant_id=request.tenant_id, principal_id=request.principal_id
+        )
+        raw_key = (idempotency_key or f"scholar.run:{request.request_id}").strip()
+        key = self._scoped_idempotency_key(identity, raw_key)
+        if not raw_key:
             raise ValueError("idempotency_key 不能为空。")
         existing_job = self._existing_job(key)
         if existing_job is not None:
             run_id = str(existing_job.payload.get("run_id") or "")
             if run_id:
-                return self.snapshot(run_id)
+                identity = TenantPrincipal(
+                    tenant_id=existing_job.tenant_id,
+                    principal_id=existing_job.principal_id,
+                )
+                return self.snapshot(run_id, identity=identity)
 
         session = self.session_manager.resolve(
             request.session_id,
             title=request.instruction[:120],
             project_id=request.project_id,
+            tenant_id=identity.tenant_id,
+            principal_id=identity.principal_id,
         )
         runtime = self._runtime_for(session.session_id)
-        run_id = f"RUN_{secrets.token_hex(8)}"
-        thread_id = request.thread_id or f"crew_{run_id}"
-        trace_id = f"TRACE_{secrets.token_hex(8)}"
-        runtime.create_run(
-            request.instruction,
-            run_id=run_id,
-            thread_id=thread_id,
-            trace_id=trace_id,
-            project_id=request.project_id,
-        )
-        payload = {
-            "request_id": request.request_id,
-            "project_id": request.project_id,
-            "session_id": session.session_id,
-            "run_id": run_id,
-            "thread_id": thread_id,
-            "trace_id": trace_id,
-            "task_type": request.task_type,
-            "metadata": _safe_metadata(request.metadata),
-        }
-        try:
-            job, created = self.repository.submit(
-                "scholar.run",
-                workspace_id=request.project_id,
-                scope_version=1,
-                payload=payload,
-                idempotency_key=key,
-                max_attempts=max_attempts,
+        # The session lock makes the active-run check and Run/Job creation one
+        # local critical section. A shared Session is intentionally serialized
+        # by default; separate Sessions remain independently concurrent.
+        with self.session_manager.lock(session.session_id):
+            raced_job = self._existing_job(key)
+            if raced_job is not None:
+                winner_id = str(raced_job.payload.get("run_id") or "")
+                if winner_id:
+                    return self.snapshot(winner_id, identity=identity)
+            active = [
+                value
+                for value in runtime.list_runs()
+                if value.status
+                in {"PENDING", "QUEUED", "RUNNING", "WAITING_USER"}
+                and value.tenant_id == identity.tenant_id
+                and value.principal_id == identity.principal_id
+            ]
+            if active:
+                error = ValueError(
+                    f"Session 当前已有活动 Run：{active[0].run_id}"
+                )
+                setattr(error, "code", "SESSION_BUSY")
+                raise error
+            run_id = f"RUN_{secrets.token_hex(8)}"
+            thread_id = request.thread_id or f"crew_{run_id}"
+            trace_id = f"TRACE_{secrets.token_hex(8)}"
+            runtime.create_run(
+                request.instruction,
+                run_id=run_id,
+                thread_id=thread_id,
+                trace_id=trace_id,
+                project_id=request.project_id,
+                task_type=request.task_type,
+                tenant_id=identity.tenant_id,
+                principal_id=identity.principal_id,
             )
+            payload = {
+                "request_id": request.request_id,
+                "project_id": request.project_id,
+                "session_id": session.session_id,
+                "run_id": run_id,
+                "thread_id": thread_id,
+                "trace_id": trace_id,
+                "task_type": request.task_type,
+                "tenant_id": identity.tenant_id,
+                "principal_id": identity.principal_id,
+                "metadata": _safe_metadata(request.metadata),
+            }
+            try:
+                job, created = self.repository.submit(
+                    "scholar.run",
+                    workspace_id=request.project_id,
+                    scope_version=1,
+                    payload=payload,
+                    idempotency_key=key,
+                    max_attempts=max_attempts,
+                    tenant_id=identity.tenant_id,
+                    principal_id=identity.principal_id,
+                )
+            except Exception:
+                raise
             if not created:
                 # The race-safe repository winner owns the Run.  Remove no
                 # data here; close the losing local Run explicitly and return
@@ -196,7 +251,7 @@ class ScholarRunManager:
                             session_id=session.session_id,
                             winner_run_id=winner_id,
                         )
-                    return self.snapshot(winner_id)
+                    return self.snapshot(winner_id, identity=identity)
             runtime.bind_job(run_id, job.job_id)
             runtime.queue_run(run_id, job_id=job.job_id)
             self.event_store.append(
@@ -207,23 +262,32 @@ class ScholarRunManager:
                 node="Scholar Run",
                 status="PENDING",
                 summary="Scholar Run queued",
-                metadata={"lifecycle": "QUEUED", "job_id": job.job_id, "backend": "crewai"},
+                metadata={
+                    "lifecycle": "QUEUED",
+                    "job_id": job.job_id,
+                    "backend": "crewai",
+                    "tenant_id": identity.tenant_id,
+                    "principal_id": identity.principal_id,
+                },
                 event_id=f"{run_id}:created",
             )
-        except Exception:
-            # The Run is intentionally left inspectable if queue persistence
-            # fails; callers can retry with the same request key safely.
-            raise
-        return self.snapshot(run_id)
+        return self.snapshot(run_id, identity=identity)
 
-    def _locate(self, run_id: str) -> tuple[Any, Any]:
+    def _locate(
+        self, run_id: str, *, identity: TenantPrincipal | None = None
+    ) -> tuple[Any, Any]:
         requested = run_id.strip()
         if not requested:
             raise KeyError("Run ID 不能为空。")
         for session in self.session_manager.list(include_deleted=False):
             runtime = self.session_manager.open(session.session_id)
             try:
-                return runtime, runtime.get_run(requested)
+                run = runtime.get_run(requested)
+                if identity is not None and not identity.matches(
+                    tenant_id=run.tenant_id, principal_id=run.principal_id
+                ):
+                    continue
+                return runtime, run
             except KeyError:
                 continue
         raise KeyError(f"Run 不存在：{requested}")
@@ -247,8 +311,10 @@ class ScholarRunManager:
                     return runtime, run
         return None
 
-    def snapshot(self, run_id: str) -> dict[str, Any]:
-        runtime, run = self._locate(run_id)
+    def snapshot(
+        self, run_id: str, *, identity: TenantPrincipal | None = None
+    ) -> dict[str, Any]:
+        runtime, run = self._locate(run_id, identity=identity)
         result = next(
             (
                 item
@@ -271,6 +337,8 @@ class ScholarRunManager:
             "run_id": run.run_id,
             "session_id": run.session_id,
             "project_id": run.project_id,
+            "tenant_id": run.tenant_id,
+            "principal_id": run.principal_id,
             "thread_id": run.thread_id,
             "trace_id": run.trace_id,
             "status": "WAITING_HUMAN_APPROVAL" if run.status == "WAITING_USER" else run.status,
@@ -291,7 +359,13 @@ class ScholarRunManager:
             "detail_available": True,
         }
 
-    def list_runs(self, *, project_id: str | None = None, session_id: str | None = None) -> list[dict[str, Any]]:
+    def list_runs(
+        self,
+        *,
+        project_id: str | None = None,
+        session_id: str | None = None,
+        identity: TenantPrincipal | None = None,
+    ) -> list[dict[str, Any]]:
         values: list[dict[str, Any]] = []
         sessions = self.session_manager.list(include_deleted=False)
         for session in sessions:
@@ -303,14 +377,20 @@ class ScholarRunManager:
             for run in runtime.list_runs():
                 if project_id and run.project_id and run.project_id != project_id:
                     continue
-                values.append(self.snapshot(run.run_id))
+                if identity is not None and not identity.matches(
+                    tenant_id=run.tenant_id, principal_id=run.principal_id
+                ):
+                    continue
+                values.append(self.snapshot(run.run_id, identity=identity))
         return sorted(values, key=lambda item: (str(item.get("created_at")), str(item.get("run_id"))))
 
-    def cancel(self, run_id: str) -> dict[str, Any]:
-        _, run = self._locate(run_id)
+    def cancel(
+        self, run_id: str, *, identity: TenantPrincipal | None = None
+    ) -> dict[str, Any]:
+        _, run = self._locate(run_id, identity=identity)
         if run.job_id:
             self.repository.request_cancel(run.job_id)
-        runtime, current = self._locate(run_id)
+        runtime, current = self._locate(run_id, identity=identity)
         if current.status in {"PENDING", "QUEUED", "WAITING_USER"}:
             runtime.complete_run(
                 run_id,
@@ -332,7 +412,7 @@ class ScholarRunManager:
                 event_id=f"{run_id}:cancelled",
             )
             self.session_manager.clear_active_run_if(current.session_id, run_id)
-        return self.snapshot(run_id)
+        return self.snapshot(run_id, identity=identity)
 
     def reconcile_job(self, job: JobRecord) -> dict[str, Any] | None:
         """Reconcile a durable Scholar Job with its Session Run.
@@ -437,14 +517,22 @@ class ScholarRunManager:
         *,
         resume_value: Any = None,
         idempotency_key: str | None = None,
+        identity: TenantPrincipal | None = None,
     ) -> dict[str, Any]:
-        runtime, run = self._locate(run_id)
+        runtime, run = self._locate(run_id, identity=identity)
         if run.status in _TERMINAL_RUNS - {"WAITING_USER"}:
-            return self.snapshot(run_id)
-        key = (idempotency_key or f"scholar.resume:{run_id}:{run.completed_at or 'pending'}").strip()
+            return self.snapshot(run_id, identity=identity)
+        effective_identity = identity or TenantPrincipal(
+            tenant_id=run.tenant_id, principal_id=run.principal_id
+        )
+        raw_key = (
+            idempotency_key
+            or f"scholar.resume:{run_id}:{run.completed_at or 'pending'}"
+        ).strip()
+        key = self._scoped_idempotency_key(effective_identity, raw_key)
         existing = self._existing_job(key)
         if existing is not None:
-            return self.snapshot(run_id)
+            return self.snapshot(run_id, identity=effective_identity)
         job, created = self.repository.submit(
             "scholar.resume",
             workspace_id=str(run.project_id or ""),
@@ -455,10 +543,14 @@ class ScholarRunManager:
                 "session_id": run.session_id,
                 "thread_id": run.thread_id,
                 "task_type": None,
+                "tenant_id": effective_identity.tenant_id,
+                "principal_id": effective_identity.principal_id,
                 "resume_value": _safe_metadata(resume_value),
             },
             idempotency_key=key,
             max_attempts=3,
+            tenant_id=effective_identity.tenant_id,
+            principal_id=effective_identity.principal_id,
         )
         runtime.queue_run(run_id, job_id=job.job_id)
         self.event_store.append(
@@ -472,22 +564,63 @@ class ScholarRunManager:
             metadata={"job_id": job.job_id},
             event_id=f"{run_id}:resume:{job.job_id}",
         )
-        return self.snapshot(run_id)
+        return self.snapshot(run_id, identity=effective_identity)
+
+    def enqueue_resume_for_thread(
+        self,
+        thread_id: str,
+        project_id: str,
+        *,
+        resume_value: Any = None,
+        session_id: str | None = None,
+        idempotency_key: str | None = None,
+        identity: TenantPrincipal | None = None,
+    ) -> dict[str, Any]:
+        """Resolve a user-facing thread reference without executing in API."""
+
+        if not thread_id.strip():
+            raise ValueError("thread_id 不能为空。")
+        for session in self.session_manager.list(include_deleted=False):
+            if session_id and session.session_id != session_id:
+                continue
+            if identity is not None and not identity.matches(
+                tenant_id=session.tenant_id, principal_id=session.principal_id
+            ):
+                continue
+            runtime = self.session_manager.open(session.session_id)
+            for run in runtime.list_runs():
+                if (
+                    run.thread_id == thread_id
+                    and run.project_id == project_id
+                    and (
+                        identity is None
+                        or identity.matches(
+                            tenant_id=run.tenant_id,
+                            principal_id=run.principal_id,
+                        )
+                    )
+                ):
+                    return self.enqueue_resume(
+                        run.run_id,
+                        resume_value=resume_value,
+                        idempotency_key=idempotency_key,
+                        identity=identity,
+                    )
+        raise KeyError(f"Run 不存在或不属于当前主体：{thread_id}")
 
     def _runner(self) -> Any:
         if self.orchestration is not None:
             return self.orchestration
         if self._bundle is None:
-            if self.runtime_factory is not None:
-                factory = self.runtime_factory() if callable(self.runtime_factory) else self.runtime_factory
+            if self.harness is not None:
+                harness = self.harness() if callable(self.harness) else self.harness
             else:
-                from app.scholar.composition import ScholarRuntimeFactory
+                from app.harness import Harness
 
-                factory = ScholarRuntimeFactory(
+                harness = Harness(
                     self.project_root,
-                    orchestration_backend=os.getenv("ORCHESTRATION_BACKEND") or "crewai",
                 )
-            self._bundle = factory.build() if callable(getattr(factory, "build", None)) else factory
+            self._bundle = harness.build() if callable(getattr(harness, "build", None)) else harness
         return getattr(self._bundle, "scholar_orchestration", self._bundle)
 
     def execute(self, job: JobRecord, context: JobExecutionContext) -> str:
@@ -520,6 +653,8 @@ class ScholarRunManager:
             session_id=run.session_id,
             task_type=payload.get("task_type") if payload.get("task_type") in _ROUTES else None,
             thread_id=run.thread_id,
+            tenant_id=str(payload.get("tenant_id") or run.tenant_id),
+            principal_id=str(payload.get("principal_id") or run.principal_id),
             metadata={
                 **(_safe_metadata(payload.get("metadata")) if isinstance(payload.get("metadata"), Mapping) else {}),
                 "_run_id": run_id,
@@ -645,9 +780,38 @@ class ScholarRunManager:
 class ScholarRunWorker:
     """Independent process entrypoint backed by the existing durable queue."""
 
-    def __init__(self, manager: ScholarRunManager, *, worker_id: str | None = None) -> None:
+    def __init__(
+        self,
+        manager: ScholarRunManager,
+        *,
+        worker_id: str | None = None,
+        retry_backoff_seconds: float | None = None,
+        retry_backoff_max_seconds: float | None = None,
+        retry_jitter_seconds: float | None = None,
+        max_running_per_scope: int | None = None,
+    ) -> None:
         self.manager = manager
         self.worker_id = worker_id or f"scholar-worker:{os.getpid()}:{secrets.token_hex(4)}"
+        configured_backoff = (
+            float(os.getenv("LEO_SCHOLAR_RETRY_BACKOFF_SECONDS", "1.0"))
+            if retry_backoff_seconds is None
+            else retry_backoff_seconds
+        )
+        configured_max_backoff = (
+            float(os.getenv("LEO_SCHOLAR_RETRY_BACKOFF_MAX_SECONDS", "60.0"))
+            if retry_backoff_max_seconds is None
+            else retry_backoff_max_seconds
+        )
+        configured_jitter = (
+            float(os.getenv("LEO_SCHOLAR_RETRY_JITTER_SECONDS", "0.25"))
+            if retry_jitter_seconds is None
+            else retry_jitter_seconds
+        )
+        configured_scope_limit = (
+            int(os.getenv("LEO_SCHOLAR_MAX_RUNNING_PER_SCOPE", "1"))
+            if max_running_per_scope is None
+            else max_running_per_scope
+        )
         self.worker = PersistentJobWorker(
             manager.repository,
             {
@@ -655,6 +819,16 @@ class ScholarRunWorker:
                 "scholar.resume": self._resume,
             },
             worker_id=self.worker_id,
+            # Keep the control-plane Worker liveness fresh while a single
+            # Scholar Run is executing. Job heartbeat alone is not enough for
+            # multi-user scheduling and readiness projections.
+            worker_heartbeat=lambda: self.manager.worker_registry.heartbeat(
+                self.worker_id
+            ),
+            retry_backoff_seconds=configured_backoff,
+            retry_backoff_max_seconds=configured_max_backoff,
+            retry_jitter_seconds=configured_jitter,
+            max_running_per_scope=configured_scope_limit,
         )
         self.manager.worker_registry.register(
             self.worker_id,

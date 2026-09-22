@@ -1,8 +1,7 @@
 """Paper-level metadata projection and deterministic BM25 index.
 
-This module is deliberately additive.  The existing chunk BM25 index remains the
-source used by the legacy retrieval path; this index is consumed only by the
-hierarchical retriever.
+This module owns the paper-level metadata index used by the hierarchical
+retriever. The chunk BM25 index remains a separate content-level projection.
 """
 
 from __future__ import annotations

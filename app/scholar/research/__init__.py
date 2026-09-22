@@ -1,4 +1,4 @@
-"""ScholarHarness 的本地 Research Capability Layer。"""
+"""Scholar 的本地 Research Capability Layer。"""
 
 from app.scholar.research.errors import (
     EvidenceValidationError,
@@ -33,6 +33,22 @@ from app.scholar.research.models import (
 )
 from app.scholar.research.service import ResearchCapabilityService, ResearchProgressCallback
 from app.scholar.research.web import WebLiteratureAdapter, canonical_identity
+from app.scholar.research.budget import (
+    BudgetExceeded,
+    CapabilityBudget,
+    CapabilityBudgetPolicy,
+    CapabilityState,
+    RecoveryLevel,
+)
+from app.scholar.research.gateway import ToolGateway, ToolSpec, build_default_gateway
+from app.scholar.research.providers import (
+    AcademicBackend,
+    AcademicLiteratureProviderAdapter,
+    BootstrapProviderComposition,
+    CandidateKnowledgeRepository,
+    CanonicalDocumentParseProviderAdapter,
+    build_bootstrap_provider_composition,
+)
 
 __all__ = [
     "EvidenceCandidate",
@@ -69,4 +85,18 @@ __all__ = [
     "LiteratureCandidate",
     "LiteratureSearchRequest",
     "LiteratureSearchResult",
+    "AcademicBackend",
+    "AcademicLiteratureProviderAdapter",
+    "BootstrapProviderComposition",
+    "CandidateKnowledgeRepository",
+    "CanonicalDocumentParseProviderAdapter",
+    "build_bootstrap_provider_composition",
+    "BudgetExceeded",
+    "CapabilityBudget",
+    "CapabilityBudgetPolicy",
+    "CapabilityState",
+    "RecoveryLevel",
+    "ToolGateway",
+    "ToolSpec",
+    "build_default_gateway",
 ]

@@ -130,7 +130,7 @@ class RetrievalRuntime:
         )
         if mode == "hierarchical" or (self.hierarchical_enabled and hierarchical_ready):
             # An explicit hierarchical call uses the configured reranker when
-            # available.  Automatic use from legacy ``fast`` remains cheap;
+            # available.  Automatic use from ``fast`` remains cheap;
             # callers can request ``accurate`` for the Cross Encoder stage.
             dense_enabled, fallback_reason = self._dense_retrieval_policy()
             reranker = (

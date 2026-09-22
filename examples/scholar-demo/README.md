@@ -1,7 +1,7 @@
-# ScholarHarness Demo Project
+# Scholar Runtime Demo Project
 
 This is a small, realistic LEO signals-of-opportunity LaTeX project used by
-the release E2E harness. It contains no credentials and no pre-populated
+the release E2E. It contains no credentials and no pre-populated
 bibliography entry, so an Introduction run can demonstrate a reviewed
 `BibEntryCandidate` and Human-approved `.bib` + `.tex` change.
 

@@ -1,4 +1,4 @@
-"""ScholarHarness 的人工审批、Patch Apply 与 LaTeX Bridge 契约。"""
+"""Scholar 的人工审批、Patch Apply 与 LaTeX Bridge 契约。"""
 
 from app.scholar.approval.models import (
     ApprovalDecision,

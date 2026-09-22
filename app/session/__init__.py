@@ -8,6 +8,7 @@ from app.session.models import (
     SessionStatus,
 )
 from app.session.runtime import SessionRuntime
+from app.session.context import ConversationContextBuilder, ManagerContextBuilder
 
 __all__ = [
     "RunRecord",
@@ -16,4 +17,6 @@ __all__ = [
     "SessionRecord",
     "SessionRuntime",
     "SessionStatus",
+    "ConversationContextBuilder",
+    "ManagerContextBuilder",
 ]

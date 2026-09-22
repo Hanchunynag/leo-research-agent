@@ -1,4 +1,4 @@
-"""ScholarHarness 的最小领域契约与 Manuscript 边界。"""
+"""Scholar 领域契约、Manuscript 边界与 CrewAI Runtime 入口。"""
 
 from app.scholar.manuscript import ManuscriptSynchronizer, PatchConflict
 from app.scholar.approval import (
@@ -26,8 +26,11 @@ from app.scholar.models import (
     ReviewIssue,
     ReviewReport,
 )
-from app.scholar.project import ScholarProjectStore
-from app.scholar.context import ScholarContextBudget
+from app.scholar.project import (
+    ProjectRevisionConflict,
+    ProjectWriteBusyError,
+    ScholarProjectStore,
+)
 from app.scholar.errors import (
     CapabilityViolation,
     CorrelationConflict,
@@ -38,12 +41,11 @@ from app.scholar.errors import (
     ScholarRuntimeError,
 )
 from app.scholar.evaluation import (
-    HarnessEvaluationCase,
-    HarnessEvaluationRecord,
-    HarnessEvaluationReport,
-    HarnessEvaluationSuite,
-    ScholarHarnessEvaluationSuite,
-    default_harness_cases,
+    ScholarEvaluationCase,
+    ScholarEvaluationRecord,
+    ScholarEvaluationReport,
+    ScholarEvaluationSuite,
+    default_scholar_cases,
 )
 from app.scholar.console import RunEvent, ScholarConsoleProjection
 from app.scholar.citation import (
@@ -99,7 +101,6 @@ from app.scholar.writing import (
     IntroductionReviewer,
     ChatCompletionSynthesisWriter,
     IntroductionSkill,
-    ManuscriptSupervisor,
     MetadataCitationResolver,
     ResearchDelegate,
     ResearchNeed,
@@ -143,7 +144,8 @@ __all__ = [
     "ReviewIssue",
     "ReviewReport",
     "ScholarProjectStore",
-    "ScholarContextBudget",
+    "ProjectRevisionConflict",
+    "ProjectWriteBusyError",
     "ScholarRuntimeError",
     "ConfigurationError",
     "ProviderUnavailable",
@@ -151,12 +153,11 @@ __all__ = [
     "CapabilityViolation",
     "CorrelationConflict",
     "DomainConflict",
-    "HarnessEvaluationCase",
-    "HarnessEvaluationRecord",
-    "HarnessEvaluationReport",
-    "HarnessEvaluationSuite",
-    "ScholarHarnessEvaluationSuite",
-    "default_harness_cases",
+    "ScholarEvaluationCase",
+    "ScholarEvaluationRecord",
+    "ScholarEvaluationReport",
+    "ScholarEvaluationSuite",
+    "default_scholar_cases",
     "RunEvent",
     "ScholarConsoleProjection",
     "EvidenceCandidate",
@@ -190,7 +191,6 @@ __all__ = [
     "IntroductionReviewer",
     "ChatCompletionSynthesisWriter",
     "IntroductionSkill",
-    "ManuscriptSupervisor",
     "MetadataCitationResolver",
     "ResearchDelegate",
     "ResearchNeed",
@@ -230,31 +230,19 @@ __all__ = [
 
 
 def __getattr__(name: str) -> object:
-    """Lazily expose the Deep Agents adapter without import cycles."""
+    """Lazily expose runtime services without import cycles."""
 
     if name in {
-        "DeepAgentsSkillAdapter",
-        "ScholarHarnessResult",
-        "ScholarHarnessService",
-        "ScholarRuntimeBundle",
-        "ScholarRuntimeFactory",
         "ScholarOrchestrationService",
         "ScholarRunManager",
         "ScholarRunWorker",
         "RunEventStore",
     }:
-        from app.scholar.harness import DeepAgentsSkillAdapter, ScholarHarnessResult, ScholarHarnessService
-        from app.scholar.composition import ScholarRuntimeBundle, ScholarRuntimeFactory
         from app.orchestration.service import ScholarOrchestrationService
         from app.scholar.runs import ScholarRunManager, ScholarRunWorker
         from app.scholar.events import RunEventStore
 
         return {
-            "DeepAgentsSkillAdapter": DeepAgentsSkillAdapter,
-            "ScholarHarnessResult": ScholarHarnessResult,
-            "ScholarHarnessService": ScholarHarnessService,
-            "ScholarRuntimeBundle": ScholarRuntimeBundle,
-            "ScholarRuntimeFactory": ScholarRuntimeFactory,
             "ScholarOrchestrationService": ScholarOrchestrationService,
             "ScholarRunManager": ScholarRunManager,
             "ScholarRunWorker": ScholarRunWorker,
@@ -265,11 +253,6 @@ def __getattr__(name: str) -> object:
 
 __all__.extend(
     (
-        "DeepAgentsSkillAdapter",
-        "ScholarHarnessResult",
-        "ScholarHarnessService",
-        "ScholarRuntimeBundle",
-        "ScholarRuntimeFactory",
         "ScholarOrchestrationService",
         "ScholarRunManager",
         "ScholarRunWorker",

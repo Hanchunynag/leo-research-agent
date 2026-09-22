@@ -15,9 +15,8 @@ stateDiagram-v2
   WAITING_HUMAN_APPROVAL --> COMPLETED: reject or applied approval
 ```
 
-`WAITING_HUMAN_APPROVAL` is stored compatibly as `WAITING_USER` in the legacy
-SessionRuntime schema and exposed with the production name at the async Run
-API. A Run and its Job always carry `run_id`, `session_id`, `project_id`,
+`WAITING_HUMAN_APPROVAL` is the canonical persisted and API state. A Run and its
+Job always carry `run_id`, `session_id`, `project_id`,
 `thread_id`, `trace_id`, and `job_id` correlation.
 
 Approval/rejection is a two-step durable boundary: the PatchApproval API first

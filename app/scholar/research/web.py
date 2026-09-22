@@ -12,7 +12,10 @@ from typing import Any, Mapping, Protocol
 
 from app.contracts import CandidateEvidence, ExternalEvidenceResolution
 from app.knowledge.identity import normalize_doi, normalize_identity_text
-from app.research.harness import ResearchBudgetPolicy, ResearchRunHarness
+from app.scholar.research.budget import (
+    CapabilityBudget,
+    CapabilityBudgetPolicy,
+)
 from app.scholar.research.cache import LiteratureDiscoveryCache, literature_request_fingerprint
 from app.scholar.research.errors import (
     WebProviderRateLimited,
@@ -85,7 +88,7 @@ def _canonical_id(raw: Mapping[str, Any], title: str, authors: tuple[str, ...], 
 
 
 class LiteratureSearcher(Protocol):
-    def __call__(self, request: LiteratureSearchRequest, harness: ResearchRunHarness | None) -> Mapping[str, Any] | LiteratureSearchResult: ...
+    def __call__(self, request: LiteratureSearchRequest, budget: CapabilityBudget | None) -> Mapping[str, Any] | LiteratureSearchResult: ...
 
 
 class WebLiteratureAdapter:
@@ -106,14 +109,14 @@ class WebLiteratureAdapter:
         self._sources: dict[str, ExternalEvidenceResolution] = {}
         self.last_diagnostics: dict[str, Any] = {}
 
-    def _raw_search(self, request: LiteratureSearchRequest, harness: ResearchRunHarness | None) -> Mapping[str, Any] | LiteratureSearchResult:
+    def _raw_search(self, request: LiteratureSearchRequest, budget: CapabilityBudget | None) -> Mapping[str, Any] | LiteratureSearchResult:
         if self.searcher is not None:
-            return self.searcher(request, harness)
+            return self.searcher(request, budget)
         assert self.gateway is not None
-        if harness is None:
-            harness = ResearchRunHarness(
+        if budget is None:
+            budget = CapabilityBudget(
                 "scholar_research",
-                ResearchBudgetPolicy(
+                CapabilityBudgetPolicy(
                     max_steps=8,
                     max_tool_calls=max(2, request.max_results + 1),
                     max_external_searches=1,
@@ -122,9 +125,9 @@ class WebLiteratureAdapter:
                     max_total_tokens=2_000,
                 ),
             )
-            harness.transition("context_preparing")
-            harness.transition("planning")
-            harness.transition("executing")
+            budget.transition("context_preparing")
+            budget.transition("planning")
+            budget.transition("executing")
         return self.gateway.invoke(
             "literature.search",
             {
@@ -139,7 +142,7 @@ class WebLiteratureAdapter:
                 "scope_version": int(request.metadata.get("scope_version", 1)),
                 "permissions": ("literature.search", "literature.read"),
             },
-            harness=harness,
+            budget=budget,
         )
 
     @staticmethod
@@ -264,7 +267,7 @@ class WebLiteratureAdapter:
         failures = tuple(value for value in (raw.get("provider_failures") or ()) if isinstance(value, Mapping))
         return LiteratureSearchResult(request_id, query, tuple(candidates), failures, tuple(conflicts), metadata={"candidate_count": len(candidates)})
 
-    def search(self, request: LiteratureSearchRequest, *, harness: ResearchRunHarness | None = None) -> LiteratureSearchResult:
+    def search(self, request: LiteratureSearchRequest, *, budget: CapabilityBudget | None = None) -> LiteratureSearchResult:
         fingerprint = literature_request_fingerprint(
             request.query,
             provider_set=tuple(str(value) for value in request.metadata.get("provider_set", ())),
@@ -277,24 +280,24 @@ class WebLiteratureAdapter:
         if cached is not None:
             result = self._normalize(cached, request.request_id, request.query)
             self.last_diagnostics = {"cache_hit": True, "fingerprint": fingerprint, "candidate_count": len(result.candidates), "metadata_conflicts": list(result.metadata_conflicts)}
-            if harness is not None:
-                harness.record_provider_usage("web_discovery", {"status": "cache_hit", "candidate_count": len(result.candidates), "metadata_conflict_count": len(result.metadata_conflicts)})
+            if budget is not None:
+                budget.record_provider_usage("web_discovery", {"status": "cache_hit", "candidate_count": len(result.candidates), "metadata_conflict_count": len(result.metadata_conflicts)})
             return result
         started = perf_counter()
         try:
-            raw = self._raw_search(request, harness)
+            raw = self._raw_search(request, budget)
         except Exception as error:
             wrapped = self._provider_error(error)
-            if harness is not None and self.searcher is not None:
-                harness.record_tool("literature.search", "failed", (perf_counter() - started) * 1000, {"error_code": getattr(wrapped, "code", "WEB_PROVIDER_UNAVAILABLE"), "error_type": type(error).__name__})
-                harness.record_provider_usage("web_discovery", {"status": "failed", "error_code": getattr(wrapped, "code", "WEB_PROVIDER_UNAVAILABLE")})
+            if budget is not None and self.searcher is not None:
+                budget.record_tool("literature.search", "failed", (perf_counter() - started) * 1000, {"error_code": getattr(wrapped, "code", "WEB_PROVIDER_UNAVAILABLE"), "error_type": type(error).__name__})
+                budget.record_provider_usage("web_discovery", {"status": "failed", "error_code": getattr(wrapped, "code", "WEB_PROVIDER_UNAVAILABLE")})
             raise wrapped from error
         if isinstance(raw, LiteratureSearchResult):
             result = raw
         else:
             result = self._normalize(raw, request.request_id, request.query)
-        if harness is not None and self.searcher is not None:
-            harness.record_tool(
+        if budget is not None and self.searcher is not None:
+            budget.record_tool(
                 "literature.search",
                 "succeeded",
                 (perf_counter() - started) * 1000,
@@ -310,8 +313,8 @@ class WebLiteratureAdapter:
                 },
             )
         self.last_diagnostics = {"cache_hit": False, "fingerprint": fingerprint, "candidate_count": len(result.candidates), "provider_failures": list(result.provider_failures), "metadata_conflicts": list(result.metadata_conflicts), "elapsed_ms": round((perf_counter() - started) * 1000, 3)}
-        if harness is not None:
-            harness.record_provider_usage("web_discovery", {"status": "cache_miss", "candidate_count": len(result.candidates), "metadata_conflict_count": len(result.metadata_conflicts)})
+        if budget is not None:
+            budget.record_provider_usage("web_discovery", {"status": "cache_miss", "candidate_count": len(result.candidates), "metadata_conflict_count": len(result.metadata_conflicts)})
         return result
 
     def evidence_candidates(

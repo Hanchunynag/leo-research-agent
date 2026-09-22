@@ -1,7 +1,7 @@
 export type ScholarRequest = {
   instruction: string;
   project_id: string;
-  task_type: "WRITE_INTRODUCTION" | "SUPPORT_CLAIM" | "WRITE_CONCLUSION" | "WRITE_ABSTRACT";
+  task_type: "RESEARCH" | "WRITE_INTRODUCTION" | "SUPPORT_CLAIM" | "WRITE_CONCLUSION" | "WRITE_ABSTRACT" | "REVIEW";
   session_id?: string;
   thread_id?: string;
 };
@@ -50,7 +50,7 @@ export type ScholarRunSnapshot = {
   session: Record<string, any>;
   routing: Record<string, any>;
   result: Record<string, any>;
-  harness: Record<string, any>;
+  orchestration: Record<string, any>;
   termination_reason: string | null;
   async_run?: Record<string, any>;
   orchestration_backend?: string;
@@ -83,20 +83,6 @@ export type ScholarDemoPayload = {
   evaluation: Record<string, any>;
 };
 
-export type ScholarResult = {
-  status: string;
-  task_type: string | null;
-  skill_name: string | null;
-  run_id: string;
-  session_id: string;
-  thread_id: string;
-  trace_id: string;
-  result_type: string | null;
-  value: Record<string, any> | null;
-  error_codes: string[];
-  metadata: Record<string, any>;
-};
-
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   const payload = await response.json().catch(() => ({}));
@@ -111,18 +97,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const scholarApi = {
   runtime: () => request<Record<string, any>>("/api/scholar/runtime/status"),
   systemStatus: () => request<Record<string, any>>("/api/system/status"),
-  request: (payload: ScholarRequest) =>
-    request<ScholarResult>("/api/scholar/requests", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }),
-  resume: (payload: { project_id: string; thread_id: string; instruction: string; session_id?: string; task_type?: ScholarRequest["task_type"]; resume_value: unknown }) =>
-    request<ScholarResult>("/api/scholar/requests/resume", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }),
   snapshot: (runId: string) => request<ScholarRunSnapshot>(`/api/scholar/runs/${encodeURIComponent(runId)}`),
   project: (projectId: string) => request<Record<string, any>>(`/api/scholar/projects/${encodeURIComponent(projectId)}/state`),
   manuscript: (projectId: string) => request<ScholarManuscript>(`/api/scholar/projects/${encodeURIComponent(projectId)}/manuscript`),

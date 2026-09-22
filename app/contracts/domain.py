@@ -1,6 +1,6 @@
 """阶段一冻结的统一知识服务领域契约。
 
-这些类型只表达跨模块语义，不依赖 Qdrant、FTS 或 Agentic Service。
+这些类型只表达跨模块语义，不依赖 Qdrant、FTS 或具体 Agent Service。
 阶段一不要求现有业务对象立即迁移到这些类型。
 """
 
@@ -372,7 +372,7 @@ class VerifiedEvidenceBundle:
 
 @dataclass(frozen=True, slots=True)
 class ContextPack:
-    """Harness 可消费、与具体检索后端无关的最终上下文。"""
+    """A bounded context projection consumed by a CrewAI specialist."""
 
     context_id: str
     request_id: str
@@ -393,33 +393,6 @@ class ContextPack:
         _positive(self.token_budget, "token_budget")
         if self.token_count > self.token_budget:
             raise ValueError("ContextPack 超出 token_budget。")
-
-
-@dataclass(frozen=True, slots=True)
-class AgentRun:
-    """ResearchHarness 的后端无关运行记录。"""
-
-    run_id: str
-    request_id: str
-    workspace_id: str
-    scope_version: int
-    state: RunState
-    answer: str = ""
-    answerable: bool | None = None
-    context_id: str | None = None
-    llm_call_count: int | None = None
-    token_usage: int | None = None
-    elapsed_ms: float | None = None
-    diagnostics: Mapping[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        for name in ("run_id", "request_id", "workspace_id"):
-            _required(getattr(self, name), name)
-        _positive(self.scope_version, "scope_version")
-        if self.llm_call_count is not None and self.llm_call_count < 0:
-            raise ValueError("llm_call_count 不能为负数。")
-        if self.token_usage is not None and self.token_usage < 0:
-            raise ValueError("token_usage 不能为负数。")
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,7 +428,7 @@ class IndexProfile:
     """索引和查询阶段共同引用的显式配置快照。"""
 
     profile_id: str
-    engine: str = "legacy_hybrid"
+    engine: str = "local_hybrid"
     query_mode: Literal["local", "global", "hybrid", "naive", "mix"] = "mix"
     top_k: int = 10
     chunk_top_k: int = 20

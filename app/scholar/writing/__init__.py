@@ -1,4 +1,4 @@
-"""ScholarHarness Writing Vertical。"""
+"""Scholar Writing capability vertical."""
 
 from app.scholar.writing.models import (
     CapabilitySet,
@@ -41,7 +41,7 @@ from app.scholar.writing.runtime import (
     SkillRuntimeError,
     TaskRouter,
 )
-from app.scholar.writing.service import CitationResolver, ManuscriptSupervisor, MetadataCitationResolver, ResearchDelegate, ScholarWritingService
+from app.scholar.writing.service import CitationResolver, MetadataCitationResolver, ResearchDelegate, ScholarWritingService
 from app.scholar.writing.skill import IntroductionSkill
 from app.scholar.writing.support import (
     ClaimSupportResult,
@@ -51,7 +51,7 @@ from app.scholar.writing.support import (
     SupportClaimRequest,
 )
 from app.scholar.writing.synthesis import AbstractFactSet, SynthesisWritingService
-from app.scholar.writing.harness import ScholarSkillRuntime
+from app.scholar.writing.skill_runtime import ScholarSkillRuntime
 
 __all__ = [
     "CapabilitySet",
@@ -73,7 +73,6 @@ __all__ = [
     "IntroductionReviewer",
     "SharedManuscriptReviewer",
     "IntroductionSkill",
-    "ManuscriptSupervisor",
     "MetadataCitationResolver",
     "PlannedClaim",
     "ResearchDelegate",

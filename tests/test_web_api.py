@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import time
@@ -12,46 +11,16 @@ from fastapi.testclient import TestClient
 
 from app.web.api import create_app
 from app.web.jobs import JobManager
-from app.web.models import AnswerRequest, ParseOptions
+from app.web.models import ParseOptions
 from app.web.runtime import EmitProgress, WebRuntimeConfig
 from app.web.runtime import LocalRAGWebRuntime
+from app.tenancy import TenantPrincipal
 
 
 class FakeWebRuntime:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
         self.parsed_path: Path | None = None
-
-    def answer(
-        self,
-        request: AnswerRequest,
-        emit: EmitProgress,
-    ) -> dict[str, Any]:
-        emit("retrieving", "正在检索", 0.4)
-        return {
-            "query": request.query,
-            "answerable": True,
-            "answer": "多普勒观测可约束钟漂。[S1]",
-            "claims": [],
-            "citations": [],
-            "refusal_reason": None,
-            "outcome": {
-                "code": "answered",
-                "stage": "completed",
-                "message": "ok",
-                "retryable": False,
-            },
-            "validation": {"valid": True},
-            "diagnostics": {"retrieval_mode": "agentic"},
-            "session": {
-                "session_id": request.session_id or "web-demo",
-                "topic_id": "T001",
-                "relation": "same_topic",
-                "standalone_query": request.query,
-            },
-            "coverage": {"overall_sufficient": True, "coverage": []},
-            "retrieval_rounds": [],
-        }
 
     def parse_pdf(
         self,
@@ -83,26 +52,6 @@ class FakeWebRuntime:
             "status": {"catalog_consistent": True},
         }
 
-    def list_sessions(self) -> dict[str, Any]:
-        return {"sessions": [{"session_id": "web-demo", "title": "LEO"}]}
-
-    def session_details(self, session_id: str) -> dict[str, Any]:
-        if session_id == "missing":
-            raise KeyError(session_id)
-        return {"session": {"session_id": session_id}, "topics": []}
-
-    def session_evidence(self, session_id: str) -> dict[str, Any]:
-        return {"session_id": session_id, "evidence": []}
-
-    def session_transcript(self, session_id: str) -> dict[str, Any]:
-        return {
-            "session_id": session_id,
-            "messages": [{"role": "user", "text": "fixture question"}],
-        }
-
-    def compact_session(self, session_id: str) -> dict[str, Any]:
-        return {"session_id": session_id, "after_tokens": 100}
-
     def public_status(self) -> dict[str, Any]:
         return {
             "service": "test-web",
@@ -120,7 +69,7 @@ def wait_for_job(client: TestClient, job_id: str) -> dict[str, Any]:
     raise AssertionError("后台任务未在测试时限内完成。")
 
 
-def test_web_api_lists_library_and_runs_answer_job(tmp_path: Path) -> None:
+def test_web_api_lists_library_and_keeps_agent_execution_out_of_web_jobs(tmp_path: Path) -> None:
     runtime = FakeWebRuntime(tmp_path)
     app = create_app(tmp_path, runtime=runtime, jobs=JobManager(max_workers=1))
 
@@ -130,31 +79,9 @@ def test_web_api_lists_library_and_runs_answer_job(tmp_path: Path) -> None:
         papers = client.get("/api/papers").json()
         assert papers["records"][0]["title"] == "LEO Web Paper"
 
-        created = client.post(
-            "/api/answers",
-            json={
-                "query": "为什么多普勒能估计钟漂？",
-                "session_id": "web-demo",
-                "include_context": True,
-            },
-        )
-        assert created.status_code == 202
-        completed = wait_for_job(client, created.json()["job_id"])
-        assert completed["status"] == "succeeded"
-        assert completed["result"]["answerable"] is True
-        assert [event["stage"] for event in completed["events"]] == [
-            "queued",
-            "running",
-            "retrieving",
-            "completed",
-        ]
-
-        stream = client.get(
-            f"/api/jobs/{created.json()['job_id']}/events"
-        )
-        assert stream.status_code == 200
-        assert "event: progress" in stream.text
-        assert "event: done" in stream.text
+        assert client.get("/api/answers").status_code == 404
+        assert client.get("/api/sessions").status_code == 404
+        assert client.get("/api/scholar/runs").json() == {"runs": []}
 
 
 def test_ready_exposes_knowledge_readiness_without_breaking_liveness(
@@ -172,6 +99,58 @@ def test_ready_exposes_knowledge_readiness_without_breaking_liveness(
         assert payload["research_readiness"] == "degraded"
         assert payload["knowledge_index"]["status"] == "not_initialized"
         assert client.get("/health").status_code == 200
+
+
+def test_web_is_control_plane_and_does_not_build_agent_harness(
+    tmp_path: Path,
+) -> None:
+    runtime = FakeWebRuntime(tmp_path)
+    app = create_app(tmp_path, runtime=runtime, jobs=JobManager(max_workers=1))
+
+    with TestClient(app) as client:
+        assert app.state.harness is None
+        status = client.get("/api/scholar/runtime/status").json()
+        assert status["execution_plane"] == "external_worker"
+        assert status["orchestration_backend"] == "crewai"
+        # Client-supplied identity headers are ignored unless an authenticated
+        # gateway/resolver is explicitly configured.
+        assert client.get(
+            "/api/scholar/projects",
+            headers={"X-Tenant-Id": "attacker", "X-Principal-Id": "attacker"},
+        ).status_code == 200
+
+
+def test_web_jobs_are_scoped_to_the_authenticated_identity(tmp_path: Path) -> None:
+    runtime = FakeWebRuntime(tmp_path)
+
+    def resolve_identity(request: Any) -> TenantPrincipal:
+        return TenantPrincipal(
+            tenant_id=request.headers.get("X-Tenant-Id", "local"),
+            principal_id=request.headers.get("X-Principal-Id", "local"),
+        )
+
+    app = create_app(
+        tmp_path,
+        runtime=runtime,
+        jobs=JobManager(max_workers=1),
+        identity_resolver=resolve_identity,
+    )
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/papers/upload",
+            headers={"X-Tenant-Id": "tenant-a", "X-Principal-Id": "user-a"},
+            files={"file": ("paper.pdf", b"%PDF-1.7 fixture", "application/pdf")},
+        )
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        assert client.get(
+            f"/api/jobs/{job_id}",
+            headers={"X-Tenant-Id": "tenant-b", "X-Principal-Id": "user-b"},
+        ).status_code == 403
+        assert client.get(
+            f"/api/jobs/{job_id}",
+            headers={"X-Tenant-Id": "tenant-a", "X-Principal-Id": "user-a"},
+        ).status_code == 200
 
 
 def test_web_api_uploads_pdf_and_removes_temporary_copy(tmp_path: Path) -> None:
@@ -197,7 +176,7 @@ def test_web_api_uploads_pdf_and_removes_temporary_copy(tmp_path: Path) -> None:
         assert invalid.status_code == 400
 
 
-def test_web_api_sessions_and_spa_fallback(tmp_path: Path) -> None:
+def test_web_api_spa_fallback_and_run_surface(tmp_path: Path) -> None:
     frontend = tmp_path / "web" / "dist"
     frontend.mkdir(parents=True)
     (frontend / "index.html").write_text("<main>LEO UI</main>", encoding="utf-8")
@@ -205,18 +184,8 @@ def test_web_api_sessions_and_spa_fallback(tmp_path: Path) -> None:
     app = create_app(tmp_path, runtime=runtime, jobs=JobManager(max_workers=1))
 
     with TestClient(app) as client:
-        assert client.get("/api/sessions").json()["sessions"][0][
-            "session_id"
-        ] == "web-demo"
-        assert client.get("/api/sessions/web-demo").status_code == 200
-        assert client.get("/api/sessions/missing").status_code == 404
-        assert client.get("/api/sessions/web-demo/evidence").json()[
-            "evidence"
-        ] == []
-        assert client.get("/api/sessions/web-demo/transcript").json()[
-            "messages"
-        ][0]["role"] == "user"
-        assert client.post("/api/sessions/web-demo/compact").status_code == 200
+        assert client.get("/api/sessions").status_code == 404
+        assert client.get("/api/scholar/runs").status_code == 200
         assert "LEO UI" in client.get("/").text
         assert "LEO UI" in client.get("/research/session").text
 
@@ -234,7 +203,7 @@ def test_web_api_initializes_empty_manuscript_without_writing_agent_content(tmp_
             return {"status": "ok"}
 
     store = ScholarProjectStore(tmp_path)
-    app = create_app(tmp_path, runtime=Runtime(), scholar_harness=SimpleNamespace())
+    app = create_app(tmp_path, runtime=Runtime(), scholar_orchestration=SimpleNamespace())
     with TestClient(app) as client:
         response = client.post(
             f"/api/scholar/projects/{store.project_id}/manuscript/initialize"
@@ -321,7 +290,7 @@ def test_web_job_error_redacts_api_key() -> None:
         raise RuntimeError(f"upstream api_key={secret}")
 
     try:
-        created = manager.submit("answer", fail)
+        created = manager.submit("parse", fail)
         for _ in range(100):
             snapshot = manager.snapshot(created.job_id)
             if snapshot.status == "failed":
@@ -409,7 +378,7 @@ def test_local_web_duplicate_pdf_reuses_canonical_without_changing_result_shape(
     monkeypatch: Any,
 ) -> None:
     from app.web import runtime as runtime_module
-    from tests.test_stage2_corpus_workspace import write_fixture
+    from tests.test_corpus_workspace import write_fixture
 
     pdf = tmp_path / "duplicate.pdf"
     pdf.write_bytes(b"%PDF-1.7 duplicate fixture")
@@ -490,28 +459,3 @@ def test_web_public_status_never_exposes_api_key(
 
     assert secret not in serialized
     assert "api_key" not in serialized.casefold()
-
-
-def test_local_web_runtime_closes_async_bootstrap_backend_inside_running_loop(
-    tmp_path: Path,
-) -> None:
-    class Backend:
-        closed = False
-
-        async def close(self) -> None:
-            self.closed = True
-
-    runtime = LocalRAGWebRuntime(
-        tmp_path,
-        WebRuntimeConfig(model_cache=tmp_path / "models"),
-    )
-    backend = Backend()
-    runtime._bootstrap_backend = backend
-
-    async def close_from_lifespan() -> None:
-        runtime.close()
-        await asyncio.sleep(0)
-
-    asyncio.run(close_from_lifespan())
-
-    assert backend.closed is True

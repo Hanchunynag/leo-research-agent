@@ -199,11 +199,10 @@ class OpenAICompatibleAnswerProvider:
         tool_choice: str | dict[str, Any] | None = None,
         reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
-        """供结构化 Agentic 阶段复用同一安全 HTTP 客户端。
+        """供 CrewAI structured tasks 复用同一安全 HTTP 客户端。
 
-        ``tools``/``tool_choice`` 是 LangChain 1.x ChatModel Adapter 的窄
-        适配面。旧的结构化调用不传它们，因此保持原有请求形状和测试
-        Provider 的兼容性；业务层仍不直接依赖 LangChain 类型。
+        ``tools``/``tool_choice`` 是 CrewAI ChatModel Adapter 的窄适配面。
+        业务层不直接依赖框架类型。
         """
 
         request_payload: dict[str, Any] = {
@@ -213,8 +212,9 @@ class OpenAICompatibleAnswerProvider:
             "max_tokens": max_tokens or self.config.max_tokens,
         }
         # OpenAI-compatible servers generally reject JSON-mode and function
-        # tool calls in the same request.  Structured legacy calls remain in
-        # JSON mode; LangChain-bound tool calls use the provider's tool schema.
+        # tool calls in the same request. Structured provider calls remain in
+        # JSON mode and native tool calls are mutually exclusive on most
+        # OpenAI-compatible gateways.
         if self.config.json_mode and not tools:
             request_payload["response_format"] = {"type": "json_object"}
         if tools:

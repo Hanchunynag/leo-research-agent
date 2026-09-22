@@ -19,9 +19,9 @@ from typing import Any
 from app.contracts import CandidateEvidence, EvidenceRequest, VerifiedEvidence
 from app.corpus import CanonicalCorpusService, CanonicalLocator
 from app.evidence import EvidenceIntelligencePipeline
-from app.knowledge_engine import UnifiedKnowledgeService
+from app.knowledge import UnifiedKnowledgeService
 from app.knowledge.identity import normalize_doi
-from app.research.harness import BudgetExceeded
+from app.scholar.research.budget import BudgetExceeded, CapabilityBudget
 from app.scholar.models import EvidencePack
 from app.scholar.research.errors import (
     EvidenceValidationError,
@@ -99,7 +99,7 @@ class ResearchCapabilityService:
         if isinstance(max_parallel_retrievals, bool) or not 1 <= max_parallel_retrievals <= 8:
             raise ValueError("max_parallel_retrievals 必须在 1 到 8 之间。")
         self.max_parallel_retrievals = max_parallel_retrievals
-        # Direct capability calls retain the legacy serialized boundary. The
+        # Direct capability calls retain the serialized capability boundary. The
         # explicit ``parallel=True`` path below uses a bounded semaphore for
         # independent ResearchNeeds and per-paper coverage backfills. This is
         # important for local Qdrant/BGE resources: concurrency is deliberate
@@ -939,13 +939,13 @@ class ResearchCapabilityService:
         request: ResearchRequest,
         *,
         allow_web: bool = False,
-        harness: Any | None = None,
+        budget: CapabilityBudget | None = None,
         parallel: bool = False,
         progress_callback: ResearchProgressCallback | None = None,
         cancellation_checker: Callable[[], None] | None = None,
     ) -> EvidencePack:
         def step(name: str, details: dict[str, Any] | None = None):
-            return harness.step(name, details=details) if harness is not None else _NullStep(details)
+            return budget.step(name, details=details) if budget is not None else _NullStep(details)
 
         with step("LOCAL_RESEARCH") as trace:
             local_candidates = self._local_candidates(
@@ -1018,7 +1018,7 @@ class ResearchCapabilityService:
         )
         with step("WEB_DISCOVERY") as trace:
             try:
-                result = self.web.search(literature_request, harness=harness)
+                result = self.web.search(literature_request, budget=budget)
             except WebLiteratureError as error:
                 failure_code = getattr(error, "code", "WEB_PROVIDER_UNAVAILABLE")
                 # Preserve the stable pack-level failure contract while
@@ -1027,8 +1027,8 @@ class ResearchCapabilityService:
                 error_code = "FRESHNESS_UNAVAILABLE" if decision.mode == "FRESH_REQUIRED" else "WEB_PROVIDER_UNAVAILABLE"
                 trace.update({"error_code": error_code, "failure_code": failure_code, "error_type": type(error).__name__})
                 metadata = {**local_pack.metadata, "freshness_decision": decision.to_dict(), "error_code": error_code, "web_failure": {"error_code": failure_code, "error_type": type(error).__name__, "message": str(error)}}
-                if harness is not None:
-                    harness.termination_reason = error_code
+                if budget is not None:
+                    budget.termination_reason = error_code
                 return replace(local_pack, unresolved=tuple(dict.fromkeys((*local_pack.unresolved, *request.target_claims))), metadata=metadata)
             except BudgetExceeded as error:
                 trace.update({"error_code": "WEB_BUDGET_EXHAUSTED", "error_type": type(error).__name__})

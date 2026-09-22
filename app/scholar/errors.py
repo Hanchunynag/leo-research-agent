@@ -1,4 +1,4 @@
-"""Stable runtime errors for the user-level Scholar Harness."""
+"""Stable runtime errors for the user-level Scholar runtime."""
 
 from __future__ import annotations
 

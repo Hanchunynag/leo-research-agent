@@ -6,8 +6,13 @@ import json
 import os
 import secrets
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
+from typing import Iterator
+
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from app.scholar.models import (
     Contribution,
@@ -17,6 +22,23 @@ from app.scholar.models import (
     ReviewIssue,
     ReviewReport,
 )
+from app.tenancy import LOCAL_PRINCIPAL, TenantPrincipal
+
+
+class ProjectRevisionConflict(ValueError):
+    """The durable manuscript revision changed before a writer committed."""
+
+    code = "MANUSCRIPT_REVISION_CONFLICT"
+
+
+class ProjectWriteBusyError(TimeoutError):
+    """Another process currently owns the Project writer lease."""
+
+    code = "PROJECT_WRITE_BUSY"
+
+
+_PROJECT_PROCESS_LOCKS: dict[str, RLock] = {}
+_PROJECT_PROCESS_LOCKS_GUARD = RLock()
 
 
 class ScholarProjectStore:
@@ -27,8 +49,34 @@ class ScholarProjectStore:
         self.directory = self.project_root / ".scholar"
         self.database_path = self.directory / "project.db"
         self._project_id: str | None = None
+        with _PROJECT_PROCESS_LOCKS_GUARD:
+            self._process_lock = _PROJECT_PROCESS_LOCKS.setdefault(
+                str(self.database_path), RLock()
+            )
         self.directory.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    @contextmanager
+    def write_lock(self, *, timeout: float = 30.0) -> Iterator[None]:
+        """Serialize Project-owned file and projection writes across workers.
+
+        The in-process lock avoids re-entrant lock surprises when API and
+        approval objects share a process. ``FileLock`` is the cross-process
+        fence, and is automatically released by the OS if a Worker crashes.
+        Read paths intentionally do not take this lock.
+        """
+
+        if timeout < 0:
+            raise ValueError("Project write lock timeout 不能为负数。")
+        lock = FileLock(str(self.directory / ".project.write.lock"), timeout=timeout)
+        with self._process_lock:
+            try:
+                with lock:
+                    yield
+            except FileLockTimeout as error:
+                raise ProjectWriteBusyError(
+                    f"Project 写锁正在被其他 Worker 占用：{self.project_id}"
+                ) from error
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=30.0)
@@ -59,6 +107,14 @@ class ScholarProjectStore:
                 CREATE TABLE IF NOT EXISTS project_info (
                     project_id TEXT PRIMARY KEY,
                     root_path TEXT NOT NULL UNIQUE
+                );
+                CREATE TABLE IF NOT EXISTS project_members (
+                    project_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    granted_at TEXT NOT NULL,
+                    PRIMARY KEY(project_id, tenant_id, principal_id)
                 );
                 CREATE TABLE IF NOT EXISTS patches (
                     patch_id TEXT PRIMARY KEY,
@@ -198,11 +254,113 @@ class ScholarProjectStore:
                     "INSERT INTO project_info(project_id, root_path) VALUES (?, ?)",
                     (self._project_id, str(self.project_root)),
                 )
+            # ``local/local`` preserves the single-user CLI default. Other
+            # identities must be provisioned through ``grant_member`` (or an
+            # external project IAM adapter) before they can access Project
+            # APIs. This prevents a user-controlled identity header from
+            # becoming an implicit Project ACL grant.
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO project_members(
+                    project_id, tenant_id, principal_id, role, granted_at
+                ) VALUES (?, ?, ?, 'owner', ?)
+                """,
+                (self._project_id, LOCAL_PRINCIPAL.tenant_id, LOCAL_PRINCIPAL.principal_id, _utc_now()),
+            )
 
     @property
     def project_id(self) -> str:
         assert self._project_id is not None
         return self._project_id
+
+    def grant_member(
+        self,
+        identity: TenantPrincipal,
+        *,
+        role: str = "member",
+        project_id: str | None = None,
+    ) -> None:
+        """Provision a tenant/principal ACL entry for this Project.
+
+        Authentication and administrator authorization belong to the host
+        application. This method only performs the durable ACL mutation after
+        that caller has made the policy decision.
+        """
+
+        target = project_id or self.project_id
+        if target != self.project_id:
+            error = ValueError("PROJECT_CONFLICT: Project 不属于当前 workspace。")
+            setattr(error, "code", "PROJECT_CONFLICT")
+            raise error
+        if not role.strip():
+            raise ValueError("Project member role 不能为空。")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO project_members(
+                    project_id, tenant_id, principal_id, role, granted_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, tenant_id, principal_id) DO UPDATE SET
+                    role=excluded.role, granted_at=excluded.granted_at
+                """,
+                (
+                    self.project_id,
+                    identity.tenant_id,
+                    identity.principal_id,
+                    role.strip(),
+                    _utc_now(),
+                ),
+            )
+
+    def check_access(
+        self,
+        identity: TenantPrincipal,
+        *,
+        project_id: str | None = None,
+    ) -> str:
+        target = project_id or self.project_id
+        if target != self.project_id:
+            error = ValueError("PROJECT_CONFLICT: Project 不属于当前 workspace。")
+            setattr(error, "code", "PROJECT_CONFLICT")
+            raise error
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT role FROM project_members
+                WHERE project_id=? AND tenant_id=? AND principal_id=?
+                """,
+                (self.project_id, identity.tenant_id, identity.principal_id),
+            ).fetchone()
+        if row is None:
+            error = ValueError(
+                f"Project 不属于当前租户或主体：{self.project_id}"
+            )
+            setattr(error, "code", "PROJECT_ACCESS_DENIED")
+            raise error
+        return str(row["role"])
+
+    def list_members(self, *, project_id: str | None = None) -> list[dict[str, str]]:
+        target = project_id or self.project_id
+        if target != self.project_id:
+            raise ValueError("PROJECT_CONFLICT: Project 不属于当前 workspace。")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT tenant_id, principal_id, role, granted_at
+                FROM project_members WHERE project_id=?
+                ORDER BY tenant_id, principal_id
+                """,
+                (self.project_id,),
+            ).fetchall()
+        return [
+            {
+                "tenant_id": str(row["tenant_id"]),
+                "principal_id": str(row["principal_id"]),
+                "role": str(row["role"]),
+                "granted_at": str(row["granted_at"]),
+            }
+            for row in rows
+        ]
 
     def put_fact(self, fact: ManuscriptFact) -> None:
         if fact.source != "user_confirmed" or not fact.confirmed:
@@ -622,9 +780,27 @@ class ScholarProjectStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def save_manuscript_state(self, state: ManuscriptState) -> None:
+    def save_manuscript_state(
+        self,
+        state: ManuscriptState,
+        *,
+        expected_version: int | None = None,
+    ) -> None:
         now = _utc_now()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT version FROM manuscript_state WHERE project_id=?",
+                (self.project_id,),
+            ).fetchone()
+            current_version = int(current["version"]) if current is not None else None
+            if expected_version is not None and current_version not in {
+                None,
+                expected_version,
+            }:
+                raise ProjectRevisionConflict(
+                    "MANUSCRIPT_REVISION_CONFLICT: Manuscript revision 已被其他 Writer 更新。"
+                )
             connection.execute(
                 """
                 INSERT INTO manuscript_state(project_id, project_hash, root_tex, version, stale_sections_json, updated_at)

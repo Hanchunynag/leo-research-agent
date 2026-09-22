@@ -22,13 +22,8 @@ dependencies = [
     "rapidfuzz==3.14.3",
     "rich>=13.9,<15",
     "sentence-transformers==3.4.1",
-    "langchain>=1,<2",
-    "langchain-core>=1,<2",
     "typer>=0.27.0",
     "uvicorn>=0.35,<1",
-    "langgraph>=1,<2",
-    "langgraph-checkpoint-sqlite>=3,<4",
-    "deepagents>=0.7,<1",
     "bibtexparser>=1.4,<2",
     "crewai==1.15.21",
 ]

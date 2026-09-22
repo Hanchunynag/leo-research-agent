@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import secrets
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass, replace
@@ -14,12 +13,15 @@ from typing import Any, Callable, Mapping
 from app.jobs.worker import JobCancelled
 
 from app.orchestration.contracts import (
+    ManagerDecision,
     OrchestrationRequest,
     OrchestrationResult,
     ResearchAgentOutput,
     ReviewAgentOutput,
+    RunBudget,
+    RunGoal,
     Route,
-    SupervisorResult,
+    default_run_goal,
     WriterAgentOutput,
 )
 from app.scholar.models import EvidencePack, ReviewReport
@@ -41,6 +43,7 @@ from app.scholar.writing.runtime import SkillRuntimeError
 from app.scholar.writing.service import ResearchDelegate
 from app.scholar.writing.skill import IntroductionSkill
 from app.scholar.writing.support import ClaimSupportResult, SupportClaimRequest
+from app.session.context import ManagerContextBuilder
 
 
 class _LazyCapabilityMatrix:
@@ -62,7 +65,7 @@ def _crewai_import_guard() -> Any:
     CrewAI 1.15 imports ``dotenv.load_dotenv`` from its LLM/event modules at
     import time.  The Scholar application already owns project-scoped config
     loading, so letting that call run would make importing the optional
-    backend affect legacy retrieval, tests, and unrelated providers.
+    framework affect retrieval, tests, and unrelated providers.
     """
 
     import dotenv
@@ -105,7 +108,10 @@ class CrewAIBackend:
         session_manager: Any | None = None,
         event_store: Any | None = None,
         max_review_rounds: int = 2,
+        max_research_attempts: int = 2,
+        max_manager_steps: int = 12,
         max_tool_calls: int = 16,
+        max_token_budget: int | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve()
         self.model = model
@@ -121,16 +127,23 @@ class CrewAIBackend:
         self.session_manager = session_manager
         self.event_store = event_store
         self.max_review_rounds = max(0, min(2, max_review_rounds))
+        self.max_research_attempts = max(1, min(8, max_research_attempts))
+        self.max_manager_steps = max(3, min(32, max_manager_steps))
         self.max_tool_calls = max(1, max_tool_calls)
+        self.max_token_budget = max_token_budget
+        self._manager_context_builder = ManagerContextBuilder(
+            recent_limit=6, context_budget_chars=7000
+        )
         # Keep CrewAI out of module import time. Its dependency graph may load
-        # a process-level dotenv file; selecting legacy must not change the
-        # environment seen by the existing RAG/runtime code.
+        # a process-level dotenv file; the application owns project-scoped
+        # configuration and must not let a framework import mutate it.
         self.crew: Any | None = None
         self._flow_result: OrchestrationResult | None = None
         self._trace: Any | None = None
         self._request: OrchestrationRequest | None = None
         self._run_id: str | None = None
         self._session_run: Any | None = None
+        self._run_goal: RunGoal | None = None
         self._tool_calls_used = 0
         self._active_route: Route | None = None
         self._active_research: ResearchAgentOutput | None = None
@@ -141,6 +154,11 @@ class CrewAIBackend:
 
     @property
     def agents(self) -> dict[str, Any]:
+        # Expose the canonical role/tool matrix for diagnostics without using
+        # this shared introspection Crew to execute a Run. Actual execution is
+        # always performed by ``_new_run_backend``.
+        if self.crew is None:
+            self._ensure_crew(None)
         return dict(self.crew.agents) if self.crew is not None else {}
 
     @staticmethod
@@ -292,28 +310,66 @@ class CrewAIBackend:
                     kind="tool",
                 )
 
-    def route(
-        self, request: OrchestrationRequest, trace: Any
-    ) -> SupervisorResult:
-        expected = self._route_hint(request)
-        context = {
-            "request_id": request.request_id,
-            "project_id": request.project_id,
-            "instruction": request.instruction,
-            "deterministic_route": expected,
-            "selected_route": expected,
-            "allowed_route": expected,
-            "capabilities": CapabilityMatrix.as_dict()["supervisor"],
-        }
+    def manager_decide(self, context: Mapping[str, Any], trace: Any) -> ManagerDecision:
+        """Ask the persistent Manager for one proposal, never execute it.
+
+        Flow owns the subsequent transition validation. Keeping this method
+        separate makes it impossible for a Manager Task to reach a domain
+        capability directly and gives tests a narrow seam for scripted
+        Manager decisions.
+        """
+
+        self._trace = trace
         output = self._ensure_crew(trace).run(
-            "supervisor", context, SupervisorResult, task_name="supervisor_route"
+            "manager", context, ManagerDecision, task_name="manager_decision"
         )
-        if output.selected_route != expected:
+        if not isinstance(output, ManagerDecision):
             raise SkillRuntimeError(
-                "ROUTING_CONTRACT_INVALID",
-                f"Supervisor selected {output.selected_route!r}; deterministic route is {expected!r}.",
+                "MANAGER_CONTRACT_INVALID", "Manager Agent 未返回 ManagerDecision。"
             )
         return output
+
+    def build_manager_context(self, state: Any) -> dict[str, Any]:
+        """Assemble the prioritized Manager projection for one decision.
+
+        Only this bounded projection is sent to the Manager task. The full
+        Session message table remains available to the application layer but
+        is never used as a workflow progress oracle.
+        """
+
+        recent_summary: Mapping[str, Any] | None = None
+        if self.session_manager is not None and self._session_run is not None:
+            try:
+                runtime = self.session_manager.open(self._session_run.session_id)
+                messages = runtime.list_messages(limit=100_000)
+                recent_summary = self._manager_context_builder.summarize_messages(messages)
+            except (KeyError, OSError, ValueError):
+                recent_summary = None
+        project_facts: dict[str, Any] = {}
+        try:
+            project_facts = {
+                "facts": [
+                    {"key": value.key, "value": value.value}
+                    for value in self.project_store.list_facts()[:16]
+                ],
+                "confirmed_contributions": [
+                    {
+                        "contribution_id": value.contribution_id,
+                        "statement": value.statement,
+                    }
+                    for value in self.project_store.list_contributions()
+                    if value.status == "confirmed" and value.confirmed_by_user
+                ][:16],
+                "manuscript": self.project_store.get_manuscript_state_projection(),
+            }
+        except (AttributeError, OSError, TypeError, ValueError):
+            project_facts = {}
+        return self._manager_context_builder.build_manager_context(
+            original_goal=state.goal,
+            run_state=state,
+            project_facts=project_facts,
+            recent_conversation_summary=recent_summary,
+        )
 
     def _date_value(self, value: Any) -> date | None:
         if isinstance(value, date):
@@ -909,29 +965,6 @@ class CrewAIBackend:
             }
         )
 
-    def finalize_research(
-        self,
-        request: OrchestrationRequest,
-        research: ResearchAgentOutput,
-        trace: Any,
-    ) -> SupervisorResult:
-        context = {
-            "request": {
-                "instruction": request.instruction,
-                "route": research.domain_result.__class__.__name__
-                if research.domain_result is not None
-                else "RESEARCH",
-            },
-            "research_result": research,
-            "selected_route": self._route_hint(request),
-            "final_answer_required": True,
-            "capabilities": sorted(CapabilityMatrix.SUPERVISOR),
-        }
-        output = self._ensure_crew(trace).run(
-            "supervisor", context, SupervisorResult, task_name="supervisor_finalize"
-        )
-        return output
-
     # Tool methods below are deliberately narrow.  Flow calls the same methods
     # directly so deterministic lifecycle decisions never depend on an LLM
     # choosing a tool, while the tools remain available to the specialist.
@@ -1160,6 +1193,7 @@ class CrewAIBackend:
                 evidence=persisted_evidence,
                 metadata=metadata,
             )
+            runtime.clear_checkpoint(result.run_id)
             if self.event_store is not None:
                 event_type = {
                     "WAITING_HUMAN_APPROVAL": "WAITING_USER",
@@ -1199,6 +1233,35 @@ class CrewAIBackend:
             # Domain result remains authoritative; a failed projection is
             # recorded in diagnostics by the caller rather than changing it.
             return
+
+    def persist_checkpoint(self, state: Any) -> None:
+        """Persist the bounded Manager/Flow projection in Session Runtime."""
+
+        if self.session_manager is None or self._session_run is None:
+            return
+        try:
+            runtime = self.session_manager.open(self._session_run.session_id)
+            payload = state.model_dump(mode="json") if hasattr(state, "model_dump") else _jsonable(state)
+            # A checkpoint is a replay boundary, not a second domain store.
+            payload = {
+                key: value
+                for key, value in dict(payload).items()
+                if key not in {"request"} or key == "request"
+            }
+            runtime.save_checkpoint(self._session_run.run_id, payload)
+        except (KeyError, OSError, ValueError, TypeError):
+            # A telemetry/checkpoint projection failure must not mutate the
+            # authoritative domain result or turn a safe run into a write.
+            return
+
+    def load_checkpoint(self, run_id: str) -> Mapping[str, Any] | None:
+        if self.session_manager is None or self._session_run is None:
+            return None
+        try:
+            runtime = self.session_manager.open(self._session_run.session_id)
+            return runtime.load_checkpoint(run_id)
+        except (KeyError, OSError, ValueError, TypeError):
+            return None
 
     @staticmethod
     def _route_from_metadata(metadata: Mapping[str, Any]) -> Route | None:
@@ -1249,6 +1312,21 @@ class CrewAIBackend:
         if not thread_id.strip() or not project_id.strip():
             raise ValueError("thread_id/project_id 不能为空。")
         runtime, run = self._find_session_run(thread_id, session_id, project_id)
+        if run.status == "INTERRUPTED" and runtime.load_checkpoint(run.run_id):
+            # Interrupted CrewAI Runs resume through the same deterministic
+            # Flow and Run identity. ``resume_value`` is never treated as an
+            # approval signal; it is intentionally ignored here.
+            return self.run(
+                OrchestrationRequest(
+                    request_id=f"resume:{run.run_id}",
+                    project_id=project_id,
+                    instruction=run.query,
+                    session_id=run.session_id,
+                    thread_id=run.thread_id,
+                    task_type=task_type,
+                    metadata={"_run_id": run.run_id, "_worker_id": "resume"},
+                )
+            )
         result_rows = {
             str(value["run_id"]): value
             for value in runtime.list_results()
@@ -1418,7 +1496,42 @@ class CrewAIBackend:
             backend="crewai",
         )
 
+    def _new_run_backend(self) -> "CrewAIBackend":
+        """Create a run-scoped adapter with no shared mutable Run state.
+
+        Domain services and stores are shared immutable dependencies, but the
+        Crew, trace, request, cancellation callback and specialist handoffs
+        belong exclusively to one Run. This is the boundary that makes a
+        single Runtime safe for concurrent users.
+        """
+
+        return CrewAIBackend(
+            self.project_root,
+            model=self.model,
+            skill_runtime=self.skill_runtime,
+            research=self.research_service,
+            writers=self.writers,
+            reviewer=self.reviewer,
+            project_store=self.project_store,
+            session_manager=self.session_manager,
+            event_store=self.event_store,
+            max_review_rounds=self.max_review_rounds,
+            max_research_attempts=self.max_research_attempts,
+            max_manager_steps=self.max_manager_steps,
+            max_tool_calls=self.max_tool_calls,
+            max_token_budget=self.max_token_budget,
+        )
+
     def run(self, request: OrchestrationRequest) -> OrchestrationResult:
+        """Execute one Run on a private backend context.
+
+        The public backend is a dependency holder only. Never execute the
+        mutable Flow state on the shared application-level instance.
+        """
+
+        return self._new_run_backend()._run_impl(request)
+
+    def _run_impl(self, request: OrchestrationRequest) -> OrchestrationResult:
         raw_cancellation_checker = request.metadata.get("_cancellation_checker")
         self._cancellation_checker = (
             raw_cancellation_checker if callable(raw_cancellation_checker) else None
@@ -1441,6 +1554,7 @@ class CrewAIBackend:
         self._active_research_domain_result = None
         self._active_writer_domain_result = None
         self._active_review_round = 0
+        self._run_goal = None
         session_id, run_id, thread_id = self._prepare_run(
             request, trace_id=trace_id
         )
@@ -1468,21 +1582,88 @@ class CrewAIBackend:
             ),
         )
         self._trace = trace
-        state = FlowState(
-            project_id=request.project_id,
-            session_id=session_id,
-            run_id=run_id,
-            thread_id=thread_id,
-            trace_id=trace_id,
-            request=request.model_copy(
-                update={"session_id": session_id, "thread_id": thread_id}
-            ),
+        request_with_run = request.model_copy(
+            update={"session_id": session_id, "thread_id": thread_id}
         )
+        persisted_goal = self._run_goal or default_run_goal(
+            request.instruction, self._route_hint(request)
+        )
+        state_payload: dict[str, Any] = {
+            "project_id": request.project_id,
+            "session_id": session_id,
+            "run_id": run_id,
+            "thread_id": thread_id,
+            "trace_id": trace_id,
+            "request": request_with_run,
+            "selected_route": self._route_hint(request),
+            "goal": persisted_goal,
+            "budget": RunBudget(
+                max_manager_steps=self.max_manager_steps,
+                max_research_rounds=self.max_research_attempts,
+                max_review_rounds=max(1, self.max_review_rounds + 1),
+                max_tool_calls=self.max_tool_calls,
+                max_tokens=self.max_token_budget,
+            ),
+            "user_preferences": [
+                str(value)
+                for value in request.metadata.get("local_preferences", ())
+                if isinstance(value, str) and value.strip()
+            ][-8:],
+        }
+        checkpoint = self.load_checkpoint(run_id)
+        if checkpoint:
+            # Restore only the bounded Flow projection. Domain objects are
+            # deliberately replayed from the deterministic capability boundary
+            # after an interruption instead of being copied into checkpoint
+            # state.
+            checkpoint_state = checkpoint.get("run_state", checkpoint)
+            if not isinstance(checkpoint_state, Mapping):
+                checkpoint_state = {}
+            for key in (
+                "stage", "status", "current_agent", "manager_steps", "research_round",
+                "review_calls", "research_status", "writer_ready", "review_decision",
+                "last_agent", "last_specialist_status", "completed_steps", "pending_gaps",
+                "success_criteria_status", "evidence_references", "research_result_reference",
+                "domain_result_refs", "draft_patch_id", "draft_patch_reference",
+                "latest_specialist_result", "last_specialist_result", "review_round",
+                "pending_approval", "manager_decisions", "error_codes", "tool_calls",
+                "last_progress_fingerprint", "no_progress_rounds", "user_preferences",
+            ):
+                if key in checkpoint_state:
+                    state_payload[key] = checkpoint_state[key]
+            state_payload["request"] = request_with_run
+            state_payload["selected_route"] = checkpoint_state.get("selected_route") or self._route_hint(request)
+            state_payload["user_preferences"] = list(
+                dict.fromkeys(
+                    list(checkpoint_state.get("user_preferences") or [])
+                    + list(state_payload.get("user_preferences") or [])
+                )
+            )[-8:]
+            if isinstance(checkpoint.get("run_goal"), Mapping):
+                stored_goal = RunGoal.model_validate(checkpoint["run_goal"])
+                # The persisted row is authoritative. The checkpoint goal is
+                # only a consistency assertion, never an overwrite source.
+                if stored_goal != persisted_goal:
+                    trace.record(
+                        "goal_checkpoint_mismatch",
+                        "FAILED",
+                        {"run_id": run_id},
+                        kind="checkpoint",
+                    )
+            trace.record(
+                "manager_checkpoint_loaded",
+                "COMPLETED",
+                {"checkpoint_ref": getattr(self._session_run, "checkpoint_ref", None)},
+                kind="checkpoint",
+            )
+        state = FlowState.model_validate(state_payload)
         flow = CrewAIOrchestrationFlow(
             backend=self,
             state=state,
             trace=trace,
+            max_research_attempts=self.max_research_attempts,
             max_review_rounds=self.max_review_rounds,
+            max_manager_steps=self.max_manager_steps,
         )
         try:
             result = flow.kickoff()
@@ -1544,6 +1725,8 @@ class CrewAIBackend:
             request.session_id,
             title=request.instruction[:120],
             project_id=request.project_id,
+            tenant_id=request.tenant_id,
+            principal_id=request.principal_id,
         )
         runtime = self.session_manager.open(session.session_id)
         requested_run_id = request.metadata.get("_run_id")
@@ -1560,10 +1743,15 @@ class CrewAIBackend:
                     raise ValueError("RUN_CORRELATION_INVALID: thread_id 与持久化 Run 不一致。")
                 if existing.project_id and existing.project_id != request.project_id:
                     raise ValueError("RUN_CORRELATION_INVALID: Run 不属于当前 Project。")
+                if existing.tenant_id != request.tenant_id or existing.principal_id != request.principal_id:
+                    error = ValueError("RUN_ACCESS_DENIED: Run 不属于当前租户或主体。")
+                    setattr(error, "code", "RUN_ACCESS_DENIED")
+                    raise error
                 if existing.status in {"COMPLETED", "FAILED", "CANCELLED", "WAITING_USER", "WAITING_HUMAN_APPROVAL"}:
                     raise ValueError(f"Run 已经是终态，不能重复执行：{run_id}")
                 if existing.trace_id:
                     trace_id = existing.trace_id
+                self._run_goal = runtime.get_run_goal(run_id)
                 # The asynchronous Scholar Worker moves the durable Run to
                 # RUNNING before invoking the backend.  A direct/embedded
                 # caller may still hand us PENDING/QUEUED/INTERRUPTED.  Keep
@@ -1585,12 +1773,27 @@ class CrewAIBackend:
         thread_id = request.thread_id or f"crew_{run_id}"
         if any(run.thread_id == thread_id for run in runtime.list_runs()):
             raise ValueError(f"RUN_CORRELATION_INVALID: thread_id 已绑定：{thread_id}")
+        goal = default_run_goal(
+            request.instruction,
+            self._route_hint(request),
+            success_criteria=request.metadata.get("success_criteria")
+            if isinstance(request.metadata.get("success_criteria"), (list, tuple))
+            else None,
+            hard_constraints=request.metadata.get("hard_constraints")
+            if isinstance(request.metadata.get("hard_constraints"), (list, tuple))
+            else None,
+        )
+        self._run_goal = goal
         runtime.create_run(
             request.instruction,
             run_id=run_id,
             thread_id=thread_id,
             trace_id=trace_id,
             project_id=request.project_id,
+            task_type=self._route_hint(request),
+            goal=goal,
+            tenant_id=request.tenant_id,
+            principal_id=request.principal_id,
         )
         runtime.start_run(
             run_id, worker_id=getattr(self.session_manager, "worker_id", "crewai")
@@ -1600,99 +1803,24 @@ class CrewAIBackend:
         return session.session_id, run_id, thread_id
 
 
-class _LegacyBackend:
-    def __init__(self, harness: Any) -> None:
-        self.harness = harness
-
-    def run(self, request: OrchestrationRequest) -> OrchestrationResult:
-        result = self.harness.scholar_request(
-            request.instruction,
-            request.project_id,
-            session_id=request.session_id,
-            task_type=request.task_type
-            if request.task_type not in {"RESEARCH", "REVIEW"}
-            else None,
-            thread_id=request.thread_id,
-        )
-        value = getattr(result, "value", None)
-        patch = getattr(value, "patch", None)
-        waiting = patch is not None and str(getattr(value, "status", "")) in {
-            "READY",
-            "NEEDS_USER_REVIEW",
-        }
-        status = (
-            "WAITING_HUMAN_APPROVAL"
-            if waiting
-            else "COMPLETED"
-            if str(getattr(result, "status", "")) != "FAILED"
-            else "FAILED"
-        )
-        return OrchestrationResult(
-            status=status,
-            request_id=request.request_id,
-            project_id=request.project_id,
-            session_id=getattr(result, "session_id", request.session_id),
-            run_id=getattr(result, "run_id", None),
-            thread_id=getattr(result, "thread_id", request.thread_id),
-            trace_id=getattr(result, "trace_id", None),
-            selected_route=request.task_type
-            if request.task_type
-            in {
-                "RESEARCH",
-                "SUPPORT_CLAIM",
-                "WRITE_INTRODUCTION",
-                "WRITE_CONCLUSION",
-                "WRITE_ABSTRACT",
-                "REVIEW",
-            }
-            else None,  # type: ignore[arg-type]
-            final_answer=None
-            if waiting
-            else str(getattr(value, "normalized_claim", "") or ""),
-            pending_action={
-                "type": "HUMAN_APPROVAL",
-                "patch_id": getattr(patch, "patch_id", ""),
-                "expected_base_hash": getattr(patch, "base_hash", ""),
-            }
-            if waiting
-            else None,
-            specialist_results={"legacy": _jsonable(value)},
-            approval_required=waiting,
-            error_codes=list(getattr(result, "error_codes", ()) or ()),
-            diagnostics=_jsonable(getattr(result, "metadata", {})),
-            value=value,
-            backend="legacy",
-        )
-
-
 class ScholarOrchestrationService:
-    """Stable entry point with ``ORCHESTRATION_BACKEND=legacy|crewai``."""
+    """The single Scholar orchestration entry point backed by CrewAI Manager."""
 
     def __init__(
         self,
         *,
-        backend: str | None = None,
-        legacy: Any | None = None,
+        backend: str | None = "crewai",
         crewai: CrewAIBackend | None = None,
     ) -> None:
-        selected = (
-            (
-                backend
-                or os.getenv("ORCHESTRATION_BACKEND")
-                or os.getenv("LEO_AGENTIC_ORCHESTRATION_BACKEND")
-                or ("crewai" if crewai is not None else "legacy")
+        selected = (backend or "crewai").strip().lower()
+        if selected != "crewai":
+            raise ValueError(
+                "ScholarOrchestrationService 只支持 CrewAI Manager；旧 backend 已移除。"
             )
-            .strip()
-            .lower()
-        )
-        if selected not in {"legacy", "crewai"}:
-            raise ValueError("ORCHESTRATION_BACKEND 只允许 legacy 或 crewai。")
-        if selected == "legacy" and legacy is None:
-            raise ValueError("legacy backend 需要注入 ScholarHarnessService。")
-        if selected == "crewai" and crewai is None:
+        if crewai is None:
             raise ValueError("crewai backend 需要注入 CrewAIBackend。")
         self.backend_name = selected
-        self._backend = _LegacyBackend(legacy) if selected == "legacy" else crewai
+        self._backend = crewai
 
     def run(
         self,
@@ -1714,11 +1842,6 @@ class ScholarOrchestrationService:
         assert self._backend is not None
         return self._backend.run(request)
 
-    def scholar_request(
-        self, instruction: str, project_id: str, **kwargs: Any
-    ) -> OrchestrationResult:
-        return self.run(instruction, project_id, **kwargs)
-
     def resume(
         self,
         thread_id: str,
@@ -1729,68 +1852,10 @@ class ScholarOrchestrationService:
         session_id: str | None = None,
         task_type: str | None = None,
     ) -> OrchestrationResult:
-        if self.backend_name == "legacy":
-            raw = self._backend.harness.resume(
-                thread_id,
-                resume_value,
-                project_id,
-                instruction=instruction,
-                session_id=session_id,
-                task_type=task_type,
-            )  # type: ignore[union-attr]
-            value = getattr(raw, "value", None)
-            patch = getattr(value, "patch", None)
-            waiting = patch is not None and str(getattr(value, "status", "")) in {
-                "READY",
-                "NEEDS_USER_REVIEW",
-            }
-            return OrchestrationResult(
-                status=(
-                    "WAITING_HUMAN_APPROVAL"
-                    if waiting
-                    else "FAILED"
-                    if str(getattr(raw, "status", "")) == "FAILED"
-                    else "COMPLETED"
-                ),
-                request_id=str(getattr(raw, "run_id", thread_id)),
-                project_id=project_id,
-                session_id=getattr(raw, "session_id", session_id),
-                run_id=getattr(raw, "run_id", None),
-                thread_id=getattr(raw, "thread_id", thread_id),
-                trace_id=getattr(raw, "trace_id", None),
-                selected_route=(
-                    getattr(raw, "task_type", None)
-                    if getattr(raw, "task_type", None)
-                    in {
-                        "RESEARCH",
-                        "SUPPORT_CLAIM",
-                        "WRITE_INTRODUCTION",
-                        "WRITE_CONCLUSION",
-                        "WRITE_ABSTRACT",
-                        "REVIEW",
-                    }
-                    else None
-                ),
-                pending_action=(
-                    {
-                        "type": "HUMAN_APPROVAL",
-                        "patch_id": getattr(patch, "patch_id", ""),
-                        "expected_base_hash": getattr(patch, "base_hash", ""),
-                    }
-                    if waiting
-                    else None
-                ),
-                specialist_results={"legacy": _jsonable(value)},
-                approval_required=waiting,
-                error_codes=list(getattr(raw, "error_codes", ()) or ()),
-                diagnostics=_jsonable(getattr(raw, "metadata", {})),
-                value=value,
-                backend="legacy",
-            )
         # The existing PatchApprovalService owns the decision and Safe Apply.
         # CrewAI only reconciles its persisted Session Run after that decision;
         # resume_value is never interpreted as approval.
-        return self._backend.resume(  # type: ignore[union-attr]
+        return self._backend.resume(
             thread_id,
             resume_value,
             project_id,

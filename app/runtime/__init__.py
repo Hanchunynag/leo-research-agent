@@ -1,5 +1,5 @@
-"""长驻进程可复用的本地检索运行时。"""
+"""Application-wide runtime configuration and infrastructure boundaries."""
 
-from app.runtime.retrieval import RetrievalRuntime
+from app.runtime.config import RuntimeMode, ScholarRuntimeConfig
 
-__all__ = ["RetrievalRuntime"]
+__all__ = ["RuntimeMode", "ScholarRuntimeConfig"]

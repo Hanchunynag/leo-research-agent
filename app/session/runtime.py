@@ -1,8 +1,4 @@
-"""一个 Session 私有 SQLite DB 的业务存储。
-
-LangGraph Working State 不在这里保存；这里仅保存 Conversation、Run 元数据
-和稳定结果 Projection。Checkpoint 由未来兼容的官方 Checkpointer Adapter 管理。
-"""
+"""One session-private SQLite database for conversation and Run projections."""
 
 from __future__ import annotations
 
@@ -13,6 +9,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from app.session.models import RunRecord, RunStatus, SessionRecord
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.orchestration.contracts import RunGoal
 
 
 def _now() -> str:
@@ -51,6 +51,8 @@ class SessionRuntime:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     project_id TEXT,
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
+                    principal_id TEXT NOT NULL DEFAULT 'local',
                     schema_version INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS messages (
@@ -73,8 +75,19 @@ class SessionRuntime:
                     trace_id TEXT,
                     job_id TEXT,
                     project_id TEXT,
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
+                    principal_id TEXT NOT NULL DEFAULT 'local',
                     checkpoint_ref TEXT,
                     failure_message TEXT
+                );
+                CREATE TABLE IF NOT EXISTS run_goals (
+                    run_id TEXT PRIMARY KEY,
+                    original_instruction TEXT NOT NULL,
+                    task_type TEXT NOT NULL,
+                    success_criteria_json TEXT NOT NULL,
+                    hard_constraints_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)
                 );
                 CREATE INDEX IF NOT EXISTS ix_messages_created
                     ON messages(created_at, message_id);
@@ -91,6 +104,13 @@ class SessionRuntime:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)
                 );
+                CREATE TABLE IF NOT EXISTS run_checkpoints (
+                    run_id TEXT PRIMARY KEY,
+                    checkpoint_ref TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES agent_runs(run_id)
+                );
                 """
             )
             columns = {
@@ -99,18 +119,36 @@ class SessionRuntime:
             }
             if "project_id" not in columns:
                 connection.execute("ALTER TABLE session_info ADD COLUMN project_id TEXT")
+            if "tenant_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE session_info ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'local'"
+                )
+            if "principal_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE session_info ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'local'"
+                )
             run_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(agent_runs)")
             }
-            for column in ("job_id", "project_id", "checkpoint_ref"):
+            for column in (
+                "job_id",
+                "project_id",
+                "tenant_id",
+                "principal_id",
+                "checkpoint_ref",
+            ):
                 if column not in run_columns:
-                    connection.execute(f"ALTER TABLE agent_runs ADD COLUMN {column} TEXT")
+                    default = " NOT NULL DEFAULT 'local'" if column in {"tenant_id", "principal_id"} else ""
+                    connection.execute(
+                        f"ALTER TABLE agent_runs ADD COLUMN {column} TEXT{default}"
+                    )
             connection.execute(
                 """
                 INSERT INTO session_info
-                    (session_id, title, status, created_at, updated_at, project_id, schema_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (session_id, title, status, created_at, updated_at, project_id,
+                     tenant_id, principal_id, schema_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     title=excluded.title,
                     status=excluded.status,
@@ -125,6 +163,8 @@ class SessionRuntime:
                     self.session.created_at,
                     self.session.updated_at,
                     self.session.project_id,
+                    self.session.tenant_id,
+                    self.session.principal_id,
                     self.session.schema_version,
                 ),
             )
@@ -148,22 +188,100 @@ class SessionRuntime:
         trace_id: str | None = None,
         job_id: str | None = None,
         project_id: str | None = None,
+        task_type: str | None = None,
+        goal: RunGoal | Mapping[str, Any] | None = None,
+        tenant_id: str | None = None,
+        principal_id: str | None = None,
     ) -> RunRecord:
         cleaned = query.strip()
         if not cleaned:
             raise ValueError("Run query 不能为空。")
         created = _now()
+        from app.orchestration.contracts import RunGoal, default_run_goal
+
+        if goal is None:
+            goal_value = default_run_goal(cleaned, task_type)
+        elif isinstance(goal, RunGoal):
+            goal_value = goal
+        else:
+            goal_value = RunGoal.model_validate(goal)
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO agent_runs
                     (run_id, query, status, thread_id, created_at, trace_id,
-                     job_id, project_id)
-                VALUES (?, ?, 'PENDING', ?, ?, ?, ?, ?)
+                     job_id, project_id, tenant_id, principal_id)
+                VALUES (?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, cleaned, thread_id, created, trace_id, job_id, project_id),
+                (
+                    run_id,
+                    cleaned,
+                    thread_id,
+                    created,
+                    trace_id,
+                    job_id,
+                    project_id,
+                    tenant_id or self.session.tenant_id,
+                    principal_id or self.session.principal_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO run_goals(
+                    run_id, original_instruction, task_type,
+                    success_criteria_json, hard_constraints_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    goal_value.original_instruction,
+                    goal_value.task_type,
+                    _json(goal_value.success_criteria),
+                    _json(goal_value.hard_constraints),
+                    created,
+                ),
             )
         return self.get_run(run_id)
+
+    def get_run_goal(self, run_id: str) -> RunGoal:
+        """Read the immutable OriginalGoal stored for ``run_id``."""
+
+        from app.orchestration.contracts import RunGoal, default_run_goal
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM run_goals WHERE run_id=?", (run_id,)
+            ).fetchone()
+        if row is None:
+            # Backward-compatible migration for Runs created before goal
+            # persistence existed. The first read materializes the goal once;
+            # later Agent calls can never replace it through the runtime API.
+            run = self.get_run(run_id)
+            goal = default_run_goal(run.query)
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO run_goals(
+                        run_id, original_instruction, task_type,
+                        success_criteria_json, hard_constraints_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        goal.original_instruction,
+                        goal.task_type,
+                        _json(goal.success_criteria),
+                        _json(goal.hard_constraints),
+                        _now(),
+                    ),
+                )
+            return goal
+        return RunGoal(
+            original_instruction=str(row["original_instruction"]),
+            task_type=str(row["task_type"]),
+            success_criteria=tuple(json.loads(str(row["success_criteria_json"]))),
+            hard_constraints=tuple(json.loads(str(row["hard_constraints_json"]))),
+        )
 
     def start_run(self, run_id: str, *, worker_id: str) -> RunRecord:
         started = _now()
@@ -208,7 +326,7 @@ class SessionRuntime:
         return self.get_run(run_id)
 
     def set_checkpoint_ref(self, run_id: str, checkpoint_ref: str | None) -> RunRecord:
-        """Record the LangGraph working-state reference without copying state."""
+        """Record the CrewAI Flow checkpoint reference without copying state."""
 
         with self._connect() as connection:
             updated = connection.execute(
@@ -218,6 +336,73 @@ class SessionRuntime:
         if updated != 1:
             raise KeyError(f"Run 不存在：{run_id}")
         return self.get_run(run_id)
+
+    def save_checkpoint(self, run_id: str, state: Mapping[str, Any]) -> str:
+        """Persist bounded orchestration state and its Run reference.
+
+        This is intentionally a small Session/Run checkpoint projection. It
+        stores contracts, counters and domain-result references only; CrewAI
+        Memory is never used as a durability mechanism.
+        """
+
+        reference = f"session://{self.session.session_id}/runs/{run_id}/manager"
+        goal = self.get_run_goal(run_id)
+        state_payload = dict(state)
+        # Persist a single authoritative envelope. A malicious or stale Flow
+        # projection cannot overwrite the immutable goal row.
+        state_payload.pop("goal", None)
+        payload = _json(
+            {
+                "run_goal": goal.model_dump(mode="json"),
+                "run_state": state_payload,
+            }
+        )
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                INSERT INTO run_checkpoints(run_id, checkpoint_ref, state_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    checkpoint_ref=excluded.checkpoint_ref,
+                    state_json=excluded.state_json,
+                    updated_at=excluded.updated_at
+                """,
+                (run_id, reference, payload, _now()),
+            ).rowcount
+            if updated != 1:
+                raise KeyError(f"Run 不存在：{run_id}")
+            changed = connection.execute(
+                "UPDATE agent_runs SET checkpoint_ref=? WHERE run_id=?",
+                (reference, run_id),
+            ).rowcount
+        if changed != 1:
+            raise KeyError(f"Run 不存在：{run_id}")
+        return reference
+
+    def load_checkpoint(self, run_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT state_json FROM run_checkpoints WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(str(row["state_json"]))
+        if not isinstance(value, dict):
+            return None
+        # Old checkpoints were raw FlowState projections. Return the same
+        # envelope shape for new callers while keeping legacy fields usable.
+        if "run_state" not in value:
+            goal = self.get_run_goal(run_id)
+            return {"run_goal": goal.model_dump(mode="json"), "run_state": value}
+        return value
+
+    def clear_checkpoint(self, run_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM run_checkpoints WHERE run_id=?", (run_id,))
+            connection.execute(
+                "UPDATE agent_runs SET checkpoint_ref=NULL WHERE run_id=?", (run_id,)
+            )
 
     def append_message(
         self,

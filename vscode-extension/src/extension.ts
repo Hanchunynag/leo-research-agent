@@ -32,7 +32,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 async function patchId(): Promise<string | undefined> {
-  return vscode.window.showInputBox({ prompt: "ScholarHarness Patch ID" });
+  return vscode.window.showInputBox({ prompt: "Scholar Runtime Patch ID" });
 }
 
 async function openPreview(): Promise<void> {
@@ -79,7 +79,7 @@ async function buildManuscript(): Promise<void> {
     void vscode.window.showErrorMessage("LATEX_WORKSHOP_UNAVAILABLE: 请安装或启用 LaTeX Workshop。");
     return;
   }
-  const projectId = await vscode.window.showInputBox({ prompt: "ScholarHarness Project ID" });
+  const projectId = await vscode.window.showInputBox({ prompt: "Scholar Runtime Project ID" });
   if (!projectId) return;
   const result = await requestJson<{ build_id: string; status: string }>(
     `/api/scholar/projects/${encodeURIComponent(projectId)}/build`,
@@ -90,12 +90,12 @@ async function buildManuscript(): Promise<void> {
 }
 
 async function showDiagnostics(): Promise<void> {
-  const projectId = await vscode.window.showInputBox({ prompt: "ScholarHarness Project ID" });
+  const projectId = await vscode.window.showInputBox({ prompt: "Scholar Runtime Project ID" });
   if (!projectId) return;
   const payload = await requestJson<{ diagnostics: Array<{ severity: string; message: string; file?: string; line?: number }> }>(
     `/api/scholar/projects/${encodeURIComponent(projectId)}/diagnostics`,
   );
-  const output = vscode.window.createOutputChannel("ScholarHarness Diagnostics");
+  const output = vscode.window.createOutputChannel("Scholar Runtime Diagnostics");
   output.clear();
   for (const diagnostic of payload.diagnostics) {
     output.appendLine(`${diagnostic.severity} ${diagnostic.file ?? ""}:${diagnostic.line ?? ""} ${diagnostic.message}`);
@@ -116,5 +116,5 @@ export function activate(context: vscode.ExtensionContext): void {
 export function deactivate(): void {}
 
 function showError(error: unknown): void {
-  void vscode.window.showErrorMessage(`ScholarHarness: ${error instanceof Error ? error.message : String(error)}`);
+  void vscode.window.showErrorMessage(`Scholar Runtime: ${error instanceof Error ? error.message : String(error)}`);
 }

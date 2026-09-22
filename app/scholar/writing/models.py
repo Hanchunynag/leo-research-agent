@@ -23,7 +23,7 @@ TaskType = Literal[
 def deterministic_patch_id(project_id: str, request_id: str, target_section: str) -> str:
     """Return the idempotency key for one writing request's Patch proposal.
 
-    A resumed Harness run reuses its ``request_id``/Run ID.  Keeping the
+    A resumed Scholar run reuses its ``request_id``/Run ID. Keeping the
     proposal id stable lets ProjectStore's immutable write provide the final
     idempotency guard if a process dies after the Domain write but before the
     framework checkpoint is committed.

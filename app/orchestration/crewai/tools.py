@@ -31,7 +31,7 @@ def _jsonable(value: Any) -> Any:
 class CapabilityMatrix:
     """Code-visible permission matrix; prompts are never the authority."""
 
-    SUPERVISOR = frozenset()
+    MANAGER = frozenset()
     RESEARCH = frozenset(
         {"LOCAL_RESEARCH", "WEB_RESEARCH", "READ_EVIDENCE", "RESOLVE_CITATION"}
     )
@@ -59,7 +59,7 @@ class CapabilityMatrix:
     @classmethod
     def as_dict(cls) -> dict[str, list[str]]:
         return {
-            "supervisor": sorted(cls.SUPERVISOR),
+            "manager": sorted(cls.MANAGER),
             "research": sorted(cls.RESEARCH),
             "writer": sorted(cls.WRITER),
             "reviewer": sorted(cls.REVIEWER),

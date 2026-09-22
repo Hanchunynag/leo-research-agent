@@ -25,7 +25,7 @@ def build_hierarchical_indexes(
     """Build Paper BM25/Dense and Chunk BM25/Dense in one compatible flow.
 
     ``build_knowledge_base`` continues to own Canonical -> Structure -> Chunk
-    and legacy Chunk BM25 construction.  This function only adds the Paper
+    and content-level Chunk BM25 construction.  This function only adds the Paper
     projection and Paper Dense index around that existing pipeline.
     """
 
@@ -67,7 +67,14 @@ def build_hierarchical_indexes(
             })
             repository.close()
     except Exception:
-        pass
+        # A configured structured store is part of the production index
+        # contract. Only an explicitly disabled/fallback-enabled local setup
+        # may continue with the rebuildable JSON projections.
+        from app.persistence.mysql import MySQLConfig
+
+        config = MySQLConfig.from_environment(project_root)
+        if config.enabled and not config.fallback_to_json:
+            raise
     return {
         "knowledge": knowledge.to_dict(),
         "chunk_dense": chunk_dense.to_dict(),

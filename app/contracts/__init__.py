@@ -1,12 +1,7 @@
-"""统一领域模型、服务 Protocol 与阶段一 Legacy Adapter。"""
+"""Cross-domain contracts shared by corpus, evidence and Scholar services."""
 
-from app.contracts.adapters import (
-    LegacyAgentRuntimeAdapter,
-    LegacyEvidenceMapper,
-    LegacyKnowledgeEngineAdapter,
-)
+from app.contracts.adapters import EvidenceMapper
 from app.contracts.domain import (
-    AgentRun,
     CandidateEvidence,
     ExternalEvidenceResolution,
     ContextPack,
@@ -32,12 +27,10 @@ from app.contracts.protocols import (
     ContextBuilder,
     EvidenceIntelligenceService,
     KnowledgeEngine,
-    ResearchHarness,
     ToolGateway,
 )
 
 __all__ = [
-    "AgentRun",
     "CandidateEvidence",
     "ExternalEvidenceResolution",
     "ContextBuilder",
@@ -53,12 +46,9 @@ __all__ = [
     "IndexGeneration",
     "IndexProfile",
     "KnowledgeEngine",
-    "LegacyAgentRuntimeAdapter",
-    "LegacyEvidenceMapper",
-    "LegacyKnowledgeEngineAdapter",
+    "EvidenceMapper",
     "ResearchDirection",
     "ResearchScope",
-    "ResearchHarness",
     "ResearchWorkspace",
     "SelectedEvidence",
     "ToolGateway",

@@ -1,8 +1,4 @@
-# Backend-neutral evaluation for legacy and CrewAI orchestration.
-#
-# The evaluator consumes the same OrchestrationResult contract for both
-# backends. Missing usage/cost telemetry is reported as None; no numbers are
-# fabricated and benchmark ground truth is never changed.
+"""Evaluation of the CrewAI Scholar orchestration contract."""
 
 from __future__ import annotations
 
@@ -337,27 +333,6 @@ def evaluate_backend(
         records=tuple(rows),
         metrics=metrics,
     )
-
-
-def compare_reports(
-    legacy: OrchestrationEvaluationReport,
-    crewai: OrchestrationEvaluationReport,
-) -> dict[str, Any]:
-    # Report deltas without declaring a winner or changing ground truth.
-    deltas: dict[str, float | None] = {}
-    for name in sorted(set(legacy.metrics) | set(crewai.metrics)):
-        left = legacy.metrics.get(name)
-        right = crewai.metrics.get(name)
-        deltas[name] = (
-            round(float(right) - float(left), 6)
-            if isinstance(left, (int, float)) and isinstance(right, (int, float))
-            else None
-        )
-    return {
-        "legacy": legacy.to_dict(),
-        "crewai": crewai.to_dict(),
-        "delta_crewai_minus_legacy": deltas,
-    }
 
 
 def request_for_case(

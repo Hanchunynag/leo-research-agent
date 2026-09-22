@@ -7,7 +7,6 @@ import json
 import secrets
 import shutil
 import tempfile
-import socket
 from urllib.parse import urlparse
 from urllib.request import urlopen
 from dataclasses import asdict
@@ -15,9 +14,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 import os
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -37,50 +36,34 @@ from app.scholar.errors import ScholarRuntimeError
 from app.orchestration.contracts import OrchestrationRequest
 from app.web.jobs import JobManager
 from app.web.models import (
-    AnswerRequest,
     BuildReportRequest,
     JobCreated,
     JobSnapshot,
     ParseOptions,
     PatchDecisionRequest,
-    ResumeRequest,
-    ScholarResumeRequest,
     ScholarRunCreateRequest,
     ScholarRunResumeRequest,
-    ScholarTaskRequest,
 )
 from app.web.runtime import EmitProgress, LocalRAGWebRuntime
 from app.scholar.console import ScholarConsoleProjection, demo_console_payload
 from app.scholar.manuscript import ManuscriptSynchronizer
+from app.session import SessionManager
+from app.tenancy import TenantPrincipal
 
 
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 
 
 class WebRuntime(Protocol):
-    """API 可注入的业务契约，测试时不需加载大模型。"""
+    """Corpus-side API contract; agent execution is owned by Scholar Runs."""
 
     project_root: Path
-
-    def answer(
-        self, request: AnswerRequest, emit: EmitProgress
-    ) -> dict[str, Any]: ...
 
     def parse_pdf(
         self, pdf_path: Path, options: ParseOptions, emit: EmitProgress
     ) -> dict[str, Any]: ...
 
     def list_papers(self) -> dict[str, Any]: ...
-
-    def list_sessions(self) -> dict[str, Any]: ...
-
-    def session_details(self, session_id: str) -> dict[str, Any]: ...
-
-    def session_evidence(self, session_id: str) -> dict[str, Any]: ...
-
-    def session_transcript(self, session_id: str) -> dict[str, Any]: ...
-
-    def compact_session(self, session_id: str) -> dict[str, Any]: ...
 
     def public_status(self) -> dict[str, Any]: ...
 
@@ -100,10 +83,21 @@ def _http_error(error: Exception) -> HTTPException:
             "CHECKPOINT_UNAVAILABLE": 503,
             "CONFIGURATION_ERROR": 503,
             "PROVIDER_UNAVAILABLE": 503,
+            "SCHOLAR_ORCHESTRATION_NOT_CONFIGURED": 503,
             "RESUME_UNAVAILABLE": 409,
             "DOMAIN_CONFLICT": 409,
             "RUN_CORRELATION_INVALID": 409,
             "SESSION_CONFLICT": 409,
+            "SESSION_BUSY": 409,
+            "SESSION_ACCESS_DENIED": 403,
+            "RUN_ACCESS_DENIED": 403,
+            "PROJECT_ACCESS_DENIED": 403,
+            "PROJECT_WRITE_BUSY": 409,
+            "ACTIVE_RUN_EXISTS": 409,
+            "RUN_NOT_RESUMABLE": 409,
+            "RESUME_TARGET_NOT_FOUND": 409,
+            "MANUSCRIPT_REVISION_CONFLICT": 409,
+            "IDENTITY_INVALID": 400,
         }
         return HTTPException(
             status_code=status_by_code.get(code, 400),
@@ -111,24 +105,11 @@ def _http_error(error: Exception) -> HTTPException:
         )
     if isinstance(error, KeyError):
         return HTTPException(status_code=404, detail=str(error).strip("'"))
+    if isinstance(error, PermissionError):
+        return HTTPException(status_code=403, detail=str(error))
     if isinstance(error, (OSError, ValueError)):
         return HTTPException(status_code=400, detail=str(error))
     return HTTPException(status_code=500, detail=type(error).__name__)
-
-
-def _probe_tcp(url: str, *, default_port: int) -> str:
-    """Return a bounded local readiness state without exposing credentials."""
-
-    parsed = urlparse(url)
-    host = parsed.hostname
-    port = parsed.port or default_port
-    if not host:
-        return "invalid"
-    try:
-        with socket.create_connection((host, port), timeout=0.5):
-            return "ready"
-    except (OSError, ValueError):
-        return "unavailable"
 
 
 def _probe_http(url: str) -> str:
@@ -143,6 +124,13 @@ def _probe_http(url: str) -> str:
         return "unavailable"
 
 
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
 def create_app(
     project_root: Path | None = None,
     *,
@@ -150,25 +138,18 @@ def create_app(
     jobs: JobManager | None = None,
     approval_service: PatchApprovalService | None = None,
     latex_bridge: LatexBridgeService | None = None,
-    scholar_harness: Any | None = None,
+    scholar_orchestration: Any | None = None,
     scholar_run_manager: ScholarRunManager | None = None,
+    identity_resolver: Callable[[Request], TenantPrincipal] | None = None,
 ) -> FastAPI:
-    """创建可测试的 API；默认使用仓库根目录和本地长驻 Runtime。"""
+    """创建控制面 API；Agent Runtime 只在外部 Worker 中组装和执行。"""
 
     configured_root = os.getenv("LEO_PROJECT_ROOT")
     root = (
         project_root
         or (Path(configured_root) if configured_root else Path(__file__).resolve().parents[2])
     ).resolve()
-    supplied_runtime = runtime is not None
     web_runtime: WebRuntime = runtime or LocalRAGWebRuntime(root)
-    production_factory: Any | None = None
-    if not supplied_runtime and scholar_harness is None:
-        # The default deployment path owns one complete Scholar Runtime. Test
-        # callers can still inject a lightweight WebRuntime/Harness pair.
-        from app.scholar.composition import ScholarRuntimeFactory
-
-        production_factory = ScholarRuntimeFactory(root)
     job_manager = jobs or JobManager(max_workers=2, project_root=root)
     project_store = ScholarProjectStore(root)
     patch_approval = approval_service or PatchApprovalService(
@@ -179,32 +160,29 @@ def create_app(
         root,
         project_store=project_store,
     )
+    control_session_manager = (
+        scholar_run_manager.session_manager
+        if scholar_run_manager is not None
+        else SessionManager(root)
+    )
     scholar_runs = scholar_run_manager or ScholarRunManager(
         root,
         repository=job_manager.repository,
+        session_manager=control_session_manager,
         event_store=RunEventStore(root),
+        orchestration=scholar_orchestration,
+    )
+    scholar_console = ScholarConsoleProjection(
+        root,
+        project_store=project_store,
+        session_manager=scholar_runs.session_manager,
     )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
-            if production_factory is not None:
-                bundle = production_factory.build()
-                app.state.scholar_runtime = bundle
-                app.state.scholar_harness = bundle.harness
-                app.state.scholar_orchestration = bundle.scholar_orchestration
-                app.state.scholar_console = ScholarConsoleProjection(
-                    root,
-                    project_store=bundle.project_store,
-                    session_manager=bundle.session_manager,
-                )
-                scholar_runs.session_manager = bundle.session_manager
-                scholar_runs.orchestration = bundle.scholar_orchestration
             yield
         finally:
-            if production_factory is not None:
-                production_factory.close()
-                app.state.scholar_runtime = None
             job_manager.close()
             close_runtime = getattr(web_runtime, "close", None)
             if callable(close_runtime):
@@ -219,12 +197,41 @@ def create_app(
     app.state.jobs = job_manager
     app.state.patch_approval = patch_approval
     app.state.latex_bridge = build_bridge
-    app.state.scholar_harness = scholar_harness or getattr(web_runtime, "scholar_harness", None)
-    app.state.scholar_orchestration = None
+    app.state.scholar_orchestration = scholar_runs.orchestration
     app.state.scholar_runtime = None
-    app.state.scholar_runtime_factory = production_factory
-    app.state.scholar_console = ScholarConsoleProjection(root, project_store=project_store)
+    app.state.harness = None
+    app.state.scholar_console = scholar_console
     app.state.scholar_runs = scholar_runs
+    app.state.identity_resolver = identity_resolver
+
+    def _identity(http_request: Request) -> TenantPrincipal:
+        resolver = app.state.identity_resolver
+        if resolver is not None:
+            return resolver(http_request)
+        # Never treat arbitrary client headers as authentication. Deployments
+        # with an authenticated gateway must inject a resolver explicitly; a
+        # header-based bridge is opt-in and only valid when the gateway strips
+        # and rewrites these headers before forwarding the request.
+        if _env_flag("LEO_TRUSTED_IDENTITY_HEADERS"):
+            return TenantPrincipal(
+                tenant_id=http_request.headers.get("X-Tenant-Id", "local"),
+                principal_id=http_request.headers.get("X-Principal-Id", "local"),
+            )
+        return TenantPrincipal(
+            tenant_id="local",
+            principal_id="local",
+        )
+
+    def _authorize_project(
+        http_request: Request,
+        project_id: str,
+    ) -> TenantPrincipal:
+        """Apply the durable Project ACL before exposing project state."""
+
+        identity = _identity(http_request)
+        store = app.state.scholar_console.project_store
+        store.check_access(identity, project_id=project_id)
+        return identity
 
     def _reconcile_approval_run(patch_id: str, decision_status: str) -> dict[str, Any] | None:
         """Queue the lifecycle reconciliation after the side effect is durable.
@@ -310,32 +317,23 @@ def create_app(
             app.state.scholar_runs.repository.list()
             from app.knowledge.corpus import knowledge_index_readiness
 
-            backend = (
-                os.getenv("ORCHESTRATION_BACKEND")
-                or os.getenv("LEO_AGENTIC_ORCHESTRATION_BACKEND")
-                or "crewai"
-            ).strip().lower()
-            if backend not in {"crewai", "legacy"}:
-                raise ValueError("invalid orchestration backend")
+            backend = "crewai"
             workers = list(app.state.scholar_runs.worker_registry.list())
             live_workers = [item for item in workers if item.get("status") == "RUNNING"]
-            redis_url = os.getenv("REDIS_URL")
             qdrant_url = os.getenv("QDRANT_URL")
-            redis_status = _probe_tcp(redis_url, default_port=6379) if redis_url else "not_configured"
             qdrant_status = _probe_http(qdrant_url) if qdrant_url else "not_configured"
             external_provider = "configured" if os.getenv("LEO_LLM_BASE_URL") else "deferred"
             knowledge_index = knowledge_index_readiness(root)
             components = {
                 "run_store": "ready",
                 "queue_store": "ready",
-                "redis": redis_status,
                 "qdrant": qdrant_status,
                 "worker": "ready" if live_workers else "waiting",
                 "crewai_backend": "ready" if backend == "crewai" else "fallback",
                 "provider": external_provider,
                 "knowledge_index": knowledge_index["status"],
             }
-            required_components = {"run_store", "queue_store", "redis", "qdrant"}
+            required_components = {"run_store", "queue_store", "qdrant"}
             unavailable = {
                 name
                 for name in required_components
@@ -386,67 +384,25 @@ def create_app(
 
         return build_metrics_snapshot(root, run_manager=app.state.scholar_runs)
     @app.get("/api/scholar/patches/{patch_id}")
-    def patch_preview(patch_id: str) -> dict[str, Any]:
+    def patch_preview(patch_id: str, http_request: Request) -> dict[str, Any]:
         try:
             preview = patch_approval.get_preview(patch_id)
+            _authorize_project(http_request, preview.patch.project_id)
             return {"preview": asdict(preview)}
-        except Exception as error:
-            raise _http_error(error) from error
-
-    @app.post("/api/scholar/requests")
-    def scholar_request(request: ScholarTaskRequest) -> dict[str, Any]:
-        orchestrator = app.state.scholar_orchestration
-        harness = app.state.scholar_harness
-        if orchestrator is None and harness is None:
-            raise HTTPException(
-                status_code=503,
-                detail={"code": "SCHOLAR_HARNESS_NOT_CONFIGURED", "message": "Scholar Harness 未配置。"},
-            )
-        try:
-            runner = orchestrator or harness
-            result = runner.scholar_request(
-                request.instruction,
-                request.project_id,
-                session_id=request.session_id,
-                task_type=request.task_type,
-                thread_id=request.thread_id,
-            )
-            return result.to_dict() if callable(getattr(result, "to_dict", None)) else dict(result)
-        except Exception as error:
-            raise _http_error(error) from error
-
-    @app.post("/api/scholar/requests/resume")
-    def resume_scholar_request(request: ScholarResumeRequest) -> dict[str, Any]:
-        orchestrator = app.state.scholar_orchestration
-        harness = app.state.scholar_harness
-        if orchestrator is None and harness is None:
-            raise HTTPException(
-                status_code=503,
-                detail={"code": "SCHOLAR_HARNESS_NOT_CONFIGURED", "message": "Scholar Harness 未配置。"},
-            )
-        try:
-            runner = orchestrator or harness
-            result = runner.resume(
-                request.thread_id,
-                request.resume_value,
-                request.project_id,
-                instruction=request.instruction,
-                session_id=request.session_id,
-                task_type=request.task_type,
-            )
-            return result.to_dict() if callable(getattr(result, "to_dict", None)) else dict(result)
         except Exception as error:
             raise _http_error(error) from error
 
     @app.post("/api/scholar/runs", status_code=202)
     def create_scholar_run(
         request: ScholarRunCreateRequest,
+        http_request: Request,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
         """Persist and enqueue a Run; the API process never runs an Agent."""
 
         try:
             key = request.idempotency_key or idempotency_key or f"scholar.run:{secrets.token_hex(12)}"
+            identity = _authorize_project(http_request, request.project_id)
             contract = OrchestrationRequest(
                 request_id=key,
                 project_id=request.project_id,
@@ -455,6 +411,8 @@ def create_app(
                 task_type=request.task_type,
                 thread_id=request.thread_id,
                 metadata=request.metadata,
+                tenant_id=identity.tenant_id,
+                principal_id=identity.principal_id,
             )
             return app.state.scholar_runs.create(contract, idempotency_key=key)
         except Exception as error:
@@ -462,11 +420,18 @@ def create_app(
 
     @app.get("/api/scholar/runs")
     def list_scholar_runs(
+        http_request: Request,
         project_id: str | None = Query(default=None),
         session_id: str | None = Query(default=None),
     ) -> dict[str, Any]:
         try:
-            runs = app.state.scholar_runs.list_runs(project_id=project_id, session_id=session_id)
+            if project_id:
+                _authorize_project(http_request, project_id)
+            runs = app.state.scholar_runs.list_runs(
+                project_id=project_id,
+                session_id=session_id,
+                identity=_identity(http_request),
+            )
             # The durable Job/Run list can outlive an older Session projection
             # after a manual migration or an interrupted storage restore. Do
             # not advertise such a row as normally openable; preserve it as an
@@ -483,14 +448,14 @@ def create_app(
             raise _http_error(error) from error
 
     @app.post("/api/scholar/runs/{run_id}/cancel", status_code=202)
-    def cancel_scholar_run(run_id: str) -> dict[str, Any]:
+    def cancel_scholar_run(run_id: str, http_request: Request) -> dict[str, Any]:
         try:
-            return app.state.scholar_runs.cancel(run_id)
+            return app.state.scholar_runs.cancel(run_id, identity=_identity(http_request))
         except Exception as error:
             raise _http_error(error) from error
 
     @app.post("/api/scholar/runs/{run_id}/stop", status_code=202)
-    def stop_scholar_run(run_id: str) -> dict[str, Any]:
+    def stop_scholar_run(run_id: str, http_request: Request) -> dict[str, Any]:
         """Explicit user-facing stop entrypoint for the Scholar console.
 
         ``cancel`` remains available for backwards compatibility.  ``stop``
@@ -499,13 +464,14 @@ def create_app(
         """
 
         try:
-            return app.state.scholar_runs.cancel(run_id)
+            return app.state.scholar_runs.cancel(run_id, identity=_identity(http_request))
         except Exception as error:
             raise _http_error(error) from error
 
     @app.post("/api/scholar/runs/{run_id}/resume", status_code=202)
     def resume_scholar_run(
         run_id: str,
+        http_request: Request,
         request: ScholarRunResumeRequest | None = None,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict[str, Any]:
@@ -515,13 +481,16 @@ def create_app(
                 run_id,
                 resume_value=body.resume_value,
                 idempotency_key=body.idempotency_key or idempotency_key,
+                identity=_identity(http_request),
             )
         except Exception as error:
             raise _http_error(error) from error
 
     @app.get("/api/scholar/runs/{run_id}")
-    def scholar_run_snapshot(run_id: str) -> dict[str, Any]:
+    def scholar_run_snapshot(run_id: str, http_request: Request) -> dict[str, Any]:
         try:
+            identity = _identity(http_request)
+            app.state.scholar_runs.snapshot(run_id, identity=identity)
             projection = app.state.scholar_console.run_snapshot(run_id)
             projection["async_run"] = app.state.scholar_runs.snapshot(run_id)
             # The durable Job carries the selected route before the Worker
@@ -538,9 +507,12 @@ def create_app(
     @app.get("/api/scholar/runs/{run_id}/events")
     async def scholar_run_events(
         run_id: str,
+        http_request: Request,
         after: int = Query(default=0, ge=0),
     ) -> StreamingResponse:
         try:
+            identity = _identity(http_request)
+            app.state.scholar_runs.snapshot(run_id, identity=identity)
             app.state.scholar_console.run_snapshot(run_id)
         except Exception as error:
             raise _http_error(error) from error
@@ -579,24 +551,30 @@ def create_app(
         )
 
     @app.get("/api/scholar/projects/{project_id}/state")
-    def scholar_project_state(project_id: str) -> dict[str, Any]:
+    def scholar_project_state(project_id: str, http_request: Request) -> dict[str, Any]:
         try:
+            _authorize_project(http_request, project_id)
             return app.state.scholar_console.project_state(project_id)
         except Exception as error:
             raise _http_error(error) from error
 
     @app.get("/api/scholar/projects/{project_id}/manuscript")
-    def scholar_manuscript(project_id: str) -> dict[str, Any]:
+    def scholar_manuscript(project_id: str, http_request: Request) -> dict[str, Any]:
         try:
+            _authorize_project(http_request, project_id)
             return app.state.scholar_console.manuscript_view(project_id)
         except Exception as error:
             raise _http_error(error) from error
 
     @app.post("/api/scholar/projects/{project_id}/manuscript/initialize")
-    def initialize_scholar_manuscript(project_id: str) -> dict[str, Any]:
+    def initialize_scholar_manuscript(
+        project_id: str,
+        http_request: Request,
+    ) -> dict[str, Any]:
         """Create only the empty LaTeX project skeleton, if it is missing."""
 
         try:
+            _authorize_project(http_request, project_id)
             if project_id != project_store.project_id:
                 raise ValueError("PROJECT_CONFLICT: Project 不属于当前 Runtime。")
             # This operation is additive and idempotent. It never creates a
@@ -607,8 +585,12 @@ def create_app(
             raise _http_error(error) from error
 
     @app.get("/api/scholar/projects/{project_id}/manuscript/pdf")
-    def scholar_manuscript_pdf(project_id: str) -> FileResponse:
+    def scholar_manuscript_pdf(
+        project_id: str,
+        http_request: Request,
+    ) -> FileResponse:
         try:
+            _authorize_project(http_request, project_id)
             if project_id != project_store.project_id:
                 raise ValueError("PROJECT_CONFLICT: Project 不属于当前 Runtime。")
             synchronizer = ManuscriptSynchronizer(root)
@@ -621,7 +603,8 @@ def create_app(
             raise _http_error(error) from error
 
     @app.get("/api/scholar/projects")
-    def scholar_projects() -> dict[str, Any]:
+    def scholar_projects(http_request: Request) -> dict[str, Any]:
+        _authorize_project(http_request, project_store.project_id)
         return {
             "projects": [
                 {"project_id": project_store.project_id, "root_path": str(root)}
@@ -629,30 +612,42 @@ def create_app(
         }
 
     @app.get("/api/scholar/projects/{project_id}")
-    def scholar_project(project_id: str) -> dict[str, Any]:
+    def scholar_project(project_id: str, http_request: Request) -> dict[str, Any]:
         try:
+            _authorize_project(http_request, project_id)
             return app.state.scholar_console.project_state(project_id)
         except Exception as error:
             raise _http_error(error) from error
 
     @app.get("/api/scholar/projects/{project_id}/evidence")
-    def scholar_project_evidence(project_id: str, run_id: str | None = None) -> dict[str, Any]:
+    def scholar_project_evidence(
+        project_id: str,
+        http_request: Request,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
         try:
+            identity = _authorize_project(http_request, project_id)
+            if run_id:
+                app.state.scholar_runs.snapshot(run_id, identity=identity)
             return app.state.scholar_console.evidence_view(project_id, run_id=run_id)
         except Exception as error:
             raise _http_error(error) from error
 
     @app.get("/api/scholar/runs/{run_id}/evaluation")
-    def scholar_run_evaluation(run_id: str) -> dict[str, Any]:
+    def scholar_run_evaluation(run_id: str, http_request: Request) -> dict[str, Any]:
         try:
+            app.state.scholar_runs.snapshot(run_id, identity=_identity(http_request))
             return app.state.scholar_console.evaluation(run_id)
         except Exception as error:
             raise _http_error(error) from error
 
     @app.get("/api/scholar/approvals")
-    def scholar_approvals(project_id: str | None = Query(default=None)) -> dict[str, Any]:
-        if project_id and project_id != project_store.project_id:
-            raise HTTPException(status_code=409, detail="Project 不属于当前 Runtime。")
+    def scholar_approvals(
+        http_request: Request,
+        project_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        target_project = project_id or app.state.scholar_console.project_store.project_id
+        _authorize_project(http_request, target_project)
         approvals: list[dict[str, Any]] = []
         for stored in project_store.list_patches():
             patch = getattr(stored, "patch", None)
@@ -671,20 +666,33 @@ def create_app(
         return {"approvals": approvals}
 
     @app.post("/api/scholar/approvals/{patch_id}/approve")
-    def approve_scholar_approval(patch_id: str, request: PatchDecisionRequest) -> Response:
-        return accept_patch(patch_id, request)
+    def approve_scholar_approval(
+        patch_id: str,
+        request: PatchDecisionRequest,
+        http_request: Request,
+    ) -> Response:
+        return accept_patch(patch_id, request, http_request)
 
     @app.post("/api/scholar/approvals/{patch_id}/reject")
-    def reject_scholar_approval(patch_id: str, request: PatchDecisionRequest) -> dict[str, Any]:
-        return reject_patch(patch_id, request)
+    def reject_scholar_approval(
+        patch_id: str,
+        request: PatchDecisionRequest,
+        http_request: Request,
+    ) -> dict[str, Any]:
+        return reject_patch(patch_id, request, http_request)
 
     @app.get("/api/scholar/demo")
     def scholar_demo() -> dict[str, Any]:
         return demo_console_payload()
 
     @app.post("/api/scholar/patches/{patch_id}/accept")
-    def accept_patch(patch_id: str, request: PatchDecisionRequest) -> Response:
+    def accept_patch(
+        patch_id: str,
+        request: PatchDecisionRequest,
+        http_request: Request,
+    ) -> Response:
         try:
+            _authorize_project(http_request, request.project_id)
             stored = project_store.get_patch(patch_id)
             source_session_id = getattr(stored, "source_session_id", None)
             if request.session_id and source_session_id != request.session_id:
@@ -710,8 +718,13 @@ def create_app(
         return JSONResponse(payload, status_code=status_code)
 
     @app.post("/api/scholar/patches/{patch_id}/reject")
-    def reject_patch(patch_id: str, request: PatchDecisionRequest) -> dict[str, Any]:
+    def reject_patch(
+        patch_id: str,
+        request: PatchDecisionRequest,
+        http_request: Request,
+    ) -> dict[str, Any]:
         try:
+            _authorize_project(http_request, request.project_id)
             stored = project_store.get_patch(patch_id)
             source_session_id = getattr(stored, "source_session_id", None)
             if request.session_id and source_session_id != request.session_id:
@@ -736,15 +749,21 @@ def create_app(
             raise _http_error(error) from error
 
     @app.post("/api/scholar/projects/{project_id}/build")
-    def request_build(project_id: str, patch_id: str | None = None) -> dict[str, Any]:
+    def request_build(
+        project_id: str,
+        http_request: Request,
+        patch_id: str | None = None,
+    ) -> dict[str, Any]:
         try:
+            _authorize_project(http_request, project_id)
             return asdict(build_bridge.request_build(project_id, patch_id=patch_id))
         except Exception as error:
             raise _http_error(error) from error
 
     @app.get("/api/scholar/projects/{project_id}/diagnostics")
-    def project_diagnostics(project_id: str) -> dict[str, Any]:
+    def project_diagnostics(project_id: str, http_request: Request) -> dict[str, Any]:
         try:
+            _authorize_project(http_request, project_id)
             latest = build_bridge.latest(project_id)
             return {
                 "project_id": project_id,
@@ -755,8 +774,13 @@ def create_app(
             raise _http_error(error) from error
 
     @app.post("/api/scholar/projects/{project_id}/build/report")
-    def report_build(project_id: str, request: BuildReportRequest) -> dict[str, Any]:
+    def report_build(
+        project_id: str,
+        request: BuildReportRequest,
+        http_request: Request,
+    ) -> dict[str, Any]:
         try:
+            _authorize_project(http_request, project_id)
             diagnostics = tuple(
                 normalize_diagnostic(value)
                 for value in request.diagnostics
@@ -779,22 +803,13 @@ def create_app(
 
     @app.get("/api/scholar/runtime/status")
     def scholar_runtime_status() -> dict[str, Any]:
-        bundle = app.state.scholar_runtime
-        if bundle is None:
-            return {
-                "status": "NOT_STARTED",
-                "mode": None,
-                "checkpoint": None,
-                "persistent": False,
-                "orchestration_backend": "crewai",
-            }
         return {
-            "status": "CLOSED" if bundle._closed else "READY",
-            "mode": bundle.mode,
-            "checkpoint": type(bundle.checkpointer).__name__,
-            "persistent": type(bundle.checkpointer).__name__ != "InMemorySaver",
-            "project_id": bundle.project_store.project_id,
-            "orchestration_backend": getattr(bundle.scholar_orchestration, "backend_name", None),
+            "status": "READY",
+            "mode": "production",
+            "checkpoint": "session_runtime",
+            "persistent": True,
+            "execution_plane": "external_worker",
+            "orchestration_backend": "crewai",
         }
 
     @app.get("/api/scholar/workers/status")
@@ -830,6 +845,7 @@ def create_app(
 
     @app.post("/api/papers/upload", response_model=JobCreated, status_code=202)
     async def upload_paper(
+        http_request: Request,
         file: UploadFile = File(...),
         method: Literal["auto", "txt", "ocr"] = Form("auto"),
         backend: Literal[
@@ -891,54 +907,34 @@ def create_app(
             finally:
                 shutil.rmtree(temporary_directory, ignore_errors=True)
 
-        return job_manager.submit("parse", task)
-
-    @app.post("/api/answers", response_model=JobCreated, status_code=202)
-    def answer(request: AnswerRequest) -> JobCreated:
-        return job_manager.submit(
-            "answer",
-            lambda emit: web_runtime.answer(request, emit),
-            payload={
-                "session_id": request.session_id,
-                "project_id": request.project_id,
-            },
-        )
-
-    @app.post("/api/answers/resume", response_model=JobCreated, status_code=202)
-    def resume_answer(request: ResumeRequest) -> JobCreated:
-        resume = getattr(web_runtime, "resume", None)
-        if not callable(resume):
-            raise HTTPException(status_code=501, detail="当前 Runtime 不支持 LangGraph Resume。")
-        return job_manager.submit(
-            "answer",
-            lambda emit: resume(request.thread_id, request.user_input, emit),
-        )
+        return job_manager.submit("parse", task, identity=_identity(http_request))
 
     @app.get("/api/jobs/{job_id}", response_model=JobSnapshot)
-    def job(job_id: str) -> JobSnapshot:
+    def job(job_id: str, http_request: Request) -> JobSnapshot:
         try:
-            return job_manager.snapshot(job_id)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail=str(error).strip("'")) from error
+            return job_manager.snapshot(job_id, identity=_identity(http_request))
+        except Exception as error:
+            raise _http_error(error) from error
 
     @app.post("/api/jobs/{job_id}/cancel", response_model=JobSnapshot)
-    def cancel_job(job_id: str) -> JobSnapshot:
+    def cancel_job(job_id: str, http_request: Request) -> JobSnapshot:
         try:
-            return job_manager.cancel(job_id)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail=str(error).strip("'")) from error
+            return job_manager.cancel(job_id, identity=_identity(http_request))
+        except Exception as error:
+            raise _http_error(error) from error
 
     @app.get("/api/jobs/{job_id}/events")
-    async def job_events(job_id: str) -> StreamingResponse:
+    async def job_events(job_id: str, http_request: Request) -> StreamingResponse:
+        identity = _identity(http_request)
         try:
-            job_manager.snapshot(job_id)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail=str(error).strip("'")) from error
+            job_manager.snapshot(job_id, identity=identity)
+        except Exception as error:
+            raise _http_error(error) from error
 
         async def stream() -> AsyncIterator[str]:
             last_sequence = 0
             while True:
-                snapshot = job_manager.snapshot(job_id)
+                snapshot = job_manager.snapshot(job_id, identity=identity)
                 for event in snapshot.events:
                     if event.sequence <= last_sequence:
                         continue
@@ -972,38 +968,6 @@ def create_app(
                 "X-Accel-Buffering": "no",
             },
         )
-
-    @app.get("/api/sessions")
-    def sessions() -> dict[str, Any]:
-        return web_runtime.list_sessions()
-
-    @app.get("/api/sessions/{session_id}")
-    def session_details(session_id: str) -> dict[str, Any]:
-        try:
-            return web_runtime.session_details(session_id)
-        except Exception as error:
-            raise _http_error(error) from error
-
-    @app.get("/api/sessions/{session_id}/evidence")
-    def session_evidence(session_id: str) -> dict[str, Any]:
-        try:
-            return web_runtime.session_evidence(session_id)
-        except Exception as error:
-            raise _http_error(error) from error
-
-    @app.get("/api/sessions/{session_id}/transcript")
-    def session_transcript(session_id: str) -> dict[str, Any]:
-        try:
-            return web_runtime.session_transcript(session_id)
-        except Exception as error:
-            raise _http_error(error) from error
-
-    @app.post("/api/sessions/{session_id}/compact")
-    def compact_session(session_id: str) -> dict[str, Any]:
-        try:
-            return web_runtime.compact_session(session_id)
-        except Exception as error:
-            raise _http_error(error) from error
 
     frontend = root / "web" / "dist"
     assets = frontend / "assets"

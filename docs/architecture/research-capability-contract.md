@@ -7,7 +7,7 @@ Phase 1C 将现有本地 Research Engine 投影为三个可组合 capability：
 `search_sections()` 负责已筛选论文中的 section/chunk candidate discovery，
 `read_evidence()` 只按已返回的 canonical locator 读取原文。它们位于
 `app/scholar/research/service.py`，不拥有 Session、Project、Conversation 或 Research Run，
-也不实现新的检索算法。LangChain/Deep Agents Tool 只能包一层调用该 Service，不能把
+也不实现新的检索算法。Agent capability tool 只能包一层调用该 Service，不能把
 Qdrant、BM25、BGE-M3、RRF 或 Reranker 暴露到上层。
 
 ```mermaid
@@ -88,7 +88,7 @@ counter evidence 只保留为未来扩展字段。
 
 Capability Service 只读使用 Shared Knowledge 和 Evidence Pipeline；它不创建 Session，不写
 Manuscript Facts、Contribution Registry、LaTeX 或 Session DB。普通用户的完整 Research Run
-仍然由 `ResearchApplicationFacade` 管理；Deep Agents Research Subagent 只能组合该
+由 `ScholarRunManager` 入队并由 CrewAI Flow 管理；CrewAI Research Agent 只能组合该
 Capability，二者在 UnifiedKnowledgeService 和 EvidenceIntelligencePipeline 处复用同一实现。
 Web Literature 仍只能通过 `ResearchRequest`、FreshnessPolicy 和既有 Tool Gateway Adapter
-进入；Persistent Checkpointer 只保存 Harness/Graph working state，不改变本 Capability 的业务所有权。
+进入；Run checkpoint 只保存 Manager/Flow working state，不改变本 Capability 的业务所有权。

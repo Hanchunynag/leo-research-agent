@@ -1,7 +1,7 @@
 """Read-only projections for the Scholar Web Console.
 
-The Console consumes existing Session/Project/Harness contracts.  This module
-does not create workflow state; it maps the persisted Harness trace into a
+The Console consumes existing Session/Project/orchestration contracts. This
+module does not create workflow state; it maps the persisted run trace into a
 small event vocabulary suitable for a browser and SSE replay.
 """
 
@@ -14,7 +14,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-from app.scholar.evaluation import HarnessEvaluationCase, ScholarHarnessEvaluationSuite
+from app.scholar.evaluation import ScholarEvaluationCase, ScholarEvaluationSuite
 from app.scholar.manuscript import ManuscriptSynchronizer
 from app.scholar.project import ScholarProjectStore
 from app.scholar.events import RunEventStore
@@ -94,7 +94,7 @@ _RUN_EVENT_STATUSES = frozenset(RunEventStatus.__args__)
 
 @dataclass(frozen=True, slots=True)
 class RunEvent:
-    """Stable read-only event contract projected from persisted Harness trace."""
+    """Stable read-only event contract projected from persisted run trace."""
 
     event_id: str
     cursor: int
@@ -172,11 +172,11 @@ def _event_type(kind: str, name: str, *, task_type: str | None = None) -> RunEve
         return "TOOL_STARTED"
     if normalized == "toolusagefinishedevent":
         return "TOOL_COMPLETED"
-    if normalized == "harness_context":
+    if normalized == "manager_context":
         return "CONTEXT_ASSEMBLED"
-    if normalized == "harness_plan":
+    if normalized == "manager_decision":
         return "SKILL_SELECTED"
-    if normalized == "harness_result":
+    if normalized == "specialist_result":
         return "DOMAIN_RESULT"
     if normalized in {"get_project_context", "read_file", "get_patch_status"}:
         return "TOOL_COMPLETED"
@@ -230,23 +230,23 @@ class ScholarConsoleProjection:
     def run_snapshot(self, run_id: str) -> dict[str, Any]:
         run, session, result = self._find_run(run_id)
         metadata = self._metadata(result)
-        harness = metadata.get("harness")
-        if not isinstance(harness, Mapping):
-            harness = {}
-        harness = dict(harness)
+        orchestration = metadata.get("orchestration")
+        if not isinstance(orchestration, Mapping):
+            orchestration = {}
+        orchestration = dict(orchestration)
         # CrewAI framework events are projected through the existing trace
         # field.  Keep the Console vocabulary and replay endpoint unchanged.
-        if metadata.get("backend") == "crewai" and not harness.get("trace"):
+        if metadata.get("backend") == "crewai" and not orchestration.get("trace"):
             crew_trace = metadata.get("trace")
             if isinstance(crew_trace, Mapping):
-                harness = {**harness, **dict(crew_trace)}
+                orchestration = {**orchestration, **dict(crew_trace)}
         for key in ("visible_capabilities", "visible_tools", "unexpected_tool_calls", "capability_violations", "context_budget"):
             if key in metadata:
-                harness[key] = _jsonable(metadata[key])
-        if "visible_tools" not in harness and "visible_capabilities" in harness:
+                orchestration[key] = _jsonable(metadata[key])
+        if "visible_tools" not in orchestration and "visible_capabilities" in orchestration:
             # CrewAI names this projection ``visible_capabilities`` while the
             # existing evaluator/console contract calls it ``visible_tools``.
-            harness["visible_tools"] = harness["visible_capabilities"]
+            orchestration["visible_tools"] = orchestration["visible_capabilities"]
         value: Any = None
         structured_result = metadata.get("structured_result")
         if structured_result is not None:
@@ -271,9 +271,9 @@ class ScholarConsoleProjection:
                 "selected_skill": metadata.get("selected_skill"),
                 "resumed": bool(metadata.get("resumed")),
             },
-            "harness": _jsonable(harness),
-            "termination_reason": metadata.get("termination_reason") or harness.get("termination_reason"),
-            "orchestration_backend": metadata.get("backend") or "legacy",
+            "orchestration": _jsonable(orchestration),
+            "termination_reason": metadata.get("termination_reason") or orchestration.get("termination_reason"),
+            "orchestration_backend": metadata.get("backend") or "crewai",
         }
 
     def run_events(self, run_id: str) -> list[dict[str, Any]]:
@@ -323,7 +323,7 @@ class ScholarConsoleProjection:
         }.get(run_status, "COMPLETED")
         emit(
             "RUN_STARTED",
-            node="Supervisor",
+            node="Manager",
             status=start_status,
             summary="Scholar Run started",
             timestamp=run.get("created_at"),
@@ -332,15 +332,15 @@ class ScholarConsoleProjection:
         if routing.get("resumed"):
             emit(
                 "RUN_RESUMED",
-                node="Supervisor",
+                node="Manager",
                 status="COMPLETED",
                 summary="Scholar Run resumed from persistent checkpoint",
                 timestamp=run.get("started_at"),
                 metadata={"thread_id": run.get("thread_id")},
             )
 
-        harness = snapshot.get("harness", {})
-        trace = harness.get("trace", []) if isinstance(harness, Mapping) else []
+        orchestration = snapshot.get("orchestration", {})
+        trace = orchestration.get("trace", []) if isinstance(orchestration, Mapping) else []
         task_type = str(routing.get("task_type") or "")
         for item in trace if isinstance(trace, list) else []:
             if not isinstance(item, Mapping):
@@ -352,10 +352,10 @@ class ScholarConsoleProjection:
             event_type = _event_type(kind, name, task_type=task_type)
             if event_status == "RUNNING":
                 event_type = "REVIEW_STARTED" if normalized_name == "review_draft" else "TOOL_STARTED" if kind == "tool" else "SUBAGENT_STARTED"
-            if normalized_name == "harness_plan":
+            if normalized_name == "manager_decision":
                 node = str(routing.get("selected_skill") or "Skill")
-            elif normalized_name == "harness_context":
-                node = "Supervisor"
+            elif normalized_name == "manager_context":
+                node = "Manager"
             elif normalized_name == "execute_scholar_skill":
                 node = "Research Capability" if task_type == "SUPPORT_CLAIM" else "Writing Runtime"
             elif normalized_name == "research_evidence":
@@ -374,7 +374,7 @@ class ScholarConsoleProjection:
                 event_metadata = item.get("metadata")
                 state_name = event_metadata.get("state") if isinstance(event_metadata, Mapping) else None
                 node = f"CrewAI Flow: {state_name}" if state_name else "CrewAI Flow"
-            elif normalized_name == "harness_result":
+            elif normalized_name == "specialist_result":
                 node = "Research Capability" if task_type == "SUPPORT_CLAIM" else "Writing Runtime"
             elif normalized_name.startswith(("web_", "evidence_")):
                 node = "Evidence Validation" if "valid" in normalized_name or "verif" in normalized_name else "Research Subagent"
@@ -759,7 +759,7 @@ class ScholarConsoleProjection:
                 "metrics": {},
                 "record": None,
             }
-        case = HarnessEvaluationCase(
+        case = ScholarEvaluationCase(
             run_id,
             str(snapshot["run"].get("query") or ""),
             self.project_store.project_id,
@@ -776,11 +776,11 @@ class ScholarConsoleProjection:
             metadata = {
                 "selected_skill": snapshot["routing"].get("selected_skill"),
                 "resumed": snapshot["routing"].get("resumed", False),
-                "visible_tools": snapshot.get("harness", {}).get("visible_tools", {}),
-                "unexpected_tool_calls": snapshot.get("harness", {}).get("unexpected_tool_calls", []),
-                "trace": snapshot.get("harness", {}),
+                "visible_tools": snapshot.get("orchestration", {}).get("visible_tools", {}),
+                "unexpected_tool_calls": snapshot.get("orchestration", {}).get("unexpected_tool_calls", []),
+                "trace": snapshot.get("orchestration", {}),
             }
-        record = ScholarHarnessEvaluationSuite().evaluate_result(case, Result())
+        record = ScholarEvaluationSuite().evaluate_result(case, Result())
         return {
             "run_id": run_id,
             "task_type": task_type,
@@ -817,10 +817,10 @@ def demo_console_payload() -> dict[str, Any]:
             "routing": {"task_type": "WRITE_INTRODUCTION", "selected_skill": "write-introduction", "resumed": False},
             "result": {"status": "READY", "result_type": "WritingResult", "value": {"patch": {"patch_id": "DEMO_PATCH_01", "target_section": "introduction"}}},
             "termination_reason": "NEEDS_USER_REVIEW",
-            "harness": {"usage": {"steps": 9, "context_tokens": 2210, "total_tokens": 6840}, "trace": []},
+            "orchestration": {"usage": {"steps": 9, "context_tokens": 2210, "total_tokens": 6840}, "trace": []},
         },
         "events": [
-            {"event_id": "DEMO:1", "type": "RUN_STARTED", "node": "Supervisor", "status": "COMPLETED", "summary": "Scholar Run started"},
+            {"event_id": "DEMO:1", "type": "RUN_STARTED", "node": "Manager", "status": "COMPLETED", "summary": "Scholar Run started"},
             {"event_id": "DEMO:2", "type": "SKILL_SELECTED", "node": "write-introduction", "status": "COMPLETED", "summary": "Skill selected"},
             {"event_id": "DEMO:3", "type": "RESEARCH_COMPLETED", "node": "Research Subagent", "status": "COMPLETED", "summary": "Local RAG + Web Literature · 6 verified evidence"},
             {"event_id": "DEMO:4", "type": "EVIDENCE_VERIFIED", "node": "Evidence Validation", "status": "COMPLETED", "summary": "6 Verified Evidence"},

@@ -1,4 +1,4 @@
-"""ScholarHarness 的第一版结构化 Contract。
+"""Scholar 的结构化领域 Contract。
 
 这些类型只描述领域数据，不负责调用 LLM、RAG 或写入文件。
 """

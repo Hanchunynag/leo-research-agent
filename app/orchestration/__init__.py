@@ -6,26 +6,42 @@ RAG, writing, review, approval and session services remain the domain owners.
 
 from app.orchestration.contracts import (
     AgentStatus,
+    DomainResultReference,
+    ManagerDecision,
+    RunBudget,
+    RunGoal,
+    RunState,
     OrchestrationRequest,
     OrchestrationResult,
     OrchestrationStatus,
     ResearchAgentOutput,
     ReviewAgentOutput,
     Route,
-    SupervisorResult,
     WriterAgentOutput,
 )
 from app.orchestration.evaluation import (
     OrchestrationEvaluationCase,
     OrchestrationEvaluationReport,
-    compare_reports,
     default_orchestration_cases,
     evaluate_backend,
+)
+from app.orchestration.manager import (
+    DecisionValidationResult,
+    ManagerDecisionRejected,
+    ManagerDecisionValidator,
 )
 from app.orchestration.service import ScholarOrchestrationService
 
 __all__ = [
     "AgentStatus",
+    "DomainResultReference",
+    "ManagerDecision",
+    "ManagerDecisionRejected",
+    "ManagerDecisionValidator",
+    "DecisionValidationResult",
+    "RunBudget",
+    "RunGoal",
+    "RunState",
     "OrchestrationRequest",
     "OrchestrationResult",
     "OrchestrationStatus",
@@ -35,9 +51,7 @@ __all__ = [
     "ReviewAgentOutput",
     "Route",
     "ScholarOrchestrationService",
-    "SupervisorResult",
     "WriterAgentOutput",
-    "compare_reports",
     "default_orchestration_cases",
     "evaluate_backend",
 ]

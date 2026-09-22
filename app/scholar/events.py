@@ -123,9 +123,9 @@ def _trace_event_type(name: str, kind: str, status: str, metadata: Mapping[str, 
         return "TOOL_STARTED"
     if normalized in {"toolusagefinishedevent"} or (kind == "tool" and status in {"COMPLETED", "FAILED"}):
         return "TOOL_COMPLETED"
-    if normalized in {"harness_context"}:
+    if normalized in {"manager_context"}:
         return "CONTEXT_ASSEMBLED"
-    if normalized in {"harness_plan"}:
+    if normalized in {"manager_decision"}:
         return "SKILL_SELECTED"
     if normalized in {"research_evidence", "research_completed"}:
         return "RESEARCH_COMPLETED"
@@ -135,7 +135,7 @@ def _trace_event_type(name: str, kind: str, status: str, metadata: Mapping[str, 
         return "EVIDENCE_VERIFIED"
     if normalized in {"review_draft", "reviewer_specialist"}:
         return "REVIEW_STARTED" if status == "RUNNING" else "REVIEW_COMPLETED"
-    if normalized in {"execute_scholar_skill", "harness_result"}:
+    if normalized in {"execute_scholar_skill", "specialist_result"}:
         return "DRAFT_CREATED" if str(metadata.get("task_type")) != "SUPPORT_CLAIM" else "DOMAIN_RESULT"
     if "checkpoint" in normalized:
         return "CHECKPOINT_SAVED"

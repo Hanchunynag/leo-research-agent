@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pytest
 
+from app.jobs.worker import JobCancelled
 from app.orchestration.contracts import OrchestrationRequest, ResearchAgentOutput
 from app.orchestration.evaluation import (
     OrchestrationEvaluationCase,
-    compare_reports,
     evaluate_backend,
 )
 from app.orchestration.service import CrewAIBackend, ScholarOrchestrationService
@@ -109,8 +109,8 @@ def test_crewai_crew_has_exactly_four_roles_and_isolated_tools(tmp_path: Path) -
     )
 
     assert result.status == "COMPLETED"
-    assert set(crew_backend.agents) == {"supervisor", "research", "writer", "reviewer"}
-    assert crew_backend.agents["supervisor"].tools == []
+    assert set(crew_backend.agents) == {"manager", "research", "writer", "reviewer"}
+    assert crew_backend.agents["manager"].tools == []
     assert [tool.name for tool in crew_backend.agents["research"].tools] == [
         "research_capability"
     ]
@@ -372,6 +372,59 @@ def test_crewai_backend_accepts_worker_started_run_without_double_start(
     )
 
 
+def test_crewai_resume_reuses_original_thread_and_persisted_manager_checkpoint(
+    tmp_path: Path,
+) -> None:
+    crew_backend, _, _, store = make_backend(tmp_path)
+    service = ScholarOrchestrationService(backend="crewai", crewai=crew_backend)
+
+    def cancel_at_first_capability() -> None:
+        raise JobCancelled("test interruption")
+
+    request = OrchestrationRequest(
+        request_id="resume-checkpoint-1",
+        project_id=store.project_id,
+        instruction="Find verified evidence",
+        task_type="RESEARCH",
+        session_id="resume-session",
+        thread_id="resume-thread",
+        metadata={"_cancellation_checker": cancel_at_first_capability},
+    )
+    with pytest.raises(JobCancelled):
+        service.run(request)
+
+    runtime = crew_backend.session_manager.open("resume-session")
+    interrupted = runtime.list_runs()[0]
+    checkpoint = runtime.load_checkpoint(interrupted.run_id)
+    assert checkpoint is not None
+    assert interrupted.thread_id == "resume-thread"
+    assert checkpoint["run_state"]["recovery_action"] == "CALL_RESEARCH"
+
+    # The worker/recovery layer owns the RUNNING -> INTERRUPTED transition;
+    # simulate that durable recovery before invoking the public resume API.
+    runtime.complete_run(
+        interrupted.run_id,
+        status="INTERRUPTED",
+        answer="",
+        citations=[],
+        evidence=[],
+        metadata={"orchestration_status": "INTERRUPTED"},
+    )
+    resumed = service.resume(
+        "resume-thread",
+        {"ignored": True},
+        store.project_id,
+        instruction="ignored by checkpoint resume",
+        session_id="resume-session",
+        task_type="RESEARCH",
+    )
+
+    assert resumed.status == "COMPLETED"
+    assert resumed.run_id == interrupted.run_id
+    assert resumed.thread_id == "resume-thread"
+    assert runtime.load_checkpoint(interrupted.run_id) is None
+
+
 def test_crewai_trace_maps_provider_usage_and_flow_capability_calls(
     tmp_path: Path,
 ) -> None:
@@ -385,7 +438,7 @@ def test_crewai_trace_maps_provider_usage_and_flow_capability_calls(
                 for item in messages  # type: ignore[union-attr]
                 if isinstance(item, dict)
             ).casefold()
-            if "scholar supervisor agent" in content:
+            if "scholar manager agent" in content:
                 payload = {"status": "COMPLETED", "selected_route": "RESEARCH"}
             elif "research agent" in content:
                 payload = {"status": "COMPLETED", "research_summary": "ok"}
@@ -674,6 +727,3 @@ def test_backend_neutral_evaluation_reads_crewai_trace_contract() -> None:
     assert report.metrics["Routing Accuracy"] == 1.0
     assert report.metrics["Average Agent Calls"] == 2.0
     assert report.metrics["Token Usage"] == 12.0
-
-    comparison = compare_reports(report, report)
-    assert comparison["delta_crewai_minus_legacy"]["Task Success"] == 0.0

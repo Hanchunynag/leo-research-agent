@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from crewai import Agent, Crew, Process, Task
 from pydantic import BaseModel
 
 from app.orchestration.contracts import (
+    ManagerDecision,
     ResearchAgentOutput,
     ReviewAgentOutput,
-    SupervisorResult,
     WriterAgentOutput,
 )
 from app.orchestration.crewai.tools import (
@@ -54,6 +55,8 @@ def _prompt_jsonable(value: Any, *, key: str = "", depth: int = 0) -> Any:
         return {"omitted": key, "reason": "authoritative_domain_object"}
     if key == "evidence_packs":
         return {"count": len(value) if isinstance(value, (list, tuple)) else 0}
+    if is_dataclass(value):
+        return _prompt_jsonable(asdict(value), key=key, depth=depth)
     if isinstance(value, BaseModel):
         return _prompt_jsonable(value.model_dump(mode="python"), key=key, depth=depth)
     if isinstance(value, str):
@@ -76,10 +79,14 @@ def _prompt_jsonable(value: Any, *, key: str = "", depth: int = 0) -> Any:
     return value
 
 
-class _SupervisorCognition(BaseModel):
-    status: str = "COMPLETED"
-    selected_route: str | None = None
-    final_answer: str | None = None
+class _ManagerCognition(BaseModel):
+    next_action: str | None = None
+    target_agent: str | None = None
+    goal_alignment: str = "Preserve the original Run goal."
+    remaining_gap: str = "No unresolved gap reported."
+    reason: str = "Manager decision"
+    required_context_refs: list[str] = []
+    completion_status: str = "IN_PROGRESS"
 
 
 class _ResearchCognition(BaseModel):
@@ -100,7 +107,7 @@ def _cognition_model(output_model: type[BaseModel]) -> type[BaseModel]:
     """Use a small CrewAI schema; domain contracts are filled by the Flow."""
 
     return {
-        SupervisorResult: _SupervisorCognition,
+        ManagerDecision: _ManagerCognition,
         ResearchAgentOutput: _ResearchCognition,
         WriterAgentOutput: _WriterCognition,
         ReviewAgentOutput: _ReviewCognition,
@@ -140,10 +147,12 @@ class ScholarCrew:
             "memory": False,
             "verbose": False,
         }
-        self.supervisor = Agent(
-            role="Scholar Supervisor Agent",
-            goal="Route the user request to exactly one specialist and return a validated orchestration result.",
-            backstory="You are the top-level Scholar coordinator. You do not retrieve, write, review, approve, or apply.",
+        self.manager = Agent(
+            # This is the persistent Manager Agent, not a one-shot request
+            # router.
+            role="Scholar Manager Agent",
+            goal="Continuously choose the next bounded specialist action from the current Run state and return ManagerDecision.",
+            backstory="You are the persistent Scholar Manager. You plan only; you never retrieve, write, review, approve, or apply.",
             tools=[],
             **common,
         )
@@ -169,7 +178,7 @@ class ScholarCrew:
             **common,
         )
         self.agents: dict[str, Agent] = {
-            "supervisor": self.supervisor,
+            "manager": self.manager,
             "research": self.research,
             "writer": self.writer,
             "reviewer": self.reviewer,
@@ -197,6 +206,16 @@ class ScholarCrew:
             "for optional fields. Never copy source text, evidence arrays, manuscript text, or "
             "the full domain object into your response. Keep the response concise."
         )
+        if output_model is ManagerDecision:
+            description += (
+                "\n\nManager rules (mandatory): reread ORIGINAL_GOAL before every decision. "
+                "Do not turn a Specialist subtask, one Reviewer comment, the latest conversation, "
+                "or one missing Evidence item into the final task goal. Explain in goal_alignment "
+                "why this action serves ORIGINAL_GOAL, and in remaining_gap what is still missing. "
+                "Use READY_TO_COMPLETE only when every SUCCESS_CRITERIA is true and there is no "
+                "BLOCKING_GAP; otherwise use IN_PROGRESS or BLOCKED. Never invent completion from "
+                "recent output alone."
+            )
         expected = (
             f"A valid {output_model.__name__} JSON object with no additional keys."
         )
@@ -288,16 +307,42 @@ class ScholarCrew:
                 )
                 structured = task_model.model_validate_json(str(raw))
             payload = structured.model_dump(mode="python")
+            if output_model is ManagerDecision and not payload.get("next_action"):
+                context_value = context if isinstance(context, dict) else {}
+                last_agent = context_value.get("last_agent")
+                current_route = context_value.get("route")
+                if last_agent == "research" and current_route in {
+                    "WRITE_INTRODUCTION", "WRITE_CONCLUSION", "WRITE_ABSTRACT"
+                }:
+                    action, target, status = "CALL_WRITER", "writer", "IN_PROGRESS"
+                elif last_agent == "research":
+                    action, target, status = "COMPLETE", None, "READY_TO_COMPLETE"
+                elif last_agent == "writer":
+                    action, target, status = "CALL_REVIEWER", "reviewer", "IN_PROGRESS"
+                elif last_agent == "reviewer" and context_value.get("review_decision") == "REVISE":
+                    action, target, status = "REQUEST_REVISION", "writer", "IN_PROGRESS"
+                elif last_agent == "reviewer":
+                    action, target, status = "COMPLETE", None, "READY_TO_COMPLETE"
+                elif current_route == "REVIEW":
+                    action, target, status = "CALL_REVIEWER", "reviewer", "IN_PROGRESS"
+                elif current_route in {"WRITE_INTRODUCTION", "RESEARCH", "SUPPORT_CLAIM"}:
+                    action, target, status = "CALL_RESEARCH", "research", "IN_PROGRESS"
+                else:
+                    action, target, status = "CALL_WRITER", "writer", "IN_PROGRESS"
+                payload.update(
+                    {
+                        "next_action": action,
+                        "target_agent": target,
+                        "goal_alignment": f"The {str(current_route or 'research').casefold().replace('_', ' ')} action advances the original goal.",
+                        "remaining_gap": "Provider returned no bounded gap.",
+                        "reason": "Normalized Manager payload at the CrewAI boundary.",
+                        "completion_status": status,
+                    }
+                )
             # Route is code-owned by the Flow. If a model omits it from the
             # minimal response, preserve the deterministic route hint instead
             # of allowing a missing field to turn a valid run into a parser
             # failure.
-            if output_model is SupervisorResult and not payload.get("selected_route"):
-                if isinstance(context, dict):
-                    payload["selected_route"] = (
-                        context.get("selected_route")
-                        or context.get("deterministic_route")
-                    )
             structured_output = output_model.model_validate(payload)
             if self.trace is not None:
                 self.trace.record(

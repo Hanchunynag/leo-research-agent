@@ -11,21 +11,6 @@ class WebModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class AnswerRequest(WebModel):
-    """一次 Agentic 问答请求，Session ID 为空时由核心服务创建。"""
-
-    query: str = Field(min_length=1, max_length=8_000)
-    session_id: str | None = Field(default=None, max_length=128)
-    project_id: str | None = Field(default=None, max_length=128)
-    force_new_topic: bool = False
-    include_context: bool = True
-
-
-class ResumeRequest(WebModel):
-    thread_id: str = Field(min_length=1, max_length=128)
-    user_input: str = Field(min_length=1, max_length=8_000)
-
-
 class ParseOptions(WebModel):
     """PDF 上传后的 MinerU 解析选项。"""
 
@@ -52,7 +37,7 @@ class JobEvent(WebModel):
 
 class JobSnapshot(WebModel):
     job_id: str
-    kind: Literal["answer", "parse"]
+    kind: Literal["parse"]
     status: Literal["queued", "running", "succeeded", "failed", "cancelled"]
     events: list[JobEvent]
     result: dict[str, Any] | None = None
@@ -69,41 +54,6 @@ class PatchDecisionRequest(WebModel):
     session_id: str | None = Field(default=None, max_length=128)
     expected_base_hash: str = Field(min_length=1, max_length=128)
     actor: str = Field(min_length=1, max_length=256)
-
-
-class ScholarTaskRequest(WebModel):
-    """User-level Scholar request; execution is owned by ScholarHarnessService."""
-
-    instruction: str = Field(min_length=1, max_length=16_000)
-    project_id: str = Field(min_length=1, max_length=128)
-    task_type: Literal[
-        "RESEARCH",
-        "WRITE_INTRODUCTION",
-        "SUPPORT_CLAIM",
-        "WRITE_CONCLUSION",
-        "WRITE_ABSTRACT",
-        "REVIEW",
-    ] | None = None
-    session_id: str | None = Field(default=None, max_length=128)
-    thread_id: str | None = Field(default=None, max_length=128)
-
-
-class ScholarResumeRequest(WebModel):
-    """Framework checkpoint resume data, never Patch Approval data."""
-
-    project_id: str = Field(min_length=1, max_length=128)
-    thread_id: str = Field(min_length=1, max_length=128)
-    instruction: str = Field(min_length=1, max_length=16_000)
-    resume_value: Any
-    task_type: Literal[
-        "RESEARCH",
-        "WRITE_INTRODUCTION",
-        "SUPPORT_CLAIM",
-        "WRITE_CONCLUSION",
-        "WRITE_ABSTRACT",
-        "REVIEW",
-    ] | None = None
-    session_id: str | None = Field(default=None, max_length=128)
 
 
 class ScholarRunCreateRequest(WebModel):

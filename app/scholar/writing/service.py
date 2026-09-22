@@ -1,4 +1,4 @@
-"""Manuscript Supervisor 的 Introduction Vertical。"""
+"""Scholar Writing 的 Introduction Vertical。"""
 
 from __future__ import annotations
 
@@ -264,7 +264,6 @@ class ResearchDelegate:
                 "parallel_elapsed_ms": round((perf_counter() - started) * 1000, 3),
             },
         )
-
     def research_needs(
         self,
         request_id: str,
@@ -776,6 +775,3 @@ class ScholarWritingService:
             warnings=draft.warnings,
             metadata=self._coverage_metadata(final_coverage),
         )
-
-
-ManuscriptSupervisor = ScholarWritingService

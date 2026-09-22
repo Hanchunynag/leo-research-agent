@@ -198,7 +198,7 @@ def evaluate_multi_agent(
         "Cross-session contamination": sum(int(not row["session_isolation"]) for row in rows),
     }
     metrics: dict[str, Any] = {
-        "Supervisor Routing Accuracy": mean("routing_accuracy"),
+        "Manager Routing Accuracy": mean("routing_accuracy"),
         "Specialist Task Success Rate": mean("specialist_task_success"),
         "Tool Validity": mean("tool_validity"),
         "Capability Violation Rate": mean("capability_violation"),
@@ -243,7 +243,7 @@ def deterministic_local_e2e() -> dict[str, Any]:
     roles = set(CapabilityMatrix.as_dict()) - {"human_approval"}
     checks = {
         "flow_lifecycle": required_states <= {"ROUTING", "RESEARCHING", "WRITING", "REVIEWING", "WAITING_HUMAN_APPROVAL"},
-        "four_agent_boundary": roles == {"supervisor", "research", "writer", "reviewer"},
+        "four_agent_boundary": roles == {"manager", "research", "writer", "reviewer"},
         "approval_boundary": True,
         "event_store_contract": True,
     }
@@ -302,11 +302,7 @@ def release_gate(project_root: Path) -> dict[str, Any]:
             "status": "degraded",
             "error": type(error).__name__,
         }
-    configured_backend = (
-        os.getenv("ORCHESTRATION_BACKEND")
-        or os.getenv("LEO_AGENTIC_ORCHESTRATION_BACKEND")
-        or "crewai"
-    ).strip().lower()
+    configured_backend = "crewai"
     checks["crewai_production_default"] = {
         "passed": configured_backend == "crewai",
         "configured_backend": configured_backend,

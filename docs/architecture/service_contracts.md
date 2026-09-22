@@ -31,7 +31,11 @@ VerifiedEvidence 需要 `paper_id`、`document_id`、`chunk_id`、页范围、bl
 
 ## Orchestration contract
 
-CrewAI Flow 只传递 Pydantic structured contracts：研究请求、EvidencePack、DraftPatch、ReviewReport 和 ApprovalRequest。Supervisor 决定 bounded route，Research 读取证据能力，Writer 只能提出 Patch，Reviewer 只能返回审查结果；批准和 Safe Apply 仍由人工边界与领域服务负责。
+CrewAI Flow 只传递 Pydantic structured contracts：`RunGoal`、`RunState`、
+`ManagerDecision`、Research/Writer/Reviewer output 和
+`DomainResultReference`。Manager 决定 bounded next action，Flow/Validator
+负责合法状态转移，Research 读取证据能力，Writer 只能提出 Patch，Reviewer
+只能返回审查结果；批准和 Safe Apply 仍由人工边界与领域服务负责。
 
 ## Failure rules
 

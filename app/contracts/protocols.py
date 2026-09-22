@@ -1,4 +1,4 @@
-"""统一知识服务和 Research Harness 的稳定 Protocol。"""
+"""Framework-neutral contracts for knowledge and evidence services."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from app.contracts.domain import (
-    AgentRun,
     CandidateEvidence,
     ContextPack,
     EvidenceRequest,
@@ -35,7 +34,6 @@ class KnowledgeEngine(Protocol):
         generation: IndexGeneration,
         profile: IndexProfile,
     ) -> Mapping[str, Any]: ...
-
     def update_documents(
         self,
         documents: Sequence[Document],
@@ -93,16 +91,3 @@ class ToolGateway(Protocol):
         *,
         context: Mapping[str, Any],
     ) -> Mapping[str, Any]: ...
-
-
-@runtime_checkable
-class ResearchHarness(Protocol):
-    """只编排请求、Context、Budget、State、Evaluation 和 Recovery。"""
-
-    def run(
-        self,
-        request: EvidenceRequest,
-        *,
-        context_pack: ContextPack | None = None,
-        state: Mapping[str, Any] | None = None,
-    ) -> AgentRun: ...
